@@ -42,6 +42,10 @@ const (
 	bindCompletedAnnotation      = "pv.kubernetes.io/bind-completed"
 	boundByControllerAnnotation  = "pv.kubernetes.io/bound-by-controller"
 	storageProvisionerAnnotation = "volume.beta.kubernetes.io/storage-provisioner"
+
+	dataProtectionAPIGroup               = "dataprotection.kubeblocks.io"
+	dataProtectionBackupKind             = "Backup"
+	dataProtectionPopulateFromAnnotation = "dataprotection.kubeblocks.io/populate-from"
 )
 
 func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
@@ -205,7 +209,13 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	s.translateUpdateBackwards(event.Host, event.Virtual)
 
 	// copy host status
-	event.Virtual.Status = *event.Host.Status.DeepCopy()
+	preserveVirtualStatus, err := s.shouldPreserveVirtualDataProtectionPopulateStatus(ctx, event.Host, event.Virtual)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !preserveVirtualStatus {
+		event.Virtual.Status = *event.Host.Status.DeepCopy()
+	}
 
 	// allow storage size to be increased
 	event.Host.Spec.Resources.Requests = event.Virtual.Spec.Resources.Requests
@@ -287,6 +297,60 @@ func (s *persistentVolumeClaimSyncer) ensurePersistentVolume(ctx *synccontext.Sy
 	}
 
 	return false, nil
+}
+
+func (s *persistentVolumeClaimSyncer) shouldPreserveVirtualDataProtectionPopulateStatus(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (bool, error) {
+	if !isDataProtectionBackupPVC(vObj) || !isVirtualPVCBound(vObj) || !isHostPVCWaitingForVolume(pObj) {
+		return false, nil
+	}
+
+	vPV := &corev1.PersistentVolume{}
+	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: vObj.Spec.VolumeName}, vPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if vPV.Annotations[dataProtectionPopulateFromAnnotation] == "" {
+		return false, nil
+	}
+	if vPV.Spec.ClaimRef == nil ||
+		vPV.Spec.ClaimRef.Namespace != vObj.Namespace ||
+		vPV.Spec.ClaimRef.Name != vObj.Name {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func isDataProtectionBackupPVC(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc.Spec.DataSourceRef == nil || pvc.Spec.DataSourceRef.APIGroup == nil {
+		return false
+	}
+
+	return *pvc.Spec.DataSourceRef.APIGroup == dataProtectionAPIGroup &&
+		pvc.Spec.DataSourceRef.Kind == dataProtectionBackupKind &&
+		pvc.Spec.DataSourceRef.Name != ""
+}
+
+func isVirtualPVCBound(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc.Spec.VolumeName == "" || pvc.Status.Phase != corev1.ClaimBound {
+		return false
+	}
+
+	storage, ok := pvc.Status.Capacity[corev1.ResourceStorage]
+	return ok && !storage.IsZero()
+}
+
+func isHostPVCWaitingForVolume(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc.Spec.VolumeName != "" || pvc.Status.Phase == corev1.ClaimBound {
+		return false
+	}
+
+	storage, ok := pvc.Status.Capacity[corev1.ResourceStorage]
+	return !ok || storage.IsZero()
 }
 
 func (s *persistentVolumeClaimSyncer) isHostVolumeRestoreInProgress(ctx *synccontext.SyncContext, pObj types.NamespacedName) (bool, error) {
