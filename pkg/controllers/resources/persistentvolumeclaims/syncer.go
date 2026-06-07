@@ -321,6 +321,9 @@ func (s *persistentVolumeClaimSyncer) shouldPreserveVirtualDataProtectionPopulat
 		vPV.Spec.ClaimRef.Name != vObj.Name {
 		return false, nil
 	}
+	if vPV.Spec.ClaimRef.UID != "" && vPV.Spec.ClaimRef.UID != vObj.UID {
+		return false, nil
+	}
 
 	return true, nil
 }

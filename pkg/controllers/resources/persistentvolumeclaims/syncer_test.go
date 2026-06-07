@@ -138,7 +138,11 @@ func TestSync(t *testing.T) {
 	}
 	dataProtectionGroup := dataProtectionAPIGroup
 	dataProtectionBackupPvc := &corev1.PersistentVolumeClaim{
-		ObjectMeta: vObjectMeta,
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vObjectMeta.Name,
+			Namespace: vObjectMeta.Namespace,
+			UID:       types.UID("target-pvc-uid"),
+		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			VolumeName: "restore-populated-pv",
 			DataSourceRef: &corev1.TypedObjectReference{
@@ -161,6 +165,8 @@ func TestSync(t *testing.T) {
 			Capacity: corev1.ResourceList{},
 		},
 	}
+	dataProtectionHostPendingPvcWithUID := dataProtectionHostPendingPvc.DeepCopy()
+	dataProtectionHostPendingPvcWithUID.Annotations[translate.UIDAnnotation] = string(dataProtectionBackupPvc.UID)
 	dataProtectionPopulatedPV := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "restore-populated-pv",
@@ -172,9 +178,14 @@ func TestSync(t *testing.T) {
 			ClaimRef: &corev1.ObjectReference{
 				Namespace: dataProtectionBackupPvc.Namespace,
 				Name:      dataProtectionBackupPvc.Name,
+				UID:       dataProtectionBackupPvc.UID,
 			},
 		},
 	}
+	dataProtectionStaleUIDPvc := dataProtectionBackupPvc.DeepCopy()
+	dataProtectionStaleUIDPvc.Status = *dataProtectionHostPendingPvc.Status.DeepCopy()
+	dataProtectionStaleUIDPV := dataProtectionPopulatedPV.DeepCopy()
+	dataProtectionStaleUIDPV.Spec.ClaimRef.UID = types.UID("stale-pvc-uid")
 
 	syncertesting.RunTestsWithContext(t, func(vConfig *config.VirtualClusterConfig, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient) *synccontext.RegisterContext {
 		ctx := syncertesting.NewFakeRegisterContext(vConfig, pClient, vClient)
@@ -345,7 +356,34 @@ func TestSync(t *testing.T) {
 				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {dataProtectionPopulatedPV.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionHostPendingPvc.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionHostPendingPvcWithUID.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionBackupPvc.DeepCopy(),
+					dataProtectionBackupPvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name: "Do not preserve data protection populated virtual status for stale same-name claim ref uid",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionBackupPvc.DeepCopy(),
+				dataProtectionStaleUIDPV.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{dataProtectionHostPendingPvc.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionStaleUIDPvc.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {dataProtectionStaleUIDPV.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionHostPendingPvcWithUID.DeepCopy()},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
 				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
