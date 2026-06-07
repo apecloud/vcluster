@@ -1,12 +1,15 @@
 package persistentvolumeclaims
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"time"
 
 	storagev1 "k8s.io/api/storage/v1"
 
 	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/api/equality"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/klog/v2"
 
@@ -46,6 +49,10 @@ const (
 	dataProtectionAPIGroup               = "dataprotection.kubeblocks.io"
 	dataProtectionBackupKind             = "Backup"
 	dataProtectionPopulateFromAnnotation = "dataprotection.kubeblocks.io/populate-from"
+
+	dataProtectionMaterializationRequestLabel  = "vcluster.loft.sh/dataprotection-materialization-request"
+	dataProtectionMaterializationRequestPrefix = "dp-host-materialization-"
+	dataProtectionMaterializationStatePending  = "pending"
 )
 
 func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
@@ -213,7 +220,12 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if !preserveVirtualStatus {
+	if preserveVirtualStatus {
+		err = s.ensureDataProtectionHostMaterialization(ctx, event.Host, event.Virtual)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	} else {
 		event.Virtual.Status = *event.Host.Status.DeepCopy()
 	}
 
@@ -300,32 +312,96 @@ func (s *persistentVolumeClaimSyncer) ensurePersistentVolume(ctx *synccontext.Sy
 }
 
 func (s *persistentVolumeClaimSyncer) shouldPreserveVirtualDataProtectionPopulateStatus(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (bool, error) {
+	_, ok, err := s.dataProtectionPopulatedPersistentVolume(ctx, pObj, vObj)
+	return ok, err
+}
+
+func (s *persistentVolumeClaimSyncer) ensureDataProtectionHostMaterialization(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) error {
+	vPV, ok, err := s.dataProtectionPopulatedPersistentVolume(ctx, pObj, vObj)
+	if err != nil || !ok {
+		return err
+	}
+
+	desired := dataProtectionMaterializationRequest(ctx.Config.HostNamespace, pObj, vObj, vPV)
+	existing := &corev1.ConfigMap{}
+	err = ctx.HostClient.Get(ctx.Context, types.NamespacedName{
+		Namespace: desired.Namespace,
+		Name:      desired.Name,
+	}, existing)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return ctx.HostClient.Create(ctx.Context, desired)
+		}
+		return err
+	}
+
+	updated := existing.DeepCopy()
+	updated.Labels = desired.Labels
+	updated.Data = desired.Data
+	if equality.Semantic.DeepEqual(existing.Labels, updated.Labels) &&
+		equality.Semantic.DeepEqual(existing.Data, updated.Data) {
+		return nil
+	}
+
+	return ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(existing))
+}
+
+func (s *persistentVolumeClaimSyncer) dataProtectionPopulatedPersistentVolume(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolume, bool, error) {
 	if !isDataProtectionBackupPVC(vObj) || !isVirtualPVCBound(vObj) || !isHostPVCWaitingForVolume(pObj) {
-		return false, nil
+		return nil, false, nil
 	}
 
 	vPV := &corev1.PersistentVolume{}
 	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: vObj.Spec.VolumeName}, vPV)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
-			return false, nil
+			return nil, false, nil
 		}
-		return false, err
+		return nil, false, err
 	}
 
 	if vPV.Annotations[dataProtectionPopulateFromAnnotation] == "" {
-		return false, nil
+		return nil, false, nil
 	}
 	if vPV.Spec.ClaimRef == nil ||
 		vPV.Spec.ClaimRef.Namespace != vObj.Namespace ||
 		vPV.Spec.ClaimRef.Name != vObj.Name {
-		return false, nil
+		return nil, false, nil
 	}
 	if vPV.Spec.ClaimRef.UID != "" && vPV.Spec.ClaimRef.UID != vObj.UID {
-		return false, nil
+		return nil, false, nil
 	}
 
-	return true, nil
+	return vPV, true, nil
+}
+
+func dataProtectionMaterializationRequest(hostNamespace string, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: hostNamespace,
+			Name:      dataProtectionMaterializationRequestName(pObj),
+			Labels: map[string]string{
+				dataProtectionMaterializationRequestLabel: "true",
+			},
+		},
+		Data: map[string]string{
+			"state":               dataProtectionMaterializationStatePending,
+			"hostPVCNamespace":    pObj.Namespace,
+			"hostPVCName":         pObj.Name,
+			"virtualPVCNamespace": vObj.Namespace,
+			"virtualPVCName":      vObj.Name,
+			"virtualPVCUID":       string(vObj.UID),
+			"virtualPVName":       vPV.Name,
+			"virtualPVUID":        string(vPV.UID),
+			"backupName":          vObj.Spec.DataSourceRef.Name,
+			"populateFrom":        vPV.Annotations[dataProtectionPopulateFromAnnotation],
+		},
+	}
+}
+
+func dataProtectionMaterializationRequestName(pObj *corev1.PersistentVolumeClaim) string {
+	sum := sha256.Sum256([]byte(pObj.Namespace + "/" + pObj.Name))
+	return dataProtectionMaterializationRequestPrefix + hex.EncodeToString(sum[:])[:16]
 }
 
 func isDataProtectionBackupPVC(pvc *corev1.PersistentVolumeClaim) bool {
