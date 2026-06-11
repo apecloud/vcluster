@@ -53,6 +53,8 @@ const (
 	dataProtectionMaterializationRequestLabel  = "vcluster.loft.sh/dataprotection-materialization-request"
 	dataProtectionMaterializationRequestPrefix = "dp-host-materialization-"
 	dataProtectionMaterializationStatePending  = "pending"
+
+	dataProtectionRestoreConditionReasonProvisioned = "Provisioned"
 )
 
 func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
@@ -122,7 +124,28 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		})
 	}
 
-	pObj, err := s.translate(ctx, event.Virtual)
+	pObj, handled, err := s.translateDataProtectionBackupToHost(ctx, event.Virtual)
+	if err != nil {
+		s.EventRecorder().Eventf(
+			event.Virtual,
+			nil,
+			"Warning",
+			"SyncError",
+			fmt.Sprintf("Sync%s", event.Virtual.GetObjectKind().GroupVersionKind().Kind),
+			err.Error(),
+		)
+		return ctrl.Result{}, err
+	}
+	if handled {
+		err = pro.ApplyPatchesHostObject(ctx, nil, pObj, event.Virtual, ctx.Config.Sync.ToHost.PersistentVolumeClaims.Patches, false)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), true)
+	}
+
+	pObj, err = s.translate(ctx, event.Virtual)
 	if err != nil {
 		s.EventRecorder().Eventf(
 			event.Virtual,
@@ -262,6 +285,21 @@ func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext
 	return patcher.CreateVirtualObject(ctx, event.Host, vPvc, s.EventRecorder(), true)
 }
 
+func (s *persistentVolumeClaimSyncer) translateDataProtectionBackupToHost(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolumeClaim, bool, error) {
+	if !isDataProtectionBackupPVC(vObj) || !isDataProtectionRestoreProvisionedWithoutDataRestore(vObj) {
+		return nil, false, nil
+	}
+
+	pObj, err := s.translate(ctx, vObj)
+	if err != nil {
+		return nil, true, err
+	}
+
+	clearDataProtectionHostDataSource(pObj)
+	pObj.Spec.VolumeName = ""
+	return pObj, true, nil
+}
+
 func (s *persistentVolumeClaimSyncer) ensurePersistentVolume(ctx *synccontext.SyncContext, pObj *corev1.PersistentVolumeClaim, vObj *corev1.PersistentVolumeClaim, log loghelper.Logger) (bool, error) {
 	// ensure the persistent volume is available in the virtual cluster
 	vPV := &corev1.PersistentVolume{}
@@ -372,6 +410,26 @@ func (s *persistentVolumeClaimSyncer) findDataProtectionPopulatedPersistentVolum
 }
 
 func (s *persistentVolumeClaimSyncer) ensureDataProtectionHostMaterialization(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) error {
+	hostPVName := s.dataProtectionHostPersistentVolumeName(ctx, vPV)
+	hostPV := &corev1.PersistentVolume{}
+	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, hostPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return s.upsertDataProtectionMaterializationRequest(ctx, pObj, vObj, vPV)
+		}
+		return err
+	}
+
+	helperPVC, helperFound, err := s.findDataProtectionPopulateHelperPVC(ctx, vObj, vPV)
+	if err != nil {
+		return err
+	}
+
+	pObj.Spec.VolumeName = hostPVName
+	return s.ensureDataProtectionHostPVClaimRef(ctx, hostPVName, pObj, helperPVC, helperFound)
+}
+
+func (s *persistentVolumeClaimSyncer) upsertDataProtectionMaterializationRequest(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) error {
 	desired := dataProtectionMaterializationRequest(ctx.Config.HostNamespace, pObj, vObj, vPV)
 	existing := &corev1.ConfigMap{}
 	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{
@@ -394,6 +452,106 @@ func (s *persistentVolumeClaimSyncer) ensureDataProtectionHostMaterialization(ct
 	}
 
 	return ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(existing))
+}
+
+func (s *persistentVolumeClaimSyncer) dataProtectionHostPersistentVolumeName(ctx *synccontext.SyncContext, vPV *corev1.PersistentVolume) string {
+	if s.useFakePersistentVolumes {
+		return vPV.Name
+	}
+
+	return mappings.VirtualToHostName(ctx, vPV.Name, "", mappings.PersistentVolumes())
+}
+
+func (s *persistentVolumeClaimSyncer) findDataProtectionPopulateHelperPVC(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) (*corev1.PersistentVolumeClaim, bool, error) {
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err := ctx.VirtualClient.List(ctx.Context, pvcList, client.InNamespace(vObj.Namespace))
+	if err != nil {
+		return nil, false, err
+	}
+
+	var match *corev1.PersistentVolumeClaim
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if pvc.Name == vObj.Name || pvc.Spec.VolumeName != vPV.Name {
+			continue
+		}
+		if match != nil && match.Name != pvc.Name {
+			return nil, false, fmt.Errorf("multiple data protection helper persistent volume claims match pv %s for pvc %s/%s", vPV.Name, vObj.Namespace, vObj.Name)
+		}
+		match = pvc.DeepCopy()
+	}
+	if match == nil {
+		return nil, false, nil
+	}
+
+	return match, true, nil
+}
+
+func (s *persistentVolumeClaimSyncer) ensureDataProtectionHostPVClaimRef(ctx *synccontext.SyncContext, hostPVName string, pObj *corev1.PersistentVolumeClaim, helperPVC *corev1.PersistentVolumeClaim, helperFound bool) error {
+	hostPV := &corev1.PersistentVolume{}
+	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, hostPV)
+	if err != nil {
+		return err
+	}
+
+	targetRef := &corev1.ObjectReference{
+		APIVersion: corev1.SchemeGroupVersion.Version,
+		Kind:       "PersistentVolumeClaim",
+		Namespace:  pObj.Namespace,
+		Name:       pObj.Name,
+		UID:        pObj.UID,
+	}
+	if claimRefMatchesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) {
+		if hostPV.Spec.ClaimRef.UID == pObj.UID {
+			return nil
+		}
+	} else if hostPV.Spec.ClaimRef != nil {
+		if !helperFound {
+			return fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
+		}
+		ok, err := s.hostPVClaimRefMatchesVirtualPVC(ctx, hostPV.Spec.ClaimRef, helperPVC)
+		if err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
+		}
+	}
+
+	updated := hostPV.DeepCopy()
+	updated.Spec.ClaimRef = targetRef
+	return ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(hostPV))
+}
+
+func (s *persistentVolumeClaimSyncer) hostPVClaimRefMatchesVirtualPVC(ctx *synccontext.SyncContext, ref *corev1.ObjectReference, vPVC *corev1.PersistentVolumeClaim) (bool, error) {
+	if ref == nil || vPVC == nil {
+		return false, nil
+	}
+
+	hostPVCName := s.VirtualToHost(ctx, types.NamespacedName{Name: vPVC.Name, Namespace: vPVC.Namespace}, vPVC)
+	if ref.Namespace != hostPVCName.Namespace || ref.Name != hostPVCName.Name {
+		return false, nil
+	}
+
+	hostPVC := &corev1.PersistentVolumeClaim{}
+	err := ctx.HostClient.Get(ctx.Context, hostPVCName, hostPVC)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return ref.UID == "" || ref.UID == hostPVC.UID, nil
+}
+
+func claimRefMatchesPersistentVolumeClaim(ref *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim) bool {
+	if ref == nil || pvc == nil {
+		return false
+	}
+
+	return ref.Namespace == pvc.Namespace &&
+		ref.Name == pvc.Name &&
+		(ref.UID == "" || ref.UID == pvc.UID)
 }
 
 func (s *persistentVolumeClaimSyncer) dataProtectionPopulatedPersistentVolume(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolume, bool, error) {
@@ -516,6 +674,23 @@ func isHostPVCWaitingForVolume(pvc *corev1.PersistentVolumeClaim) bool {
 
 	storage, ok := pvc.Status.Capacity[corev1.ResourceStorage]
 	return !ok || storage.IsZero()
+}
+
+func isDataProtectionRestoreProvisionedWithoutDataRestore(pvc *corev1.PersistentVolumeClaim) bool {
+	for _, condition := range pvc.Status.Conditions {
+		if condition.Type == corev1.PersistentVolumeClaimConditionType("Restore") &&
+			condition.Status == corev1.ConditionTrue &&
+			condition.Reason == dataProtectionRestoreConditionReasonProvisioned {
+			return true
+		}
+	}
+
+	return false
+}
+
+func clearDataProtectionHostDataSource(pvc *corev1.PersistentVolumeClaim) {
+	pvc.Spec.DataSource = nil
+	pvc.Spec.DataSourceRef = nil
 }
 
 func (s *persistentVolumeClaimSyncer) isHostVolumeRestoreInProgress(ctx *synccontext.SyncContext, pObj types.NamespacedName) (bool, error) {
