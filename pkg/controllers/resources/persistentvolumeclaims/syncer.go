@@ -45,6 +45,7 @@ const (
 	bindCompletedAnnotation      = "pv.kubernetes.io/bind-completed"
 	boundByControllerAnnotation  = "pv.kubernetes.io/bound-by-controller"
 	storageProvisionerAnnotation = "volume.beta.kubernetes.io/storage-provisioner"
+	selectedNodeAnnotation       = "volume.kubernetes.io/selected-node"
 
 	dataProtectionAPIGroup               = "dataprotection.kubeblocks.io"
 	dataProtectionBackupKind             = "Backup"
@@ -198,6 +199,12 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	} else if event.Virtual.DeletionTimestamp != nil {
 		return patcher.DeleteHostObjectWithOptions(ctx, event.Host, event.Virtual, "virtual persistent volume claim is being deleted", &client.DeleteOptions{
 			GracePeriodSeconds: event.Virtual.DeletionGracePeriodSeconds,
+			Preconditions:      metav1.NewUIDPreconditions(string(event.Host.UID)),
+		})
+	}
+	if shouldRecreateDataProtectionHostNoDataRestorePVC(event.Host, event.Virtual) {
+		return patcher.DeleteHostObjectWithOptions(ctx, event.Host, event.Virtual, "data protection restore pvc was provisioned without data restore", &client.DeleteOptions{
+			GracePeriodSeconds: &zero,
 			Preconditions:      metav1.NewUIDPreconditions(string(event.Host.UID)),
 		})
 	}
@@ -691,6 +698,34 @@ func isDataProtectionRestoreProvisionedWithoutDataRestore(pvc *corev1.Persistent
 func clearDataProtectionHostDataSource(pvc *corev1.PersistentVolumeClaim) {
 	pvc.Spec.DataSource = nil
 	pvc.Spec.DataSourceRef = nil
+}
+
+func shouldRecreateDataProtectionHostNoDataRestorePVC(pObj, vObj *corev1.PersistentVolumeClaim) bool {
+	if !isDataProtectionBackupPVC(vObj) || !isDataProtectionRestoreProvisionedWithoutDataRestore(vObj) || !isHostPVCWaitingForVolume(pObj) {
+		return false
+	}
+
+	return isDataProtectionBackupDataSource(pObj.Spec.DataSource) || isDataProtectionBackupDataSourceRef(pObj.Spec.DataSourceRef)
+}
+
+func isDataProtectionBackupDataSource(ref *corev1.TypedLocalObjectReference) bool {
+	if ref == nil || ref.APIGroup == nil {
+		return false
+	}
+
+	return *ref.APIGroup == dataProtectionAPIGroup &&
+		ref.Kind == dataProtectionBackupKind &&
+		ref.Name != ""
+}
+
+func isDataProtectionBackupDataSourceRef(ref *corev1.TypedObjectReference) bool {
+	if ref == nil || ref.APIGroup == nil {
+		return false
+	}
+
+	return *ref.APIGroup == dataProtectionAPIGroup &&
+		ref.Kind == dataProtectionBackupKind &&
+		ref.Name != ""
 }
 
 func (s *persistentVolumeClaimSyncer) isHostVolumeRestoreInProgress(ctx *synccontext.SyncContext, pObj types.NamespacedName) (bool, error) {

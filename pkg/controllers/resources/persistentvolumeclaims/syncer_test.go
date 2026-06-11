@@ -107,6 +107,7 @@ func TestSync(t *testing.T) {
 				bindCompletedAnnotation:           "testannotation",
 				boundByControllerAnnotation:       "testannotation2",
 				storageProvisionerAnnotation:      "testannotation3",
+				selectedNodeAnnotation:            "node1",
 			},
 			Labels: pObjectMeta.Labels,
 		},
@@ -119,6 +120,7 @@ func TestSync(t *testing.T) {
 				bindCompletedAnnotation:      "testannotation",
 				boundByControllerAnnotation:  "testannotation2",
 				storageProvisionerAnnotation: "testannotation3",
+				selectedNodeAnnotation:       "node1",
 			},
 		},
 	}
@@ -225,6 +227,19 @@ func TestSync(t *testing.T) {
 	dataProtectionNoDataHostPvc := dataProtectionHostPendingPvcWithUID.DeepCopy()
 	dataProtectionNoDataHostPvc.Spec = corev1.PersistentVolumeClaimSpec{}
 	dataProtectionNoDataHostPvc.Status = dataProtectionNoDataRestorePvc.Status
+	dataProtectionNoDataHostPendingWithBackupSource := dataProtectionHostPendingPvcWithUID.DeepCopy()
+	dataProtectionNoDataHostPendingWithBackupSource.Spec = corev1.PersistentVolumeClaimSpec{
+		DataSource: &corev1.TypedLocalObjectReference{
+			APIGroup: &dataProtectionGroup,
+			Kind:     dataProtectionBackupKind,
+			Name:     "backup-1",
+		},
+		DataSourceRef: &corev1.TypedObjectReference{
+			APIGroup: &dataProtectionGroup,
+			Kind:     dataProtectionBackupKind,
+			Name:     "backup-1",
+		},
+	}
 
 	dataProtectionPopulateHelperPvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -435,6 +450,29 @@ func TestSync(t *testing.T) {
 					pObj,
 					vObjOld,
 					vObj,
+				))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                 "Delete existing host backup data source pvc after no-data restore is provisioned",
+			InitialVirtualState:  []runtime.Object{dataProtectionNoDataRestorePvc.DeepCopy()},
+			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestorePvc.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataRestorePvc.DeepCopy(),
+					dataProtectionNoDataRestorePvc.DeepCopy(),
 				))
 				assert.NilError(t, err)
 			},
