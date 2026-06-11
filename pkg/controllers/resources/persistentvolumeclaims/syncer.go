@@ -187,6 +187,13 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		} else if requeue {
 			return ctrl.Result{Requeue: true}, nil
 		}
+	} else {
+		requeue, err := s.ensureDataProtectionPopulatedPersistentVolumeName(ctx, event.Host, event.Virtual, ctx.Log)
+		if err != nil {
+			return ctrl.Result{}, err
+		} else if requeue {
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	// patch objects
@@ -315,6 +322,54 @@ func (s *persistentVolumeClaimSyncer) ensurePersistentVolume(ctx *synccontext.Sy
 	return false, nil
 }
 
+func (s *persistentVolumeClaimSyncer) ensureDataProtectionPopulatedPersistentVolumeName(ctx *synccontext.SyncContext, pObj *corev1.PersistentVolumeClaim, vObj *corev1.PersistentVolumeClaim, log loghelper.Logger) (bool, error) {
+	if vObj.Spec.VolumeName != "" || !isDataProtectionBackupPVC(vObj) || !isHostPVCWaitingForVolume(pObj) {
+		return false, nil
+	}
+
+	vPV, ok, err := s.findDataProtectionPopulatedPersistentVolumeByClaimRef(ctx, vObj)
+	if err != nil || !ok {
+		return false, err
+	}
+
+	log.Infof("update virtual data protection pvc %s/%s volume name to populated pv %s", vObj.Namespace, vObj.Name, vPV.Name)
+	vObj.Spec.VolumeName = vPV.Name
+	err = ctx.VirtualClient.Update(ctx, vObj)
+	if err != nil {
+		return false, err
+	}
+
+	// The direct update changes the virtual PVC resourceVersion. Stop this
+	// reconcile here so the following status patch uses a fresh object.
+	return true, nil
+}
+
+func (s *persistentVolumeClaimSyncer) findDataProtectionPopulatedPersistentVolumeByClaimRef(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolume, bool, error) {
+	vPVs := &corev1.PersistentVolumeList{}
+	err := ctx.VirtualClient.List(ctx.Context, vPVs)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var match *corev1.PersistentVolume
+	for i := range vPVs.Items {
+		vPV := &vPVs.Items[i]
+		if !isDataProtectionPopulatedPersistentVolumeForPVC(vPV, vObj, true) {
+			continue
+		}
+		if match != nil && match.Name != vPV.Name {
+			return nil, false, fmt.Errorf("multiple data protection populated persistent volumes match pvc %s/%s", vObj.Namespace, vObj.Name)
+		}
+		match = vPV.DeepCopy()
+	}
+
+	if match == nil {
+		return nil, false, nil
+	}
+
+	return match, true, nil
+}
+
 func (s *persistentVolumeClaimSyncer) shouldPreserveVirtualDataProtectionPopulateStatus(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (bool, error) {
 	_, ok, err := s.dataProtectionPopulatedPersistentVolume(ctx, pObj, vObj)
 	return ok, err
@@ -367,16 +422,30 @@ func (s *persistentVolumeClaimSyncer) dataProtectionPopulatedPersistentVolume(ct
 	if vPV.Annotations[dataProtectionPopulateFromAnnotation] == "" {
 		return nil, false, nil
 	}
-	if vPV.Spec.ClaimRef == nil ||
-		vPV.Spec.ClaimRef.Namespace != vObj.Namespace ||
-		vPV.Spec.ClaimRef.Name != vObj.Name {
-		return nil, false, nil
-	}
-	if vPV.Spec.ClaimRef.UID != "" && vPV.Spec.ClaimRef.UID != vObj.UID {
+	if !isDataProtectionPopulatedPersistentVolumeForPVC(vPV, vObj, false) {
 		return nil, false, nil
 	}
 
 	return vPV, true, nil
+}
+
+func isDataProtectionPopulatedPersistentVolumeForPVC(vPV *corev1.PersistentVolume, vObj *corev1.PersistentVolumeClaim, requireBoundPV bool) bool {
+	if requireBoundPV && vPV.Status.Phase != corev1.VolumeBound {
+		return false
+	}
+	if vPV.Annotations[dataProtectionPopulateFromAnnotation] == "" {
+		return false
+	}
+	if vPV.Spec.ClaimRef == nil ||
+		vPV.Spec.ClaimRef.Namespace != vObj.Namespace ||
+		vPV.Spec.ClaimRef.Name != vObj.Name {
+		return false
+	}
+	if vPV.Spec.ClaimRef.UID != "" && vPV.Spec.ClaimRef.UID != vObj.UID {
+		return false
+	}
+
+	return true
 }
 
 func dataProtectionMaterializationRequest(hostNamespace string, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) *corev1.ConfigMap {

@@ -162,6 +162,13 @@ func TestSync(t *testing.T) {
 			},
 		},
 	}
+	dataProtectionBackupPendingPvc := dataProtectionBackupPvc.DeepCopy()
+	dataProtectionBackupPendingPvc.Spec.VolumeName = ""
+	dataProtectionBackupPendingPvc.Status = corev1.PersistentVolumeClaimStatus{
+		Phase: corev1.ClaimPending,
+	}
+	dataProtectionBackupPendingPvcWithVolumeName := dataProtectionBackupPendingPvc.DeepCopy()
+	dataProtectionBackupPendingPvcWithVolumeName.Spec.VolumeName = "restore-populated-pv"
 	dataProtectionHostPendingPvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: pObjectMeta,
 		Status: corev1.PersistentVolumeClaimStatus{
@@ -185,11 +192,15 @@ func TestSync(t *testing.T) {
 				UID:       dataProtectionBackupPvc.UID,
 			},
 		},
+		Status: corev1.PersistentVolumeStatus{
+			Phase: corev1.VolumeBound,
+		},
 	}
 	dataProtectionStaleUIDPvc := dataProtectionBackupPvc.DeepCopy()
 	dataProtectionStaleUIDPvc.Status = *dataProtectionHostPendingPvc.Status.DeepCopy()
 	dataProtectionStaleUIDPV := dataProtectionPopulatedPV.DeepCopy()
 	dataProtectionStaleUIDPV.Spec.ClaimRef.UID = types.UID("stale-pvc-uid")
+	dataProtectionStaleUIDPendingPvc := dataProtectionBackupPendingPvc.DeepCopy()
 	dataProtectionMaterializationRequestCM := dataProtectionMaterializationRequest("test", dataProtectionHostPendingPvc, dataProtectionBackupPvc, dataProtectionPopulatedPV)
 
 	syncertesting.RunTestsWithContext(t, func(vConfig *config.VirtualClusterConfig, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient) *synccontext.RegisterContext {
@@ -399,6 +410,62 @@ func TestSync(t *testing.T) {
 					dataProtectionBackupPvc.DeepCopy(),
 				))
 				assert.NilError(t, err)
+			},
+		},
+		{
+			Name: "Requeue after deriving data protection pvc volume name from populated pv claim ref",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionBackupPendingPvc.DeepCopy(),
+				dataProtectionPopulatedPV.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{dataProtectionHostPendingPvc.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionBackupPendingPvcWithVolumeName.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {dataProtectionPopulatedPV.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionHostPendingPvc.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionBackupPendingPvc.DeepCopy(),
+					dataProtectionBackupPendingPvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.Requeue)
+			},
+		},
+		{
+			Name: "Do not derive data protection pvc volume name from stale same-name claim ref uid",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionBackupPendingPvc.DeepCopy(),
+				dataProtectionStaleUIDPV.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{dataProtectionHostPendingPvc.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionStaleUIDPendingPvc.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {dataProtectionStaleUIDPV.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionHostPendingPvcWithUID.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionBackupPendingPvc.DeepCopy(),
+					dataProtectionBackupPendingPvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, !result.Requeue)
 			},
 		},
 		{
