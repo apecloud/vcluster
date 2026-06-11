@@ -223,15 +223,16 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	s.translateUpdateBackwards(event.Host, event.Virtual)
 
 	// copy host status
-	preserveVirtualStatus, err := s.shouldPreserveVirtualDataProtectionPopulateStatus(ctx, event.Host, event.Virtual)
+	vPV, preserveVirtualStatus, err := s.dataProtectionPopulatedPersistentVolume(ctx, event.Host, event.Virtual)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if preserveVirtualStatus {
-		err = s.ensureDataProtectionHostMaterialization(ctx, event.Host, event.Virtual)
+		err = s.ensureDataProtectionHostMaterialization(ctx, event.Host, event.Virtual, vPV)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		ensureDataProtectionVirtualPopulateStatus(event.Virtual, vPV)
 	} else {
 		event.Virtual.Status = *event.Host.Status.DeepCopy()
 	}
@@ -370,20 +371,10 @@ func (s *persistentVolumeClaimSyncer) findDataProtectionPopulatedPersistentVolum
 	return match, true, nil
 }
 
-func (s *persistentVolumeClaimSyncer) shouldPreserveVirtualDataProtectionPopulateStatus(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (bool, error) {
-	_, ok, err := s.dataProtectionPopulatedPersistentVolume(ctx, pObj, vObj)
-	return ok, err
-}
-
-func (s *persistentVolumeClaimSyncer) ensureDataProtectionHostMaterialization(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) error {
-	vPV, ok, err := s.dataProtectionPopulatedPersistentVolume(ctx, pObj, vObj)
-	if err != nil || !ok {
-		return err
-	}
-
+func (s *persistentVolumeClaimSyncer) ensureDataProtectionHostMaterialization(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) error {
 	desired := dataProtectionMaterializationRequest(ctx.Config.HostNamespace, pObj, vObj, vPV)
 	existing := &corev1.ConfigMap{}
-	err = ctx.HostClient.Get(ctx.Context, types.NamespacedName{
+	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{
 		Namespace: desired.Namespace,
 		Name:      desired.Name,
 	}, existing)
@@ -406,7 +397,7 @@ func (s *persistentVolumeClaimSyncer) ensureDataProtectionHostMaterialization(ct
 }
 
 func (s *persistentVolumeClaimSyncer) dataProtectionPopulatedPersistentVolume(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolume, bool, error) {
-	if !isDataProtectionBackupPVC(vObj) || !isVirtualPVCBound(vObj) || !isHostPVCWaitingForVolume(pObj) {
+	if !isDataProtectionBackupPVC(vObj) || vObj.Spec.VolumeName == "" || !isHostPVCWaitingForVolume(pObj) {
 		return nil, false, nil
 	}
 
@@ -425,8 +416,30 @@ func (s *persistentVolumeClaimSyncer) dataProtectionPopulatedPersistentVolume(ct
 	if !isDataProtectionPopulatedPersistentVolumeForPVC(vPV, vObj, false) {
 		return nil, false, nil
 	}
+	if !isVirtualPVCBound(vObj) && vPV.Status.Phase != corev1.VolumeBound {
+		return nil, false, nil
+	}
 
 	return vPV, true, nil
+}
+
+func ensureDataProtectionVirtualPopulateStatus(vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) {
+	if isVirtualPVCBound(vObj) {
+		return
+	}
+
+	if vPV.Status.Phase != corev1.VolumeBound {
+		return
+	}
+
+	vObj.Status.Phase = corev1.ClaimBound
+	if len(vObj.Status.AccessModes) == 0 {
+		vObj.Status.AccessModes = append([]corev1.PersistentVolumeAccessMode(nil), vPV.Spec.AccessModes...)
+	}
+	storage, ok := vObj.Status.Capacity[corev1.ResourceStorage]
+	if vObj.Status.Capacity == nil || !ok || storage.IsZero() {
+		vObj.Status.Capacity = vPV.Spec.Capacity.DeepCopy()
+	}
 }
 
 func isDataProtectionPopulatedPersistentVolumeForPVC(vPV *corev1.PersistentVolume, vObj *corev1.PersistentVolumeClaim, requireBoundPV bool) bool {
