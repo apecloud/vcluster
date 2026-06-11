@@ -240,6 +240,9 @@ func TestSync(t *testing.T) {
 			Name:     "backup-1",
 		},
 	}
+	dataProtectionNoDataHostDeletingWithBackupSource := dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()
+	dataProtectionNoDataHostDeletingWithBackupSource.Finalizers = []string{"kubernetes.io/pvc-protection"}
+	dataProtectionNoDataHostDeletingWithBackupSource.DeletionTimestamp = &metav1.Time{Time: time.Now()}
 
 	dataProtectionPopulateHelperPvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -346,6 +349,26 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
+			Name:                "Recreate data protection no-data host pvc without deleting virtual after stale host pvc was deleted",
+			InitialVirtualState: []runtime.Object{dataProtectionNoDataRestorePvc.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestorePvc.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataHostPvc.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, &synccontext.SyncToHostEvent[*corev1.PersistentVolumeClaim]{
+					HostOld: dataProtectionNoDataHostDeletingWithBackupSource.DeepCopy(),
+					Virtual: dataProtectionNoDataRestorePvc.DeepCopy(),
+				})
+				assert.NilError(t, err)
+			},
+		},
+		{
 			Name:                 "Delete forward with create function",
 			InitialVirtualState:  []runtime.Object{basePvc},
 			InitialPhysicalState: []runtime.Object{createdPvc},
@@ -425,6 +448,30 @@ func TestSync(t *testing.T) {
 				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
 				_, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEvent(createdPvc.DeepCopy(), deletePvc.DeepCopy()))
 				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                 "Do not delete virtual data protection no-data pvc while stale host pvc is deleting",
+			InitialVirtualState:  []runtime.Object{dataProtectionNoDataRestorePvc.DeepCopy()},
+			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostDeletingWithBackupSource.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestorePvc.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataHostDeletingWithBackupSource.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionNoDataHostDeletingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataHostDeletingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataRestorePvc.DeepCopy(),
+					dataProtectionNoDataRestorePvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.RequeueAfter > 0)
 			},
 		},
 		{

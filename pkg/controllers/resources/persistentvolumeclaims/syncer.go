@@ -119,7 +119,11 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, nil
 	}
 
-	if event.HostOld != nil || event.Virtual.DeletionTimestamp != nil {
+	if event.HostOld != nil && shouldRecreateDataProtectionHostNoDataRestorePVC(event.HostOld, event.Virtual) && event.Virtual.DeletionTimestamp == nil {
+		// The host PVC was intentionally deleted so it can be recreated without
+		// the Backup dataSource. Keep the virtual restore PVC and continue into
+		// the create path below.
+	} else if event.HostOld != nil || event.Virtual.DeletionTimestamp != nil {
 		return patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.HostOld, "host object was deleted", &client.DeleteOptions{
 			GracePeriodSeconds: &zero,
 		})
@@ -189,6 +193,9 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 	// if pvs are deleted check the corresponding pvc is deleted as well
 	if event.Host.DeletionTimestamp != nil {
+		if shouldRecreateDataProtectionHostNoDataRestorePVC(event.Host, event.Virtual) {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 		if event.Virtual.DeletionTimestamp == nil {
 			return patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.Host, "host persistent volume claim is being deleted", &client.DeleteOptions{GracePeriodSeconds: &minimumGracePeriodInSeconds})
 		} else if *event.Virtual.DeletionGracePeriodSeconds != *event.Host.DeletionGracePeriodSeconds {
