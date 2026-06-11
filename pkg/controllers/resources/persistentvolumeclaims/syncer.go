@@ -119,7 +119,7 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, nil
 	}
 
-	if event.HostOld != nil && shouldRecreateDataProtectionHostNoDataRestorePVC(event.HostOld, event.Virtual) && event.Virtual.DeletionTimestamp == nil {
+	if event.HostOld != nil && shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(event.HostOld, event.Virtual) && event.Virtual.DeletionTimestamp == nil {
 		// The host PVC was intentionally deleted so it can be recreated without
 		// the Backup dataSource. Keep the virtual restore PVC and continue into
 		// the create path below.
@@ -193,7 +193,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 	// if pvs are deleted check the corresponding pvc is deleted as well
 	if event.Host.DeletionTimestamp != nil {
-		if shouldRecreateDataProtectionHostNoDataRestorePVC(event.Host, event.Virtual) {
+		if shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(event.Host, event.Virtual) {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 		if event.Virtual.DeletionTimestamp == nil {
@@ -210,10 +210,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		})
 	}
 	if shouldRecreateDataProtectionHostNoDataRestorePVC(event.Host, event.Virtual) {
-		return patcher.DeleteHostObjectWithOptions(ctx, event.Host, event.Virtual, "data protection restore pvc was provisioned without data restore", &client.DeleteOptions{
-			GracePeriodSeconds: &zero,
-			Preconditions:      metav1.NewUIDPreconditions(string(event.Host.UID)),
-		})
+		return deleteDataProtectionNoDataRestoreHostPVC(ctx, event.Host, event.Virtual)
 	}
 
 	// make sure the persistent volume is synced / faked
@@ -708,11 +705,45 @@ func clearDataProtectionHostDataSource(pvc *corev1.PersistentVolumeClaim) {
 }
 
 func shouldRecreateDataProtectionHostNoDataRestorePVC(pObj, vObj *corev1.PersistentVolumeClaim) bool {
-	if !isDataProtectionBackupPVC(vObj) || !isDataProtectionRestoreProvisionedWithoutDataRestore(vObj) || !isHostPVCWaitingForVolume(pObj) {
+	if !shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(pObj, vObj) || !isHostPVCWaitingForVolume(pObj) {
 		return false
 	}
 
 	return isDataProtectionBackupDataSource(pObj.Spec.DataSource) || isDataProtectionBackupDataSourceRef(pObj.Spec.DataSourceRef)
+}
+
+func shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(pObj, vObj *corev1.PersistentVolumeClaim) bool {
+	return isDataProtectionBackupPVC(vObj) &&
+		isDataProtectionRestoreProvisionedWithoutDataRestore(vObj)
+}
+
+func deleteDataProtectionNoDataRestoreHostPVC(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (ctrl.Result, error) {
+	result, err := patcher.DeleteHostObjectWithOptions(ctx, pObj, vObj, "data protection restore pvc was provisioned without data restore", &client.DeleteOptions{
+		GracePeriodSeconds: &zero,
+		Preconditions:      hostDeletePreconditions(pObj),
+	})
+	if kerrors.IsConflict(err) {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	return result, err
+}
+
+func hostDeletePreconditions(obj client.Object) *metav1.Preconditions {
+	preconditions := &metav1.Preconditions{}
+	if obj.GetUID() != "" {
+		uid := obj.GetUID()
+		preconditions.UID = &uid
+	}
+	if obj.GetResourceVersion() != "" {
+		resourceVersion := obj.GetResourceVersion()
+		preconditions.ResourceVersion = &resourceVersion
+	}
+	if preconditions.UID == nil && preconditions.ResourceVersion == nil {
+		return nil
+	}
+
+	return preconditions
 }
 
 func isDataProtectionBackupDataSource(ref *corev1.TypedLocalObjectReference) bool {
