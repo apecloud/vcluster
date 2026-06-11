@@ -136,6 +136,10 @@ func TestSync(t *testing.T) {
 		Spec:       backwardUpdateStatusPvc.Spec,
 		Status:     backwardUpdateStatusPvc.Status,
 	}
+	backwardUpdateVolumeNameOnlyPvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: vObjectMeta,
+		Spec:       backwardUpdateStatusPvc.Spec,
+	}
 	dataProtectionGroup := dataProtectionAPIGroup
 	dataProtectionBackupPvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -318,8 +322,32 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
-			Name:                 "Update backwards new status",
+			Name:                 "Requeue after updating virtual pvc volume name from host",
 			InitialVirtualState:  []runtime.Object{basePvc.DeepCopy()},
+			InitialPhysicalState: []runtime.Object{backwardUpdateStatusPvc.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {backwardUpdateVolumeNameOnlyPvc.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {backwardUpdateStatusPvc.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					backwardUpdateStatusPvc.DeepCopy(),
+					backwardUpdateStatusPvc.DeepCopy(),
+					basePvc.DeepCopy(),
+					basePvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.Requeue)
+			},
+		},
+		{
+			Name:                 "Update backwards new status",
+			InitialVirtualState:  []runtime.Object{backwardUpdateVolumeNameOnlyPvc.DeepCopy()},
 			InitialPhysicalState: []runtime.Object{backwardUpdateStatusPvc.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {backwardUpdatedStatusPvc.DeepCopy()},
@@ -333,8 +361,8 @@ func TestSync(t *testing.T) {
 
 				pObjOld := backwardUpdateStatusPvc.DeepCopy()
 				pObj := backwardUpdateStatusPvc.DeepCopy()
-				vObjOld := basePvc.DeepCopy()
-				vObj := basePvc.DeepCopy()
+				vObjOld := backwardUpdateVolumeNameOnlyPvc.DeepCopy()
+				vObj := backwardUpdateVolumeNameOnlyPvc.DeepCopy()
 
 				_, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
 					pObjOld,

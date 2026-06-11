@@ -305,6 +305,10 @@ func (s *persistentVolumeClaimSyncer) ensurePersistentVolume(ctx *synccontext.Sy
 			if err != nil {
 				return false, err
 			}
+
+			// The direct update changes the virtual PVC resourceVersion. Stop this
+			// reconcile here so the following status patch uses a fresh object.
+			return true, nil
 		}
 	}
 
