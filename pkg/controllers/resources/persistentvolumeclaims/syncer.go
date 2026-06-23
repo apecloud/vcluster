@@ -790,25 +790,8 @@ func (s *persistentVolumeClaimSyncer) isDataProtectionNoDataRestorePVC(ctx *sync
 	if !isDataProtectionBackupPVC(vObj) {
 		return false, nil
 	}
-	if isDataProtectionRestoreProvisionedWithoutDataRestore(vObj) {
-		return true, nil
-	}
 
-	if vObj.Spec.VolumeName != "" {
-		vPV := &corev1.PersistentVolume{}
-		err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: vObj.Spec.VolumeName}, vPV)
-		if err != nil {
-			if kerrors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, err
-		}
-
-		return isDataProtectionPopulatedPersistentVolumeForPVC(vPV, vObj, true), nil
-	}
-
-	_, ok, err := s.findDataProtectionPopulatedPersistentVolumeByClaimRef(ctx, vObj)
-	return ok, err
+	return isDataProtectionRestoreProvisionedWithoutDataRestore(vObj), nil
 }
 
 func deleteDataProtectionNoDataRestoreHostPVC(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (ctrl.Result, error) {
