@@ -119,7 +119,11 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, nil
 	}
 
-	if event.HostOld != nil && shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(event.HostOld, event.Virtual) && event.Virtual.DeletionTimestamp == nil {
+	preserveDeletingHostPVC, err := s.shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(ctx, event.Virtual)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if event.HostOld != nil && preserveDeletingHostPVC && event.Virtual.DeletionTimestamp == nil {
 		// The host PVC was intentionally deleted so it can be recreated without
 		// the Backup dataSource. Keep the virtual restore PVC and continue into
 		// the create path below.
@@ -193,7 +197,11 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 	// if pvs are deleted check the corresponding pvc is deleted as well
 	if event.Host.DeletionTimestamp != nil {
-		if shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(event.Host, event.Virtual) {
+		preserveDeletingHostPVC, err := s.shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(ctx, event.Virtual)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if preserveDeletingHostPVC {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 		if event.Virtual.DeletionTimestamp == nil {
@@ -209,7 +217,11 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 			Preconditions:      metav1.NewUIDPreconditions(string(event.Host.UID)),
 		})
 	}
-	if shouldRecreateDataProtectionHostNoDataRestorePVC(event.Host, event.Virtual) {
+	recreateHostPVC, err := s.shouldRecreateDataProtectionHostNoDataRestorePVC(ctx, event.Host, event.Virtual)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if recreateHostPVC {
 		return deleteDataProtectionNoDataRestoreHostPVC(ctx, event.Host, event.Virtual)
 	}
 
@@ -297,7 +309,11 @@ func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext
 }
 
 func (s *persistentVolumeClaimSyncer) translateDataProtectionBackupToHost(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolumeClaim, bool, error) {
-	if !isDataProtectionBackupPVC(vObj) || !isDataProtectionRestoreProvisionedWithoutDataRestore(vObj) {
+	noDataRestore, err := s.isDataProtectionNoDataRestorePVC(ctx, vObj)
+	if err != nil {
+		return nil, true, err
+	}
+	if !noDataRestore {
 		return nil, false, nil
 	}
 
@@ -679,7 +695,7 @@ func isVirtualPVCBound(pvc *corev1.PersistentVolumeClaim) bool {
 }
 
 func isHostPVCWaitingForVolume(pvc *corev1.PersistentVolumeClaim) bool {
-	if pvc.Spec.VolumeName != "" || pvc.Status.Phase == corev1.ClaimBound {
+	if pvc.Status.Phase == corev1.ClaimBound {
 		return false
 	}
 
@@ -704,17 +720,47 @@ func clearDataProtectionHostDataSource(pvc *corev1.PersistentVolumeClaim) {
 	pvc.Spec.DataSourceRef = nil
 }
 
-func shouldRecreateDataProtectionHostNoDataRestorePVC(pObj, vObj *corev1.PersistentVolumeClaim) bool {
-	if !shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(pObj, vObj) || !isHostPVCWaitingForVolume(pObj) {
-		return false
+func (s *persistentVolumeClaimSyncer) shouldRecreateDataProtectionHostNoDataRestorePVC(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (bool, error) {
+	if !isHostPVCWaitingForVolume(pObj) ||
+		(!isDataProtectionBackupDataSource(pObj.Spec.DataSource) && !isDataProtectionBackupDataSourceRef(pObj.Spec.DataSourceRef)) {
+		return false, nil
 	}
 
-	return isDataProtectionBackupDataSource(pObj.Spec.DataSource) || isDataProtectionBackupDataSourceRef(pObj.Spec.DataSourceRef)
+	noDataRestore, err := s.isDataProtectionNoDataRestorePVC(ctx, vObj)
+	if err != nil || !noDataRestore {
+		return false, err
+	}
+
+	return true, nil
 }
 
-func shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(pObj, vObj *corev1.PersistentVolumeClaim) bool {
-	return isDataProtectionBackupPVC(vObj) &&
-		isDataProtectionRestoreProvisionedWithoutDataRestore(vObj)
+func (s *persistentVolumeClaimSyncer) shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (bool, error) {
+	return s.isDataProtectionNoDataRestorePVC(ctx, vObj)
+}
+
+func (s *persistentVolumeClaimSyncer) isDataProtectionNoDataRestorePVC(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (bool, error) {
+	if !isDataProtectionBackupPVC(vObj) {
+		return false, nil
+	}
+	if isDataProtectionRestoreProvisionedWithoutDataRestore(vObj) {
+		return true, nil
+	}
+
+	if vObj.Spec.VolumeName != "" {
+		vPV := &corev1.PersistentVolume{}
+		err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: vObj.Spec.VolumeName}, vPV)
+		if err != nil {
+			if kerrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+
+		return isDataProtectionPopulatedPersistentVolumeForPVC(vPV, vObj, true), nil
+	}
+
+	_, ok, err := s.findDataProtectionPopulatedPersistentVolumeByClaimRef(ctx, vObj)
+	return ok, err
 }
 
 func deleteDataProtectionNoDataRestoreHostPVC(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (ctrl.Result, error) {
