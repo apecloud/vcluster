@@ -986,3 +986,341 @@ func TestSync(t *testing.T) {
 		},
 	})
 }
+
+func TestSync_ExternalPopulatorStatusNotOverwritten(t *testing.T) {
+	vObjectMeta := metav1.ObjectMeta{
+		Name:      "testpvc",
+		Namespace: "testns",
+	}
+	pObjectMeta := metav1.ObjectMeta{
+		Name:      translate.Default.HostName(nil, "testpvc", "testns").Name,
+		Namespace: "test",
+		Annotations: map[string]string{
+			translate.NameAnnotation:          vObjectMeta.Name,
+			translate.NamespaceAnnotation:     vObjectMeta.Namespace,
+			translate.UIDAnnotation:           "",
+			translate.KindAnnotation:          corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim").String(),
+			translate.HostNamespaceAnnotation: "test",
+			translate.HostNameAnnotation:      translate.Default.HostName(nil, "testpvc", "testns").Name,
+		},
+		Labels: map[string]string{
+			translate.MarkerLabel:    translate.VClusterName,
+			translate.NamespaceLabel: vObjectMeta.Namespace,
+		},
+	}
+	apiGroup := "dataprotection.kubeblocks.io"
+
+	syncertesting.RunTestsWithContext(t, func(vConfig *config.VirtualClusterConfig, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient) *synccontext.RegisterContext {
+		ctx := syncertesting.NewFakeRegisterContext(vConfig, pClient, vClient)
+		ctx.Config.Sync.ToHost.StorageClasses.Enabled = false
+		return ctx
+	}, []*syncertesting.SyncTest{
+		{
+			Name: "External populator PVC keeps virtual status on sync",
+			InitialVirtualState: []runtime.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: vObjectMeta,
+					Spec: corev1.PersistentVolumeClaimSpec{
+						DataSourceRef: &corev1.TypedObjectReference{
+							APIGroup: &apiGroup,
+							Kind:     "Backup",
+							Name:     "my-backup",
+						},
+						VolumeName: "pvc-restored-vol",
+					},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Phase:       corev1.ClaimBound,
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+					},
+				},
+			},
+			InitialPhysicalState: []runtime.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: pObjectMeta,
+					Spec: corev1.PersistentVolumeClaimSpec{
+						DataSourceRef: &corev1.TypedObjectReference{
+							APIGroup: &apiGroup,
+							Kind:     "Backup",
+							Name:     "my-backup",
+						},
+					},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Phase: corev1.ClaimPending,
+					},
+				},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					&corev1.PersistentVolumeClaim{
+						ObjectMeta: vObjectMeta,
+						Spec: corev1.PersistentVolumeClaimSpec{
+							DataSourceRef: &corev1.TypedObjectReference{
+								APIGroup: &apiGroup,
+								Kind:     "Backup",
+								Name:     "my-backup",
+							},
+							VolumeName: "pvc-restored-vol",
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase:       corev1.ClaimBound,
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+							Capacity: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("10Gi"),
+							},
+						},
+					},
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					&corev1.PersistentVolumeClaim{
+						ObjectMeta: pObjectMeta,
+						Spec: corev1.PersistentVolumeClaimSpec{
+							DataSourceRef: &corev1.TypedObjectReference{
+								APIGroup: &apiGroup,
+								Kind:     "Backup",
+								Name:     "my-backup",
+							},
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase: corev1.ClaimPending,
+						},
+					},
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+
+				vPVC := &corev1.PersistentVolumeClaim{}
+				err := syncCtx.VirtualClient.Get(syncCtx, types.NamespacedName{
+					Namespace: vObjectMeta.Namespace,
+					Name:      vObjectMeta.Name,
+				}, vPVC)
+				assert.NilError(t, err)
+
+				pPVC := &corev1.PersistentVolumeClaim{}
+				err = syncCtx.HostClient.Get(syncCtx, types.NamespacedName{
+					Namespace: pObjectMeta.Namespace,
+					Name:      pObjectMeta.Name,
+				}, pPVC)
+				assert.NilError(t, err)
+
+				_, err = syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					pPVC.DeepCopy(),
+					pPVC.DeepCopy(),
+					vPVC.DeepCopy(),
+					vPVC.DeepCopy(),
+				))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name: "VolumeSnapshot PVC still gets host status overwrite",
+			InitialVirtualState: []runtime.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "snapshot-pvc",
+						Namespace: "testns",
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						DataSourceRef: &corev1.TypedObjectReference{
+							APIGroup: func() *string { s := "snapshot.storage.k8s.io"; return &s }(),
+							Kind:     "VolumeSnapshot",
+							Name:     "my-snapshot",
+						},
+					},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Phase: corev1.ClaimPending,
+					},
+				},
+			},
+			InitialPhysicalState: []runtime.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      translate.Default.HostName(nil, "snapshot-pvc", "testns").Name,
+						Namespace: "test",
+						Annotations: map[string]string{
+							translate.NameAnnotation:          "snapshot-pvc",
+							translate.NamespaceAnnotation:     "testns",
+							translate.UIDAnnotation:           "",
+							translate.KindAnnotation:          corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim").String(),
+							translate.HostNamespaceAnnotation: "test",
+							translate.HostNameAnnotation:      translate.Default.HostName(nil, "snapshot-pvc", "testns").Name,
+						},
+						Labels: map[string]string{
+							translate.MarkerLabel:    translate.VClusterName,
+							translate.NamespaceLabel: "testns",
+						},
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						DataSourceRef: &corev1.TypedObjectReference{
+							APIGroup: func() *string { s := "snapshot.storage.k8s.io"; return &s }(),
+							Kind:     "VolumeSnapshot",
+							Name:     "my-snapshot",
+						},
+					},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Phase:       corev1.ClaimBound,
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					},
+				},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					&corev1.PersistentVolumeClaim{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "snapshot-pvc",
+							Namespace: "testns",
+						},
+						Spec: corev1.PersistentVolumeClaimSpec{
+							DataSourceRef: &corev1.TypedObjectReference{
+								APIGroup: func() *string { s := "snapshot.storage.k8s.io"; return &s }(),
+								Kind:     "VolumeSnapshot",
+								Name:     "my-snapshot",
+							},
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase:       corev1.ClaimBound,
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						},
+					},
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					&corev1.PersistentVolumeClaim{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      translate.Default.HostName(nil, "snapshot-pvc", "testns").Name,
+							Namespace: "test",
+							Annotations: map[string]string{
+								translate.NameAnnotation:          "snapshot-pvc",
+								translate.NamespaceAnnotation:     "testns",
+								translate.UIDAnnotation:           "",
+								translate.KindAnnotation:          corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim").String(),
+								translate.HostNamespaceAnnotation: "test",
+								translate.HostNameAnnotation:      translate.Default.HostName(nil, "snapshot-pvc", "testns").Name,
+							},
+							Labels: map[string]string{
+								translate.MarkerLabel:    translate.VClusterName,
+								translate.NamespaceLabel: "testns",
+							},
+						},
+						Spec: corev1.PersistentVolumeClaimSpec{
+							DataSourceRef: &corev1.TypedObjectReference{
+								APIGroup: func() *string { s := "snapshot.storage.k8s.io"; return &s }(),
+								Kind:     "VolumeSnapshot",
+								Name:     "my-snapshot",
+							},
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase:       corev1.ClaimBound,
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						},
+					},
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+
+				vPVC := &corev1.PersistentVolumeClaim{}
+				err := syncCtx.VirtualClient.Get(syncCtx, types.NamespacedName{
+					Namespace: "testns",
+					Name:      "snapshot-pvc",
+				}, vPVC)
+				assert.NilError(t, err)
+
+				pPVC := &corev1.PersistentVolumeClaim{}
+				err = syncCtx.HostClient.Get(syncCtx, types.NamespacedName{
+					Namespace: "test",
+					Name:      translate.Default.HostName(nil, "snapshot-pvc", "testns").Name,
+				}, pPVC)
+				assert.NilError(t, err)
+
+				_, err = syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					pPVC.DeepCopy(),
+					pPVC.DeepCopy(),
+					vPVC.DeepCopy(),
+					vPVC.DeepCopy(),
+				))
+				assert.NilError(t, err)
+			},
+		},
+	})
+}
+
+func TestHasExternalPopulatorDataSource(t *testing.T) {
+	apiGroup := "dataprotection.kubeblocks.io"
+	snapshotGroup := "snapshot.storage.k8s.io"
+
+	tests := []struct {
+		name     string
+		pvc      *corev1.PersistentVolumeClaim
+		expected bool
+	}{
+		{
+			name:     "nil dataSourceRef",
+			pvc:      &corev1.PersistentVolumeClaim{},
+			expected: false,
+		},
+		{
+			name: "VolumeSnapshot kind",
+			pvc: &corev1.PersistentVolumeClaim{
+				Spec: corev1.PersistentVolumeClaimSpec{
+					DataSourceRef: &corev1.TypedObjectReference{
+						APIGroup: &snapshotGroup,
+						Kind:     "VolumeSnapshot",
+						Name:     "snap",
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "PersistentVolumeClaim kind",
+			pvc: &corev1.PersistentVolumeClaim{
+				Spec: corev1.PersistentVolumeClaimSpec{
+					DataSourceRef: &corev1.TypedObjectReference{
+						Kind: "PersistentVolumeClaim",
+						Name: "source-pvc",
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "Backup kind",
+			pvc: &corev1.PersistentVolumeClaim{
+				Spec: corev1.PersistentVolumeClaimSpec{
+					DataSourceRef: &corev1.TypedObjectReference{
+						APIGroup: &apiGroup,
+						Kind:     "Backup",
+						Name:     "my-backup",
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "custom external populator kind",
+			pvc: &corev1.PersistentVolumeClaim{
+				Spec: corev1.PersistentVolumeClaimSpec{
+					DataSourceRef: &corev1.TypedObjectReference{
+						APIGroup: &apiGroup,
+						Kind:     "CustomPopulator",
+						Name:     "custom",
+					},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, hasExternalPopulatorDataSource(tt.pvc), tt.expected)
+		})
+	}
+}

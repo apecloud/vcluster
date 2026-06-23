@@ -280,7 +280,13 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		}
 		ensureDataProtectionVirtualPopulateStatus(event.Virtual, vPV)
 	} else {
-		event.Virtual.Status = *event.Host.Status.DeepCopy()
+		preserveExternalPopulatorStatus, err := s.shouldPreserveExternalPopulatorVirtualStatus(ctx, event.Host, event.Virtual)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !preserveExternalPopulatorStatus {
+			event.Virtual.Status = *event.Host.Status.DeepCopy()
+		}
 	}
 
 	// allow storage size to be increased
@@ -608,6 +614,35 @@ func (s *persistentVolumeClaimSyncer) dataProtectionPopulatedPersistentVolume(ct
 	return vPV, true, nil
 }
 
+func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorVirtualStatus(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (bool, error) {
+	if !hasExternalPopulatorDataSource(vObj) {
+		return false, nil
+	}
+	if !isDataProtectionBackupPVC(vObj) {
+		return true, nil
+	}
+	if !isHostPVCWaitingForVolume(pObj) {
+		return false, nil
+	}
+	if vObj.Spec.VolumeName == "" {
+		return true, nil
+	}
+
+	vPV := &corev1.PersistentVolume{}
+	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: vObj.Spec.VolumeName}, vPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if vPV.Annotations[dataProtectionPopulateFromAnnotation] == "" {
+		return true, nil
+	}
+
+	return isDataProtectionPopulatedPersistentVolumeForPVC(vPV, vObj, false), nil
+}
+
 func ensureDataProtectionVirtualPopulateStatus(vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) {
 	if isVirtualPVCBound(vObj) {
 		return
@@ -683,6 +718,19 @@ func isDataProtectionBackupPVC(pvc *corev1.PersistentVolumeClaim) bool {
 	return *pvc.Spec.DataSourceRef.APIGroup == dataProtectionAPIGroup &&
 		pvc.Spec.DataSourceRef.Kind == dataProtectionBackupKind &&
 		pvc.Spec.DataSourceRef.Name != ""
+}
+
+func hasExternalPopulatorDataSource(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc.Spec.DataSourceRef == nil {
+		return false
+	}
+
+	switch pvc.Spec.DataSourceRef.Kind {
+	case "VolumeSnapshot", "PersistentVolumeClaim":
+		return false
+	default:
+		return true
+	}
 }
 
 func isVirtualPVCBound(pvc *corev1.PersistentVolumeClaim) bool {
