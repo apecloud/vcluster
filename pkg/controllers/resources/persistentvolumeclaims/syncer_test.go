@@ -223,14 +223,32 @@ func TestSync(t *testing.T) {
 	dataProtectionNoDataRestorePvc := dataProtectionBackupPvc.DeepCopy()
 	dataProtectionNoDataRestorePvc.Status.Conditions = []corev1.PersistentVolumeClaimCondition{
 		{
-			Type:   corev1.PersistentVolumeClaimConditionType("Restore"),
+			Type:   dataProtectionRestoreConditionType,
 			Status: corev1.ConditionTrue,
 			Reason: dataProtectionRestoreConditionReasonProvisioned,
+		},
+	}
+	dataProtectionNoDataRestoreProcessingPvc := dataProtectionBackupPendingPvc.DeepCopy()
+	dataProtectionNoDataRestoreProcessingPvc.Status.Conditions = []corev1.PersistentVolumeClaimCondition{
+		{
+			Type:    dataProtectionPopulateConditionType,
+			Status:  corev1.ConditionTrue,
+			Reason:  dataProtectionRestoreConditionReasonProcessing,
+			Message: dataProtectionNoDataRestoreMessage,
+		},
+		{
+			Type:    dataProtectionRestoreConditionType,
+			Status:  corev1.ConditionUnknown,
+			Reason:  dataProtectionRestoreConditionReasonProcessing,
+			Message: dataProtectionNoDataRestoreMessage,
 		},
 	}
 	dataProtectionNoDataHostPvc := dataProtectionHostPendingPvcWithUID.DeepCopy()
 	dataProtectionNoDataHostPvc.Spec = corev1.PersistentVolumeClaimSpec{}
 	dataProtectionNoDataHostPvc.Status = dataProtectionNoDataRestorePvc.Status
+	dataProtectionNoDataHostProcessingPvc := dataProtectionHostPendingPvcWithUID.DeepCopy()
+	dataProtectionNoDataHostProcessingPvc.Spec = corev1.PersistentVolumeClaimSpec{}
+	dataProtectionNoDataHostProcessingPvc.Status = dataProtectionNoDataRestoreProcessingPvc.Status
 	dataProtectionNoDataHostPendingWithBackupSource := dataProtectionHostPendingPvcWithUID.DeepCopy()
 	dataProtectionNoDataHostPendingWithBackupSource.Spec = corev1.PersistentVolumeClaimSpec{
 		DataSource: &corev1.TypedLocalObjectReference{
@@ -245,6 +263,8 @@ func TestSync(t *testing.T) {
 		},
 	}
 	dataProtectionNoDataHostPendingWithBackupSource.ResourceVersion = "1"
+	dataProtectionNoDataHostProcessingWithBackupSource := dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()
+	dataProtectionNoDataHostProcessingWithBackupSource.Status = dataProtectionNoDataRestoreProcessingPvc.Status
 	dataProtectionNoDataHostPendingWithBackupSourceAndFakeVolumeName := dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()
 	dataProtectionNoDataHostPendingWithBackupSourceAndFakeVolumeName.Spec.VolumeName = dataProtectionPopulatedPV.Name
 	dataProtectionDataRestoreHostPvc := dataProtectionHostPendingPvcWithUID.DeepCopy()
@@ -401,6 +421,23 @@ func TestSync(t *testing.T) {
 				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
 
 				_, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(dataProtectionNoDataRestorePvc.DeepCopy()))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                "Create data protection no-data restore processing forward without host backup data source",
+			InitialVirtualState: []runtime.Object{dataProtectionNoDataRestoreProcessingPvc.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestoreProcessingPvc.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataHostProcessingPvc.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(dataProtectionNoDataRestoreProcessingPvc.DeepCopy()))
 				assert.NilError(t, err)
 			},
 		},
@@ -620,6 +657,29 @@ func TestSync(t *testing.T) {
 					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
 					dataProtectionNoDataRestorePvc.DeepCopy(),
 					dataProtectionNoDataRestorePvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                 "Delete existing host backup data source pvc while no-data restore is processing",
+			InitialVirtualState:  []runtime.Object{dataProtectionNoDataRestoreProcessingPvc.DeepCopy()},
+			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestoreProcessingPvc.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataRestoreProcessingPvc.DeepCopy(),
+					dataProtectionNoDataRestoreProcessingPvc.DeepCopy(),
 				))
 				assert.NilError(t, err)
 			},

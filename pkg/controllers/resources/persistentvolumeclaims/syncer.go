@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	storagev1 "k8s.io/api/storage/v1"
@@ -55,7 +56,11 @@ const (
 	dataProtectionMaterializationRequestPrefix = "dp-host-materialization-"
 	dataProtectionMaterializationStatePending  = "pending"
 
+	dataProtectionRestoreConditionType              = corev1.PersistentVolumeClaimConditionType("Restore")
+	dataProtectionPopulateConditionType             = corev1.PersistentVolumeClaimConditionType("Populating")
 	dataProtectionRestoreConditionReasonProvisioned = "Provisioned"
+	dataProtectionRestoreConditionReasonProcessing  = "Processing"
+	dataProtectionNoDataRestoreMessage              = "Provisioning PVC without data restore"
 )
 
 func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
@@ -766,11 +771,30 @@ func isHostPVCWaitingForVolume(pvc *corev1.PersistentVolumeClaim) bool {
 
 func isDataProtectionRestoreProvisionedWithoutDataRestore(pvc *corev1.PersistentVolumeClaim) bool {
 	for _, condition := range pvc.Status.Conditions {
-		if condition.Type == corev1.PersistentVolumeClaimConditionType("Restore") &&
+		if condition.Type == dataProtectionRestoreConditionType &&
 			condition.Status == corev1.ConditionTrue &&
 			condition.Reason == dataProtectionRestoreConditionReasonProvisioned {
 			return true
 		}
+	}
+
+	return false
+}
+
+func isDataProtectionRestoreProvisioningWithoutDataRestore(pvc *corev1.PersistentVolumeClaim) bool {
+	for _, condition := range pvc.Status.Conditions {
+		if condition.Type != dataProtectionRestoreConditionType &&
+			condition.Type != dataProtectionPopulateConditionType {
+			continue
+		}
+
+		if condition.Status == corev1.ConditionFalse ||
+			condition.Reason != dataProtectionRestoreConditionReasonProcessing ||
+			!strings.Contains(condition.Message, dataProtectionNoDataRestoreMessage) {
+			continue
+		}
+
+		return true
 	}
 
 	return false
@@ -804,7 +828,8 @@ func (s *persistentVolumeClaimSyncer) isDataProtectionNoDataRestorePVC(ctx *sync
 		return false, nil
 	}
 
-	return isDataProtectionRestoreProvisionedWithoutDataRestore(vObj), nil
+	return isDataProtectionRestoreProvisionedWithoutDataRestore(vObj) ||
+		isDataProtectionRestoreProvisioningWithoutDataRestore(vObj), nil
 }
 
 func deleteDataProtectionNoDataRestoreHostPVC(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (ctrl.Result, error) {
