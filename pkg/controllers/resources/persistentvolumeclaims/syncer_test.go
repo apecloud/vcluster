@@ -142,7 +142,7 @@ func TestSync(t *testing.T) {
 		ObjectMeta: vObjectMeta,
 		Spec:       backwardUpdateStatusPvc.Spec,
 	}
-	dataProtectionGroup := dataProtectionAPIGroup
+	dataProtectionGroup := "dataprotection.kubeblocks.io"
 	dataProtectionBackupPvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      vObjectMeta.Name,
@@ -153,7 +153,7 @@ func TestSync(t *testing.T) {
 			VolumeName: "restore-populated-pv",
 			DataSourceRef: &corev1.TypedObjectReference{
 				APIGroup: &dataProtectionGroup,
-				Kind:     dataProtectionBackupKind,
+				Kind:     "Backup",
 				Name:     "backup-1",
 			},
 		},
@@ -196,7 +196,7 @@ func TestSync(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "restore-populated-pv",
 			Annotations: map[string]string{
-				dataProtectionPopulateFromAnnotation: "backup-1",
+				legacyDataProtectionPopulateFromAnnotation: "backup-1",
 			},
 		},
 		Spec: corev1.PersistentVolumeSpec{
@@ -219,28 +219,40 @@ func TestSync(t *testing.T) {
 	dataProtectionStaleUIDPV := dataProtectionPopulatedPV.DeepCopy()
 	dataProtectionStaleUIDPV.Spec.ClaimRef.UID = types.UID("stale-pvc-uid")
 	dataProtectionStaleUIDPendingPvc := dataProtectionBackupPendingPvc.DeepCopy()
-	dataProtectionMaterializationRequestCM := dataProtectionMaterializationRequest("test", dataProtectionHostPendingPvc, dataProtectionBackupPvc, dataProtectionPopulatedPV)
+	dataProtectionMaterializationRequestCM := externalPopulatorMaterializationRequest("test", dataProtectionHostPendingPvc, dataProtectionBackupPvc, dataProtectionPopulatedPV)
+	customPopulatorGroup := "example.io"
+	customExternalPopulatorPvc := dataProtectionBackupPvc.DeepCopy()
+	customExternalPopulatorPvc.UID = types.UID("custom-target-pvc-uid")
+	customExternalPopulatorPvc.Spec.DataSourceRef.APIGroup = &customPopulatorGroup
+	customExternalPopulatorPvc.Spec.DataSourceRef.Kind = "Dataset"
+	customExternalPopulatorPvc.Spec.DataSourceRef.Name = "dataset-1"
+	customExternalPopulatorPV := dataProtectionPopulatedPV.DeepCopy()
+	customExternalPopulatorPV.Annotations = nil
+	customExternalPopulatorPV.Spec.ClaimRef.UID = customExternalPopulatorPvc.UID
+	customExternalPopulatorHostPendingPvcWithUID := dataProtectionHostPendingPvc.DeepCopy()
+	customExternalPopulatorHostPendingPvcWithUID.Annotations[translate.UIDAnnotation] = string(customExternalPopulatorPvc.UID)
+	customExternalPopulatorMaterializationRequestCM := externalPopulatorMaterializationRequest("test", dataProtectionHostPendingPvc, customExternalPopulatorPvc, customExternalPopulatorPV)
 	dataProtectionNoDataRestorePvc := dataProtectionBackupPvc.DeepCopy()
 	dataProtectionNoDataRestorePvc.Status.Conditions = []corev1.PersistentVolumeClaimCondition{
 		{
-			Type:   dataProtectionRestoreConditionType,
+			Type:   externalPopulatorRestoreConditionType,
 			Status: corev1.ConditionTrue,
-			Reason: dataProtectionRestoreConditionReasonProvisioned,
+			Reason: externalPopulatorRestoreConditionReasonProvisioned,
 		},
 	}
 	dataProtectionNoDataRestoreProcessingPvc := dataProtectionBackupPendingPvc.DeepCopy()
 	dataProtectionNoDataRestoreProcessingPvc.Status.Conditions = []corev1.PersistentVolumeClaimCondition{
 		{
-			Type:    dataProtectionPopulateConditionType,
+			Type:    externalPopulatorPopulateConditionType,
 			Status:  corev1.ConditionTrue,
-			Reason:  dataProtectionRestoreConditionReasonProcessing,
-			Message: dataProtectionNoDataRestoreMessage,
+			Reason:  externalPopulatorRestoreConditionReasonProcessing,
+			Message: externalPopulatorNoDataRestoreMessage,
 		},
 		{
-			Type:    dataProtectionRestoreConditionType,
+			Type:    externalPopulatorRestoreConditionType,
 			Status:  corev1.ConditionUnknown,
-			Reason:  dataProtectionRestoreConditionReasonProcessing,
-			Message: dataProtectionNoDataRestoreMessage,
+			Reason:  externalPopulatorRestoreConditionReasonProcessing,
+			Message: externalPopulatorNoDataRestoreMessage,
 		},
 	}
 	dataProtectionNoDataHostPvc := dataProtectionHostPendingPvcWithUID.DeepCopy()
@@ -253,12 +265,12 @@ func TestSync(t *testing.T) {
 	dataProtectionNoDataHostPendingWithBackupSource.Spec = corev1.PersistentVolumeClaimSpec{
 		DataSource: &corev1.TypedLocalObjectReference{
 			APIGroup: &dataProtectionGroup,
-			Kind:     dataProtectionBackupKind,
+			Kind:     "Backup",
 			Name:     "backup-1",
 		},
 		DataSourceRef: &corev1.TypedObjectReference{
 			APIGroup: &dataProtectionGroup,
-			Kind:     dataProtectionBackupKind,
+			Kind:     "Backup",
 			Name:     "backup-1",
 		},
 	}
@@ -271,7 +283,7 @@ func TestSync(t *testing.T) {
 	dataProtectionDataRestoreHostPvc.Spec = corev1.PersistentVolumeClaimSpec{
 		DataSourceRef: &corev1.TypedObjectReference{
 			APIGroup: &dataProtectionGroup,
-			Kind:     dataProtectionBackupKind,
+			Kind:     "Backup",
 			Name:     "backup-1",
 		},
 	}
@@ -835,6 +847,34 @@ func TestSync(t *testing.T) {
 					dataProtectionHostPendingPvc.DeepCopy(),
 					dataProtectionBackupPvc.DeepCopy(),
 					dataProtectionBackupPvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name: "Preserve custom external populator virtual status while host pvc waits for volume",
+			InitialVirtualState: []runtime.Object{
+				customExternalPopulatorPvc.DeepCopy(),
+				customExternalPopulatorPV.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{dataProtectionHostPendingPvc.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {customExternalPopulatorPvc.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {customExternalPopulatorPV.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {customExternalPopulatorHostPendingPvcWithUID.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("ConfigMap"):             {customExternalPopulatorMaterializationRequestCM.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionHostPendingPvc.DeepCopy(),
+					customExternalPopulatorPvc.DeepCopy(),
+					customExternalPopulatorPvc.DeepCopy(),
 				))
 				assert.NilError(t, err)
 			},
