@@ -145,3 +145,66 @@ func TestDiffTolerationSync(t *testing.T) {
 		})
 	}
 }
+
+func TestDiffRepairsMissingVirtualLabelsOnHost(t *testing.T) {
+	pClient := testingutil.NewFakeClient(scheme.Scheme)
+	vClient := testingutil.NewFakeClient(scheme.Scheme)
+
+	imageTranslator, err := NewImageTranslator(map[string]string{})
+	assert.NilError(t, err)
+
+	tr := &translator{
+		vClient:         vClient,
+		imageTranslator: imageTranslator,
+		log:             loghelper.New("diff-test"),
+	}
+
+	registerCtx := generictesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), pClient, vClient)
+	syncCtx := registerCtx.ToSyncContext("test")
+
+	assert.NilError(t, vClient.Create(syncCtx.Context, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "testns"},
+	}))
+
+	virtualLabels := map[string]string{
+		"app.kubernetes.io/instance":                 "pg-vsmoke",
+		"apps.kubeblocks.postgres.patroni/role":      "master",
+		"kubeblocks.io/role":                         "primary",
+		"vcluster.loft.sh/ns-label-legacy-x-1234567": "must-not-sync",
+	}
+	hostLabels := map[string]string{
+		"app.kubernetes.io/instance": "pg-vsmoke",
+		"host-only":                  "keep",
+	}
+
+	vOld := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "postgresql-0",
+			Namespace: "testns",
+			Labels:    virtualLabels,
+		},
+	}
+	vNew := vOld.DeepCopy()
+	pOld := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "postgresql-0-x-testns",
+			Namespace: "test",
+			Labels:    hostLabels,
+			Annotations: map[string]string{
+				VClusterLabelsAnnotation: LabelsAnnotation(vNew),
+			},
+		},
+	}
+	pNew := pOld.DeepCopy()
+
+	event := synccontext.NewSyncEventWithOld(pOld, pNew, vOld, vNew)
+	assert.NilError(t, tr.Diff(syncCtx, event))
+
+	assert.Equal(t, pNew.Labels["kubeblocks.io/role"], "primary")
+	assert.Equal(t, pNew.Labels["apps.kubeblocks.postgres.patroni/role"], "master")
+	assert.Equal(t, pNew.Labels["host-only"], "keep")
+	assert.Equal(t, pNew.Labels["app.kubernetes.io/instance"], "pg-vsmoke")
+	_, ok := pNew.Labels["vcluster.loft.sh/ns-label-legacy-x-1234567"]
+	assert.Assert(t, !ok)
+	assert.Equal(t, pNew.Annotations[VClusterLabelsAnnotation], LabelsAnnotation(vNew))
+}

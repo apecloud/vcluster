@@ -73,6 +73,7 @@ func (t *translator) Diff(ctx *synccontext.SyncContext, event *synccontext.SyncE
 		excludeLabelsFn,
 		excludeLabelsFn,
 	)
+	event.Host.Labels = ensureVirtualLabelsOnHost(event.Virtual.Labels, event.Host.Labels, excludeLabelsFn)
 
 	// update namespace labels
 	for key := range event.Host.Labels {
@@ -101,6 +102,39 @@ func (t *translator) Diff(ctx *synccontext.SyncContext, event *synccontext.SyncE
 	}
 
 	return nil
+}
+
+func ensureVirtualLabelsOnHost(
+	virtualLabels, hostLabels map[string]string,
+	excludeLabelsFn func(key string, value interface{}) (string, interface{}),
+) map[string]string {
+	if len(virtualLabels) == 0 {
+		return hostLabels
+	}
+	if hostLabels == nil {
+		hostLabels = map[string]string{}
+	}
+
+	for key, value := range virtualLabels {
+		hostKey := translate.HostLabel(key)
+		hostValue := interface{}(value)
+		if excludeLabelsFn != nil {
+			hostKey, hostValue = excludeLabelsFn(hostKey, value)
+		}
+		if hostKey == "" {
+			continue
+		}
+		if _, ok := hostLabels[hostKey]; ok {
+			continue
+		}
+		hostValueString, ok := hostValue.(string)
+		if !ok {
+			continue
+		}
+		hostLabels[hostKey] = hostValueString
+	}
+
+	return hostLabels
 }
 
 func GetExcludedAnnotations(pPod *corev1.Pod) []string {
