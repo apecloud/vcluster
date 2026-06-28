@@ -87,6 +87,14 @@ func VolumeSnapshots() schema.GroupVersionKind {
 	return volumesnapshotv1.SchemeGroupVersion.WithKind("VolumeSnapshot")
 }
 
+func DataProtectionBackups() schema.GroupVersionKind {
+	return schema.GroupVersionKind{
+		Group:   "dataprotection.kubeblocks.io",
+		Version: "v1alpha1",
+		Kind:    "Backup",
+	}
+}
+
 func VolumeSnapshotClasses() schema.GroupVersionKind {
 	return volumesnapshotv1.SchemeGroupVersion.WithKind("VolumeSnapshotClass")
 }

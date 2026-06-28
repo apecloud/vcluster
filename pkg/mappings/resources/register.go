@@ -16,6 +16,7 @@ func getMappers(ctx *synccontext.RegisterContext) []BuildMapper {
 	return append([]BuildMapper{
 		CreateSecretsMapper,
 		CreateConfigMapsMapper,
+		CreateDataProtectionBackupsMapper,
 		CreateEndpointsMapper,
 		CreateEndpointSlicesMapper,
 		CreateEventsMapper,

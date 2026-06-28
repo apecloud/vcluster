@@ -3,6 +3,7 @@ package resources
 import (
 	"fmt"
 
+	"github.com/loft-sh/vcluster/pkg/controllers/resources/backups"
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/configmaps"
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/csidrivers"
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/csinodes"
@@ -45,6 +46,7 @@ func getSyncers(ctx *synccontext.RegisterContext) []BuildController {
 	return append([]BuildController{
 		isEnabled(ctx.Config.Sync.ToHost.Services.Enabled, services.New),
 		isEnabled(ctx.Config.Sync.ToHost.ConfigMaps.Enabled, configmaps.New),
+		backups.New,
 		isEnabled(ctx.Config.Sync.FromHost.ConfigMaps.Enabled, configmaps.NewFromHost),
 		isEnabled(ctx.Config.Sync.FromHost.Secrets.Enabled, secrets.NewFromHost),
 		isEnabled(ctx.Config.Sync.ToHost.Secrets.Enabled, secrets.New),
