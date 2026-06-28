@@ -111,6 +111,7 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 	copyNestedField(event.Host.Object, event.Virtual.Object, "status")
 	translateBackupRepoStatusToVirtual(ctx, event.Host.Object, event.Virtual.Object)
 	translateBackupTargetPodNameToVirtual(ctx, event.Host.Object, event.Virtual.Object, event.Virtual.GetNamespace())
+	translateBackupActionsToVirtual(ctx, event.Virtual.Object, event.Virtual.GetNamespace(), event.Host.GetName(), event.Virtual.GetName())
 	event.Virtual.SetFinalizers(event.Host.GetFinalizers())
 
 	// Virtual users own the desired spec; host DP owns status/finalizers.
@@ -174,6 +175,62 @@ func translateBackupTargetPodNameToVirtual(ctx *synccontext.SyncContext, from, t
 	}
 
 	_ = unstructured.SetNestedField(to, translateHostPodNameToVirtual(ctx, targetPodName, namespace), "status", "targetPodName")
+}
+
+func translateBackupActionsToVirtual(ctx *synccontext.SyncContext, to map[string]interface{}, namespace, hostBackupName, virtualBackupName string) {
+	actions, ok, _ := unstructured.NestedSlice(to, "status", "actions")
+	if !ok || len(actions) == 0 {
+		return
+	}
+
+	hostNamespace := translate.Default.HostName(ctx, virtualBackupName, namespace).Namespace
+	for i := range actions {
+		action, ok := actions[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		targetPodName, ok, _ := unstructured.NestedString(action, "targetPodName")
+		if ok && targetPodName != "" {
+			_ = unstructured.SetNestedField(action, translateHostPodNameToVirtual(ctx, targetPodName, namespace), "targetPodName")
+		}
+
+		translateBackupActionObjectRefToVirtual(action, namespace, hostNamespace, hostBackupName, virtualBackupName)
+	}
+
+	_ = unstructured.SetNestedSlice(to, actions, "status", "actions")
+}
+
+func translateBackupActionObjectRefToVirtual(action map[string]interface{}, namespace, hostNamespace, hostBackupName, virtualBackupName string) {
+	objectRef, ok, _ := unstructured.NestedMap(action, "objectRef")
+	if !ok {
+		return
+	}
+
+	objectRefNamespace, ok, _ := unstructured.NestedString(action, "objectRef", "namespace")
+	if ok && objectRefNamespace == hostNamespace {
+		objectRef["namespace"] = namespace
+	}
+
+	kind, _, _ := unstructured.NestedString(action, "objectRef", "kind")
+	objectRefName, ok, _ := unstructured.NestedString(action, "objectRef", "name")
+	if !ok || kind != "Job" || objectRefName == "" || hostBackupName == "" || virtualBackupName == "" {
+		_ = unstructured.SetNestedMap(action, objectRef, "objectRef")
+		return
+	}
+
+	actionName, ok, _ := unstructured.NestedString(action, "name")
+	if !ok || actionName == "" {
+		_ = unstructured.SetNestedMap(action, objectRef, "objectRef")
+		return
+	}
+
+	hostJobName := translate.SafeConcatName(actionName, hostBackupName)
+	if objectRefName == hostJobName {
+		objectRef["name"] = translate.SafeConcatName(actionName, virtualBackupName)
+	}
+
+	_ = unstructured.SetNestedMap(action, objectRef, "objectRef")
 }
 
 func translateHostPodNameToVirtual(ctx *synccontext.SyncContext, hostName, namespace string) string {

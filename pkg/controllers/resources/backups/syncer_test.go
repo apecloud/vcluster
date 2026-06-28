@@ -203,6 +203,118 @@ func TestTranslateBackupTargetPodNameToVirtualPreservesUnverifiedSingleNamespace
 	}
 }
 
+func TestTranslateBackupActionsToVirtual(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtualBackupName := "mysql-br-readback-xtrabackup-backup-51929"
+	hostBackupName := translate.Default.HostName(&synccontext.SyncContext{}, virtualBackupName, namespace).Name
+	virtualPodName := "mysql-br-readback-mysql-1"
+	hostPodName := translate.Default.HostName(&synccontext.SyncContext{}, virtualPodName, namespace).Name
+	actionName := "dp-backup-0"
+	hostJobName := translate.SafeConcatName(actionName, hostBackupName)
+	to := map[string]interface{}{
+		"status": map[string]interface{}{
+			"actions": []interface{}{
+				map[string]interface{}{
+					"actionType":    "Job",
+					"name":          actionName,
+					"targetPodName": hostPodName,
+					"objectRef": map[string]interface{}{
+						"apiVersion": "batch/v1",
+						"kind":       "Job",
+						"name":       hostJobName,
+						"namespace":  translate.Default.HostName(&synccontext.SyncContext{}, virtualBackupName, namespace).Namespace,
+					},
+				},
+			},
+		},
+	}
+
+	translateBackupActionsToVirtual(&synccontext.SyncContext{}, to, namespace, hostBackupName, virtualBackupName)
+
+	actions, ok, err := unstructured.NestedSlice(to, "status", "actions")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok || len(actions) != 1 {
+		t.Fatalf("expected one status action, got ok=%v len=%d", ok, len(actions))
+	}
+	action := actions[0].(map[string]interface{})
+	podName, ok, err := unstructured.NestedString(action, "targetPodName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected action targetPodName to be set")
+	} else if podName != virtualPodName {
+		t.Fatalf("expected translated action targetPodName, got %q", podName)
+	}
+
+	objectRefName, ok, err := unstructured.NestedString(action, "objectRef", "name")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected objectRef.name to be set")
+	} else if objectRefName != translate.SafeConcatName(actionName, virtualBackupName) {
+		t.Fatalf("expected translated objectRef.name, got %q", objectRefName)
+	}
+
+	objectRefNamespace, ok, err := unstructured.NestedString(action, "objectRef", "namespace")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected objectRef.namespace to be set")
+	} else if objectRefNamespace != namespace {
+		t.Fatalf("expected translated objectRef.namespace, got %q", objectRefNamespace)
+	}
+}
+
+func TestTranslateBackupActionsToVirtualPreservesUnexpectedJobRefName(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtualBackupName := "mysql-br-readback-xtrabackup-backup-51929"
+	hostBackupName := translate.Default.HostName(&synccontext.SyncContext{}, virtualBackupName, namespace).Name
+	unexpectedJobName := "different-host-job"
+	to := map[string]interface{}{
+		"status": map[string]interface{}{
+			"actions": []interface{}{
+				map[string]interface{}{
+					"actionType": "Job",
+					"name":       "dp-backup-0",
+					"objectRef": map[string]interface{}{
+						"kind":      "Job",
+						"name":      unexpectedJobName,
+						"namespace": translate.Default.HostName(&synccontext.SyncContext{}, virtualBackupName, namespace).Namespace,
+					},
+				},
+			},
+		},
+	}
+
+	translateBackupActionsToVirtual(&synccontext.SyncContext{}, to, namespace, hostBackupName, virtualBackupName)
+
+	actions, ok, err := unstructured.NestedSlice(to, "status", "actions")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok || len(actions) != 1 {
+		t.Fatalf("expected one status action, got ok=%v len=%d", ok, len(actions))
+	}
+	action := actions[0].(map[string]interface{})
+	objectRefName, ok, err := unstructured.NestedString(action, "objectRef", "name")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected objectRef.name to be set")
+	} else if objectRefName != unexpectedJobName {
+		t.Fatalf("expected unexpected objectRef.name to be preserved, got %q", objectRefName)
+	}
+
+	objectRefNamespace, ok, err := unstructured.NestedString(action, "objectRef", "namespace")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected objectRef.namespace to be set")
+	} else if objectRefNamespace != namespace {
+		t.Fatalf("expected host objectRef.namespace to be translated, got %q", objectRefNamespace)
+	}
+}
+
 func TestTranslateBackupRepoLabelToVirtualFromDefaultRepo(t *testing.T) {
 	backupRepos := &unstructured.UnstructuredList{
 		Items: []unstructured.Unstructured{
