@@ -40,3 +40,40 @@ func TestCopyNestedFieldRemovesMissingField(t *testing.T) {
 		t.Fatal("expected status to be removed")
 	}
 }
+
+func TestTranslateBackupPolicyName(t *testing.T) {
+	from := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"backupPolicyName": "mysql-policy",
+		},
+	}
+	to := map[string]interface{}{
+		"spec": map[string]interface{}{},
+	}
+
+	translateBackupPolicyName(nil, from, to, "mysql-ns")
+
+	name, ok, err := unstructured.NestedString(to, "spec", "backupPolicyName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected spec.backupPolicyName to be set")
+	} else if name != "mysql-policy-x-mysql-ns-x-suffix" {
+		t.Fatalf("expected translated backupPolicyName, got %q", name)
+	}
+}
+
+func TestTranslateBackupPolicyNameLeavesMissingField(t *testing.T) {
+	to := map[string]interface{}{
+		"spec": map[string]interface{}{},
+	}
+
+	translateBackupPolicyName(nil, map[string]interface{}{}, to, "mysql-ns")
+
+	_, ok, err := unstructured.NestedString(to, "spec", "backupPolicyName")
+	if err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("expected missing backupPolicyName to remain unset")
+	}
+}

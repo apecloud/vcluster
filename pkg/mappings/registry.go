@@ -95,6 +95,14 @@ func DataProtectionBackups() schema.GroupVersionKind {
 	}
 }
 
+func DataProtectionBackupPolicies() schema.GroupVersionKind {
+	return schema.GroupVersionKind{
+		Group:   "dataprotection.kubeblocks.io",
+		Version: "v1alpha1",
+		Kind:    "BackupPolicy",
+	}
+}
+
 func VolumeSnapshotClasses() schema.GroupVersionKind {
 	return volumesnapshotv1.SchemeGroupVersion.WithKind("VolumeSnapshotClass")
 }

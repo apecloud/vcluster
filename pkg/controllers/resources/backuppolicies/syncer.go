@@ -1,4 +1,4 @@
-package backups
+package backuppolicies
 
 import (
 	"fmt"
@@ -24,41 +24,41 @@ func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
 		return nil, nil
 	}
 
-	mapper, err := ctx.Mappings.ByGVK(mappings.DataProtectionBackups())
+	mapper, err := ctx.Mappings.ByGVK(mappings.DataProtectionBackupPolicies())
 	if err != nil {
 		return nil, err
 	}
 
-	return &backupSyncer{
-		GenericTranslator: translator2.NewGenericTranslator(ctx, "dataprotection-backup", NewObject(), mapper),
+	return &backupPolicySyncer{
+		GenericTranslator: translator2.NewGenericTranslator(ctx, "dataprotection-backuppolicy", NewObject(), mapper),
 		patches:           cfg.Patches,
 	}, nil
 }
 
-type backupSyncer struct {
+type backupPolicySyncer struct {
 	syncertypes.GenericTranslator
 
 	patches []config.TranslatePatch
 }
 
-var _ syncertypes.OptionsProvider = &backupSyncer{}
+var _ syncertypes.OptionsProvider = &backupPolicySyncer{}
 
-func (s *backupSyncer) Options() *syncertypes.Options {
+func (s *backupPolicySyncer) Options() *syncertypes.Options {
 	return &syncertypes.Options{
 		ObjectCaching: true,
 	}
 }
 
-var _ syncertypes.Syncer = &backupSyncer{}
+var _ syncertypes.Syncer = &backupPolicySyncer{}
 
-func (s *backupSyncer) Syncer() syncertypes.Sync[client.Object] {
+func (s *backupPolicySyncer) Syncer() syncertypes.Sync[client.Object] {
 	return syncer.ToGenericSyncer(s)
 }
 
-func (s *backupSyncer) SyncToHost(ctx *synccontext.SyncContext, event *synccontext.SyncToHostEvent[*unstructured.Unstructured]) (ctrl.Result, error) {
+func (s *backupPolicySyncer) SyncToHost(ctx *synccontext.SyncContext, event *synccontext.SyncToHostEvent[*unstructured.Unstructured]) (ctrl.Result, error) {
 	if event.Virtual.GetDeletionTimestamp() != nil {
 		if event.HostOld != nil {
-			return patcher.DeleteHostObject(ctx, event.HostOld, event.Virtual, "virtual dataprotection backup is being deleted")
+			return patcher.DeleteHostObject(ctx, event.HostOld, event.Virtual, "virtual dataprotection backup policy is being deleted")
 		}
 
 		return ctrl.Result{}, nil
@@ -66,7 +66,6 @@ func (s *backupSyncer) SyncToHost(ctx *synccontext.SyncContext, event *syncconte
 
 	pObj := translate.HostMetadata(event.Virtual, s.VirtualToHost(ctx, client.ObjectKeyFromObject(event.Virtual), event.Virtual))
 	unstructured.RemoveNestedField(pObj.Object, "status")
-	translateBackupPolicyName(ctx, event.Virtual.Object, pObj.Object, event.Virtual.GetNamespace())
 
 	err := pro.ApplyPatchesHostObject(ctx, nil, pObj, event.Virtual, s.patches, false)
 	if err != nil {
@@ -76,18 +75,18 @@ func (s *backupSyncer) SyncToHost(ctx *synccontext.SyncContext, event *syncconte
 	return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), false)
 }
 
-func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*unstructured.Unstructured]) (_ ctrl.Result, retErr error) {
+func (s *backupPolicySyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*unstructured.Unstructured]) (_ ctrl.Result, retErr error) {
 	if event.Host.GetDeletionTimestamp() != nil {
 		if event.Virtual.GetDeletionTimestamp() == nil {
-			return patcher.DeleteVirtualObject(ctx, event.Virtual, event.Host, "host dataprotection backup is being deleted")
+			return patcher.DeleteVirtualObject(ctx, event.Virtual, event.Host, "host dataprotection backup policy is being deleted")
 		}
 
 		return ctrl.Result{}, nil
 	} else if event.Virtual.GetDeletionTimestamp() != nil {
-		return patcher.DeleteHostObject(ctx, event.Host, event.Virtual, "virtual dataprotection backup is being deleted")
+		return patcher.DeleteHostObject(ctx, event.Host, event.Virtual, "virtual dataprotection backup policy is being deleted")
 	}
 
-	patch, err := patcher.NewSyncerPatcher(ctx, event.Host, event.Virtual, patcher.TranslatePatches(s.patches, false))
+	patch, err := patcher.NewSyncerPatcher(ctx, event.Host, event.Virtual, patcher.TranslatePatches(s.patches, false), patcher.NoStatusSubResource())
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("new syncer patcher: %w", err)
 	}
@@ -97,13 +96,8 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 		}
 	}()
 
-	// Host DP owns runtime state; reflect it back so virtual callers can wait on Backup phase.
-	copyNestedField(event.Host.Object, event.Virtual.Object, "status")
-	event.Virtual.SetFinalizers(event.Host.GetFinalizers())
-
-	// Virtual users own the desired spec; host DP owns status/finalizers.
+	// BackupPolicy is desired configuration for host DP. Keep virtual status owned by the virtual control plane.
 	copyNestedField(event.Virtual.Object, event.Host.Object, "spec")
-	translateBackupPolicyName(ctx, event.Virtual.Object, event.Host.Object, event.Virtual.GetNamespace())
 
 	event.Virtual.SetAnnotations(translate.VirtualAnnotations(event.Host, event.Virtual))
 	event.Host.SetAnnotations(translate.HostAnnotations(event.Virtual, event.Host))
@@ -113,8 +107,8 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 	return ctrl.Result{}, nil
 }
 
-func (s *backupSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*unstructured.Unstructured]) (ctrl.Result, error) {
-	return patcher.DeleteHostObject(ctx, event.Host, event.VirtualOld, "virtual dataprotection backup was deleted")
+func (s *backupPolicySyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*unstructured.Unstructured]) (ctrl.Result, error) {
+	return patcher.DeleteHostObject(ctx, event.Host, event.VirtualOld, "virtual dataprotection backup policy was deleted")
 }
 
 func copyNestedField(from, to map[string]interface{}, fields ...string) {
@@ -125,18 +119,4 @@ func copyNestedField(from, to map[string]interface{}, fields ...string) {
 	}
 
 	_ = unstructured.SetNestedField(to, value, fields...)
-}
-
-func translateBackupPolicyName(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {
-	backupPolicyName, ok, _ := unstructured.NestedString(from, "spec", "backupPolicyName")
-	if !ok || backupPolicyName == "" {
-		return
-	}
-
-	hostName := translate.Default.HostName(ctx, backupPolicyName, namespace).Name
-	if hostName == "" {
-		return
-	}
-
-	_ = unstructured.SetNestedField(to, hostName, "spec", "backupPolicyName")
 }
