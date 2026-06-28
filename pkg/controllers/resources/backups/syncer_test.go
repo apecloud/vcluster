@@ -128,6 +128,12 @@ func TestTranslateBackupTargetPodNameToVirtualFromPodMapper(t *testing.T) {
 	from := map[string]interface{}{
 		"status": map[string]interface{}{
 			"targetPodName": "mysql-br-readback-mysql-1-x-mysql-backup-cr-readback-x-suffix",
+			"target": map[string]interface{}{
+				"selectedTargetPods": []interface{}{
+					"mysql-br-readback-mysql-1-x-mysql-backup-cr-readback-x-suffix",
+					"unmapped-host-pod",
+				},
+			},
 		},
 	}
 	to := map[string]interface{}{
@@ -154,6 +160,19 @@ func TestTranslateBackupTargetPodNameToVirtualFromPodMapper(t *testing.T) {
 	} else if name != "mysql-br-readback-mysql-1" {
 		t.Fatalf("expected translated targetPodName, got %q", name)
 	}
+
+	selectedTargetPods, ok, err := unstructured.NestedStringSlice(to, "status", "target", "selectedTargetPods")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.target.selectedTargetPods to be set")
+	} else if len(selectedTargetPods) != 2 {
+		t.Fatalf("expected two selected target pods, got %d", len(selectedTargetPods))
+	} else if selectedTargetPods[0] != "mysql-br-readback-mysql-1" {
+		t.Fatalf("expected translated selected target pod, got %q", selectedTargetPods[0])
+	} else if selectedTargetPods[1] != "unmapped-host-pod" {
+		t.Fatalf("expected unmapped selected target pod to be preserved, got %q", selectedTargetPods[1])
+	}
 }
 
 func TestTranslateBackupTargetPodNameToVirtualFromSingleNamespaceHostName(t *testing.T) {
@@ -163,6 +182,9 @@ func TestTranslateBackupTargetPodNameToVirtualFromSingleNamespaceHostName(t *tes
 	from := map[string]interface{}{
 		"status": map[string]interface{}{
 			"targetPodName": hostPodName,
+			"target": map[string]interface{}{
+				"selectedTargetPods": []interface{}{hostPodName},
+			},
 		},
 	}
 	to := map[string]interface{}{
@@ -179,12 +201,24 @@ func TestTranslateBackupTargetPodNameToVirtualFromSingleNamespaceHostName(t *tes
 	} else if name != virtualPodName {
 		t.Fatalf("expected translated targetPodName, got %q", name)
 	}
+
+	selectedTargetPods, ok, err := unstructured.NestedStringSlice(to, "status", "target", "selectedTargetPods")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.target.selectedTargetPods to be set")
+	} else if len(selectedTargetPods) != 1 || selectedTargetPods[0] != virtualPodName {
+		t.Fatalf("expected translated selected target pods, got %#v", selectedTargetPods)
+	}
 }
 
 func TestTranslateBackupTargetPodNameToVirtualPreservesUnverifiedSingleNamespaceName(t *testing.T) {
 	from := map[string]interface{}{
 		"status": map[string]interface{}{
 			"targetPodName": "mysql-br-readback-mysql-1-x-mysql-backup-cr-readback-wronghash",
+			"target": map[string]interface{}{
+				"selectedTargetPods": []interface{}{"mysql-br-readback-mysql-1-x-mysql-backup-cr-readback-wronghash"},
+			},
 		},
 	}
 	to := map[string]interface{}{
@@ -200,6 +234,15 @@ func TestTranslateBackupTargetPodNameToVirtualPreservesUnverifiedSingleNamespace
 		t.Fatal("expected status.targetPodName to be set")
 	} else if name != "mysql-br-readback-mysql-1-x-mysql-backup-cr-readback-wronghash" {
 		t.Fatalf("expected unverified targetPodName to be preserved, got %q", name)
+	}
+
+	selectedTargetPods, ok, err := unstructured.NestedStringSlice(to, "status", "target", "selectedTargetPods")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.target.selectedTargetPods to be set")
+	} else if len(selectedTargetPods) != 1 || selectedTargetPods[0] != "mysql-br-readback-mysql-1-x-mysql-backup-cr-readback-wronghash" {
+		t.Fatalf("expected unverified selected target pods to be preserved, got %#v", selectedTargetPods)
 	}
 }
 

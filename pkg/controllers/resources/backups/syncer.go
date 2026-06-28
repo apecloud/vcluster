@@ -170,11 +170,24 @@ func translateBackupRepoStatusToVirtual(ctx *synccontext.SyncContext, from, to m
 
 func translateBackupTargetPodNameToVirtual(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {
 	targetPodName, ok, _ := unstructured.NestedString(from, "status", "targetPodName")
-	if !ok || targetPodName == "" {
+	if ok && targetPodName != "" {
+		_ = unstructured.SetNestedField(to, translateHostPodNameToVirtual(ctx, targetPodName, namespace), "status", "targetPodName")
+	}
+
+	selectedTargetPods, ok, _ := unstructured.NestedSlice(from, "status", "target", "selectedTargetPods")
+	if !ok || len(selectedTargetPods) == 0 {
 		return
 	}
 
-	_ = unstructured.SetNestedField(to, translateHostPodNameToVirtual(ctx, targetPodName, namespace), "status", "targetPodName")
+	for i := range selectedTargetPods {
+		podName, ok := selectedTargetPods[i].(string)
+		if !ok || podName == "" {
+			continue
+		}
+
+		selectedTargetPods[i] = translateHostPodNameToVirtual(ctx, podName, namespace)
+	}
+	_ = unstructured.SetNestedSlice(to, selectedTargetPods, "status", "target", "selectedTargetPods")
 }
 
 func translateBackupActionsToVirtual(ctx *synccontext.SyncContext, to map[string]interface{}, namespace, hostBackupName string, hostBackupUID types.UID, virtualBackupName string, virtualBackupUID types.UID) {
