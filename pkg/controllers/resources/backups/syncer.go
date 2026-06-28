@@ -12,10 +12,18 @@ import (
 	translator2 "github.com/loft-sh/vcluster/pkg/syncer/translator"
 	syncertypes "github.com/loft-sh/vcluster/pkg/syncer/types"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	dataProtectionBackupRepoLabel       = "dataprotection.kubeblocks.io/backup-repo-name"
+	dataProtectionDefaultRepoAnnotation = "dataprotection.kubeblocks.io/is-default-repo"
 )
 
 func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
@@ -99,6 +107,7 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 
 	// Host DP owns runtime state; reflect it back so virtual callers can wait on Backup phase.
 	copyNestedField(event.Host.Object, event.Virtual.Object, "status")
+	translateBackupRepoStatusToVirtual(ctx, event.Host.Object, event.Virtual.Object)
 	event.Virtual.SetFinalizers(event.Host.GetFinalizers())
 
 	// Virtual users own the desired spec; host DP owns status/finalizers.
@@ -107,8 +116,13 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 
 	event.Virtual.SetAnnotations(translate.VirtualAnnotations(event.Host, event.Virtual))
 	event.Host.SetAnnotations(translate.HostAnnotations(event.Virtual, event.Host))
-	event.Virtual.SetLabels(translate.VirtualLabels(event.Host, event.Virtual))
-	event.Host.SetLabels(translate.HostLabels(event.Virtual, event.Host))
+	virtualLabels := translate.VirtualLabels(event.Host, event.Virtual)
+	translateBackupRepoLabelToVirtual(ctx, event.Host.GetLabels(), virtualLabels)
+	event.Virtual.SetLabels(virtualLabels)
+
+	hostLabels := translate.HostLabels(event.Virtual, event.Host)
+	preserveHostBackupRepoLabel(event.Host.GetLabels(), hostLabels)
+	event.Host.SetLabels(hostLabels)
 
 	return ctrl.Result{}, nil
 }
@@ -139,4 +153,105 @@ func translateBackupPolicyName(ctx *synccontext.SyncContext, from, to map[string
 	}
 
 	_ = unstructured.SetNestedField(to, hostName, "spec", "backupPolicyName")
+}
+
+func translateBackupRepoStatusToVirtual(ctx *synccontext.SyncContext, from, to map[string]interface{}) {
+	backupRepoName, ok, _ := unstructured.NestedString(from, "status", "backupRepoName")
+	if !ok || backupRepoName == "" {
+		return
+	}
+
+	_ = unstructured.SetNestedField(to, translateBackupRepoNameToVirtual(ctx, backupRepoName), "status", "backupRepoName")
+}
+
+func translateBackupRepoLabelToVirtual(ctx *synccontext.SyncContext, from, to map[string]string) {
+	if to == nil {
+		return
+	}
+
+	backupRepoName := from[dataProtectionBackupRepoLabel]
+	if backupRepoName == "" {
+		return
+	}
+
+	to[dataProtectionBackupRepoLabel] = translateBackupRepoNameToVirtual(ctx, backupRepoName)
+}
+
+func preserveHostBackupRepoLabel(from, to map[string]string) {
+	if to == nil {
+		return
+	}
+
+	backupRepoName := from[dataProtectionBackupRepoLabel]
+	if backupRepoName == "" {
+		return
+	}
+
+	to[dataProtectionBackupRepoLabel] = backupRepoName
+}
+
+func translateBackupRepoNameToVirtual(ctx *synccontext.SyncContext, hostName string) string {
+	if hostName == "" || ctx == nil || ctx.VirtualClient == nil {
+		return hostName
+	}
+
+	backupRepos := &unstructured.UnstructuredList{}
+	backupRepos.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "dataprotection.kubeblocks.io",
+		Version: "v1alpha1",
+		Kind:    "BackupRepoList",
+	})
+	err := ctx.VirtualClient.List(ctx, backupRepos)
+	if err != nil {
+		if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			return hostName
+		}
+		return hostName
+	}
+
+	return translateBackupRepoNameToVirtualFromList(hostName, backupRepos)
+}
+
+func translateBackupRepoNameToVirtualFromList(hostName string, backupRepos *unstructured.UnstructuredList) string {
+	if backupRepos == nil || len(backupRepos.Items) == 0 {
+		return hostName
+	}
+
+	for i := range backupRepos.Items {
+		if backupRepos.Items[i].GetName() == hostName {
+			return hostName
+		}
+	}
+
+	defaultRepo := ""
+	for i := range backupRepos.Items {
+		if isDefaultBackupRepo(&backupRepos.Items[i]) {
+			if defaultRepo != "" {
+				return hostName
+			}
+			defaultRepo = backupRepos.Items[i].GetName()
+		}
+	}
+	if defaultRepo != "" {
+		return defaultRepo
+	}
+
+	if len(backupRepos.Items) == 1 {
+		return backupRepos.Items[0].GetName()
+	}
+
+	return hostName
+}
+
+func isDefaultBackupRepo(repo *unstructured.Unstructured) bool {
+	if repo == nil {
+		return false
+	}
+
+	if repo.GetAnnotations()[dataProtectionDefaultRepoAnnotation] == "true" {
+		return true
+	}
+
+	isDefault, ok, _ := unstructured.NestedBool(repo.Object, "status", "isDefault")
+	return ok && isDefault
 }
