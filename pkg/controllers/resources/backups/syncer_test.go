@@ -3,7 +3,12 @@ package backups
 import (
 	"testing"
 
+	"github.com/loft-sh/vcluster/pkg/mappings"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func TestCopyNestedField(t *testing.T) {
@@ -98,6 +103,58 @@ func TestTranslateBackupRepoStatusToVirtualPreservesWhenMappingUnavailable(t *te
 	}
 }
 
+func TestTranslateBackupTargetPodNameToVirtualPreservesWhenMappingUnavailable(t *testing.T) {
+	from := map[string]interface{}{
+		"status": map[string]interface{}{"targetPodName": "host-pod"},
+	}
+	to := map[string]interface{}{
+		"status": map[string]interface{}{},
+	}
+
+	translateBackupTargetPodNameToVirtual(nil, from, to, "mysql-ns")
+
+	name, ok, err := unstructured.NestedString(to, "status", "targetPodName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.targetPodName to be set")
+	} else if name != "host-pod" {
+		t.Fatalf("nil context should preserve targetPodName, got %q", name)
+	}
+}
+
+func TestTranslateBackupTargetPodNameToVirtualFromPodMapper(t *testing.T) {
+	from := map[string]interface{}{
+		"status": map[string]interface{}{
+			"targetPodName": "mysql-br-readback-mysql-1-x-mysql-backup-cr-readback-x-suffix",
+		},
+	}
+	to := map[string]interface{}{
+		"status": map[string]interface{}{},
+	}
+	registry := mappings.NewMappingsRegistry(nil)
+	err := registry.AddMapper(staticPodMapperForTest{
+		hostName:    "mysql-br-readback-mysql-1-x-mysql-backup-cr-readback-x-suffix",
+		virtualName: "mysql-br-readback-mysql-1",
+		namespace:   "mysql-backup-cr-readback",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := &synccontext.SyncContext{Mappings: registry}
+
+	translateBackupTargetPodNameToVirtual(ctx, from, to, "mysql-backup-cr-readback")
+
+	name, ok, err := unstructured.NestedString(to, "status", "targetPodName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.targetPodName to be set")
+	} else if name != "mysql-br-readback-mysql-1" {
+		t.Fatalf("expected translated targetPodName, got %q", name)
+	}
+}
+
 func TestTranslateBackupRepoLabelToVirtualFromDefaultRepo(t *testing.T) {
 	backupRepos := &unstructured.UnstructuredList{
 		Items: []unstructured.Unstructured{
@@ -145,4 +202,34 @@ func newBackupRepoForTest(name string, defaultRepo bool) unstructured.Unstructur
 		repo.SetAnnotations(map[string]string{dataProtectionDefaultRepoAnnotation: "true"})
 	}
 	return repo
+}
+
+type staticPodMapperForTest struct {
+	hostName    string
+	virtualName string
+	namespace   string
+}
+
+func (s staticPodMapperForTest) GroupVersionKind() schema.GroupVersionKind {
+	return mappings.Pods()
+}
+
+func (s staticPodMapperForTest) Migrate(_ *synccontext.RegisterContext, _ synccontext.Mapper) error {
+	return nil
+}
+
+func (s staticPodMapperForTest) VirtualToHost(_ *synccontext.SyncContext, req types.NamespacedName, _ client.Object) types.NamespacedName {
+	return req
+}
+
+func (s staticPodMapperForTest) HostToVirtual(_ *synccontext.SyncContext, req types.NamespacedName, _ client.Object) types.NamespacedName {
+	if req.Name != s.hostName {
+		return types.NamespacedName{}
+	}
+
+	return types.NamespacedName{Name: s.virtualName, Namespace: s.namespace}
+}
+
+func (s staticPodMapperForTest) IsManaged(_ *synccontext.SyncContext, _ client.Object) (bool, error) {
+	return false, nil
 }

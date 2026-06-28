@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -108,6 +109,7 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 	// Host DP owns runtime state; reflect it back so virtual callers can wait on Backup phase.
 	copyNestedField(event.Host.Object, event.Virtual.Object, "status")
 	translateBackupRepoStatusToVirtual(ctx, event.Host.Object, event.Virtual.Object)
+	translateBackupTargetPodNameToVirtual(ctx, event.Host.Object, event.Virtual.Object, event.Virtual.GetNamespace())
 	event.Virtual.SetFinalizers(event.Host.GetFinalizers())
 
 	// Virtual users own the desired spec; host DP owns status/finalizers.
@@ -162,6 +164,34 @@ func translateBackupRepoStatusToVirtual(ctx *synccontext.SyncContext, from, to m
 	}
 
 	_ = unstructured.SetNestedField(to, translateBackupRepoNameToVirtual(ctx, backupRepoName), "status", "backupRepoName")
+}
+
+func translateBackupTargetPodNameToVirtual(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {
+	targetPodName, ok, _ := unstructured.NestedString(from, "status", "targetPodName")
+	if !ok || targetPodName == "" {
+		return
+	}
+
+	_ = unstructured.SetNestedField(to, translateHostPodNameToVirtual(ctx, targetPodName, namespace), "status", "targetPodName")
+}
+
+func translateHostPodNameToVirtual(ctx *synccontext.SyncContext, hostName, namespace string) string {
+	if hostName == "" || namespace == "" || ctx == nil || ctx.Mappings == nil {
+		return hostName
+	}
+
+	podMapper, err := ctx.Mappings.ByGVK(mappings.Pods())
+	if err != nil {
+		return hostName
+	}
+
+	hostNamespace := translate.Default.HostName(ctx, hostName, namespace).Namespace
+	virtualName := podMapper.HostToVirtual(ctx, types.NamespacedName{Name: hostName, Namespace: hostNamespace}, nil)
+	if virtualName.Name == "" {
+		return hostName
+	}
+
+	return virtualName.Name
 }
 
 func translateBackupRepoLabelToVirtual(ctx *synccontext.SyncContext, from, to map[string]string) {
