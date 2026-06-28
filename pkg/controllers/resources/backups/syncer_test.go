@@ -205,12 +205,17 @@ func TestTranslateBackupTargetPodNameToVirtualPreservesUnverifiedSingleNamespace
 
 func TestTranslateBackupActionsToVirtual(t *testing.T) {
 	namespace := "mysql-backup-cr-readback"
-	virtualBackupName := "mysql-br-readback-xtrabackup-backup-51929"
+	virtualBackupName := "mysql-br-readback-xtrabackup-backup-60590"
+	virtualBackupUID := types.UID("virtual1-2345-6789")
 	hostBackupName := translate.Default.HostName(&synccontext.SyncContext{}, virtualBackupName, namespace).Name
+	hostBackupUID := types.UID("hostuid1-2345-6789")
 	virtualPodName := "mysql-br-readback-mysql-1"
 	hostPodName := translate.Default.HostName(&synccontext.SyncContext{}, virtualPodName, namespace).Name
 	actionName := "dp-backup-0"
-	hostJobName := translate.SafeConcatName(actionName, hostBackupName)
+	hostJobName := generateBackupJobNameForStatus(hostBackupName, hostBackupUID, actionName)
+	if hostJobName != "dp-backup-0-mysql-br-readback-xtrabackup-backup-60590-x-mysql-b" {
+		t.Fatalf("expected host job name to match the v7 truncated form, got %q", hostJobName)
+	}
 	to := map[string]interface{}{
 		"status": map[string]interface{}{
 			"actions": []interface{}{
@@ -229,7 +234,7 @@ func TestTranslateBackupActionsToVirtual(t *testing.T) {
 		},
 	}
 
-	translateBackupActionsToVirtual(&synccontext.SyncContext{}, to, namespace, hostBackupName, virtualBackupName)
+	translateBackupActionsToVirtual(&synccontext.SyncContext{}, to, namespace, hostBackupName, hostBackupUID, virtualBackupName, virtualBackupUID)
 
 	actions, ok, err := unstructured.NestedSlice(to, "status", "actions")
 	if err != nil {
@@ -252,7 +257,7 @@ func TestTranslateBackupActionsToVirtual(t *testing.T) {
 		t.Fatal(err)
 	} else if !ok {
 		t.Fatal("expected objectRef.name to be set")
-	} else if objectRefName != translate.SafeConcatName(actionName, virtualBackupName) {
+	} else if objectRefName != generateBackupJobNameForStatus(virtualBackupName, virtualBackupUID, actionName) {
 		t.Fatalf("expected translated objectRef.name, got %q", objectRefName)
 	}
 
@@ -269,7 +274,9 @@ func TestTranslateBackupActionsToVirtual(t *testing.T) {
 func TestTranslateBackupActionsToVirtualPreservesUnexpectedJobRefName(t *testing.T) {
 	namespace := "mysql-backup-cr-readback"
 	virtualBackupName := "mysql-br-readback-xtrabackup-backup-51929"
+	virtualBackupUID := types.UID("virtual1-2345-6789")
 	hostBackupName := translate.Default.HostName(&synccontext.SyncContext{}, virtualBackupName, namespace).Name
+	hostBackupUID := types.UID("hostuid1-2345-6789")
 	unexpectedJobName := "different-host-job"
 	to := map[string]interface{}{
 		"status": map[string]interface{}{
@@ -287,7 +294,7 @@ func TestTranslateBackupActionsToVirtualPreservesUnexpectedJobRefName(t *testing
 		},
 	}
 
-	translateBackupActionsToVirtual(&synccontext.SyncContext{}, to, namespace, hostBackupName, virtualBackupName)
+	translateBackupActionsToVirtual(&synccontext.SyncContext{}, to, namespace, hostBackupName, hostBackupUID, virtualBackupName, virtualBackupUID)
 
 	actions, ok, err := unstructured.NestedSlice(to, "status", "actions")
 	if err != nil {

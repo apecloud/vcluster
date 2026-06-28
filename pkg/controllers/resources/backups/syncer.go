@@ -111,7 +111,7 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 	copyNestedField(event.Host.Object, event.Virtual.Object, "status")
 	translateBackupRepoStatusToVirtual(ctx, event.Host.Object, event.Virtual.Object)
 	translateBackupTargetPodNameToVirtual(ctx, event.Host.Object, event.Virtual.Object, event.Virtual.GetNamespace())
-	translateBackupActionsToVirtual(ctx, event.Virtual.Object, event.Virtual.GetNamespace(), event.Host.GetName(), event.Virtual.GetName())
+	translateBackupActionsToVirtual(ctx, event.Virtual.Object, event.Virtual.GetNamespace(), event.Host.GetName(), event.Host.GetUID(), event.Virtual.GetName(), event.Virtual.GetUID())
 	event.Virtual.SetFinalizers(event.Host.GetFinalizers())
 
 	// Virtual users own the desired spec; host DP owns status/finalizers.
@@ -177,7 +177,7 @@ func translateBackupTargetPodNameToVirtual(ctx *synccontext.SyncContext, from, t
 	_ = unstructured.SetNestedField(to, translateHostPodNameToVirtual(ctx, targetPodName, namespace), "status", "targetPodName")
 }
 
-func translateBackupActionsToVirtual(ctx *synccontext.SyncContext, to map[string]interface{}, namespace, hostBackupName, virtualBackupName string) {
+func translateBackupActionsToVirtual(ctx *synccontext.SyncContext, to map[string]interface{}, namespace, hostBackupName string, hostBackupUID types.UID, virtualBackupName string, virtualBackupUID types.UID) {
 	actions, ok, _ := unstructured.NestedSlice(to, "status", "actions")
 	if !ok || len(actions) == 0 {
 		return
@@ -195,13 +195,13 @@ func translateBackupActionsToVirtual(ctx *synccontext.SyncContext, to map[string
 			_ = unstructured.SetNestedField(action, translateHostPodNameToVirtual(ctx, targetPodName, namespace), "targetPodName")
 		}
 
-		translateBackupActionObjectRefToVirtual(action, namespace, hostNamespace, hostBackupName, virtualBackupName)
+		translateBackupActionObjectRefToVirtual(action, namespace, hostNamespace, hostBackupName, hostBackupUID, virtualBackupName, virtualBackupUID)
 	}
 
 	_ = unstructured.SetNestedSlice(to, actions, "status", "actions")
 }
 
-func translateBackupActionObjectRefToVirtual(action map[string]interface{}, namespace, hostNamespace, hostBackupName, virtualBackupName string) {
+func translateBackupActionObjectRefToVirtual(action map[string]interface{}, namespace, hostNamespace, hostBackupName string, hostBackupUID types.UID, virtualBackupName string, virtualBackupUID types.UID) {
 	objectRef, ok, _ := unstructured.NestedMap(action, "objectRef")
 	if !ok {
 		return
@@ -214,7 +214,7 @@ func translateBackupActionObjectRefToVirtual(action map[string]interface{}, name
 
 	kind, _, _ := unstructured.NestedString(action, "objectRef", "kind")
 	objectRefName, ok, _ := unstructured.NestedString(action, "objectRef", "name")
-	if !ok || kind != "Job" || objectRefName == "" || hostBackupName == "" || virtualBackupName == "" {
+	if !ok || kind != "Job" || objectRefName == "" || hostBackupName == "" || virtualBackupName == "" || len(hostBackupUID) < 8 || len(virtualBackupUID) < 8 {
 		_ = unstructured.SetNestedMap(action, objectRef, "objectRef")
 		return
 	}
@@ -225,12 +225,24 @@ func translateBackupActionObjectRefToVirtual(action map[string]interface{}, name
 		return
 	}
 
-	hostJobName := translate.SafeConcatName(actionName, hostBackupName)
+	hostJobName := generateBackupJobNameForStatus(hostBackupName, hostBackupUID, actionName)
 	if objectRefName == hostJobName {
-		objectRef["name"] = translate.SafeConcatName(actionName, virtualBackupName)
+		objectRef["name"] = generateBackupJobNameForStatus(virtualBackupName, virtualBackupUID, actionName)
 	}
 
 	_ = unstructured.SetNestedMap(action, objectRef, "objectRef")
+}
+
+func generateBackupJobNameForStatus(backupName string, backupUID types.UID, prefix string) string {
+	if len(backupUID) < 8 {
+		return ""
+	}
+
+	name := fmt.Sprintf("%s-%s-%s", prefix, backupName, string(backupUID)[:8])
+	if len(name) > 63 {
+		return strings.TrimSuffix(name[:63], "-")
+	}
+	return name
 }
 
 func translateHostPodNameToVirtual(ctx *synccontext.SyncContext, hostName, namespace string) string {
