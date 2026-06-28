@@ -111,12 +111,14 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 	copyNestedField(event.Host.Object, event.Virtual.Object, "status")
 	translateBackupRepoStatusToVirtual(ctx, event.Host.Object, event.Virtual.Object)
 	translateBackupTargetPodNameToVirtual(ctx, event.Host.Object, event.Virtual.Object, event.Virtual.GetNamespace())
+	translateBackupTargetConnectionCredentialSecretNameToVirtual(ctx, event.Host.Object, event.Virtual.Object, event.Virtual.GetNamespace())
 	translateBackupActionsToVirtual(ctx, event.Virtual.Object, event.Virtual.GetNamespace(), event.Host.GetName(), event.Host.GetUID(), event.Virtual.GetName(), event.Virtual.GetUID())
 	event.Virtual.SetFinalizers(event.Host.GetFinalizers())
 
 	// Virtual users own the desired spec; host DP owns status/finalizers.
 	copyNestedField(event.Virtual.Object, event.Host.Object, "spec")
 	translateBackupPolicyName(ctx, event.Virtual.Object, event.Host.Object, event.Virtual.GetNamespace())
+	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, event.Host.Object, event.Virtual.GetNamespace())
 
 	event.Virtual.SetAnnotations(translate.VirtualAnnotations(event.Host, event.Virtual))
 	event.Host.SetAnnotations(translate.HostAnnotations(event.Virtual, event.Host))
@@ -188,6 +190,24 @@ func translateBackupTargetPodNameToVirtual(ctx *synccontext.SyncContext, from, t
 		selectedTargetPods[i] = translateHostPodNameToVirtual(ctx, podName, namespace)
 	}
 	_ = unstructured.SetNestedSlice(to, selectedTargetPods, "status", "target", "selectedTargetPods")
+}
+
+func translateBackupTargetConnectionCredentialSecretNameToHost(ctx *synccontext.SyncContext, to map[string]interface{}, namespace string) {
+	secretName, ok, _ := unstructured.NestedString(to, "status", "target", "connectionCredential", "secretName")
+	if !ok || secretName == "" {
+		return
+	}
+
+	_ = unstructured.SetNestedField(to, translateVirtualSecretNameToHost(ctx, secretName, namespace), "status", "target", "connectionCredential", "secretName")
+}
+
+func translateBackupTargetConnectionCredentialSecretNameToVirtual(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {
+	secretName, ok, _ := unstructured.NestedString(from, "status", "target", "connectionCredential", "secretName")
+	if !ok || secretName == "" {
+		return
+	}
+
+	_ = unstructured.SetNestedField(to, translateHostSecretNameToVirtual(ctx, secretName, namespace), "status", "target", "connectionCredential", "secretName")
 }
 
 func translateBackupActionsToVirtual(ctx *synccontext.SyncContext, to map[string]interface{}, namespace, hostBackupName string, hostBackupUID types.UID, virtualBackupName string, virtualBackupUID types.UID) {
@@ -282,18 +302,70 @@ func translateHostPodNameToVirtual(ctx *synccontext.SyncContext, hostName, names
 }
 
 func translateSingleNamespaceHostPodNameToVirtual(ctx *synccontext.SyncContext, hostName, namespace string) string {
-	separator := "-x-" + namespace
-	index := strings.LastIndex(hostName, separator)
-	if index <= 0 {
+	return translateSingleNamespaceHostNameToVirtual(ctx, hostName, namespace)
+}
+
+func translateVirtualSecretNameToHost(ctx *synccontext.SyncContext, virtualName, namespace string) string {
+	if virtualName == "" || namespace == "" {
+		return virtualName
+	}
+
+	if translateHostSecretNameToVirtual(ctx, virtualName, namespace) != virtualName {
+		return virtualName
+	}
+
+	if ctx != nil && ctx.Mappings != nil {
+		secretMapper, err := ctx.Mappings.ByGVK(mappings.Secrets())
+		if err == nil {
+			hostName := secretMapper.VirtualToHost(ctx, types.NamespacedName{Name: virtualName, Namespace: namespace}, nil)
+			if hostName.Name != "" {
+				return hostName.Name
+			}
+		}
+	}
+
+	return translate.Default.HostName(ctx, virtualName, namespace).Name
+}
+
+func translateHostSecretNameToVirtual(ctx *synccontext.SyncContext, hostName, namespace string) string {
+	if hostName == "" || namespace == "" || ctx == nil {
 		return hostName
 	}
 
-	virtualName := hostName[:index]
-	if translate.Default.HostName(ctx, virtualName, namespace).Name != hostName {
-		return hostName
+	if ctx.Mappings != nil {
+		secretMapper, err := ctx.Mappings.ByGVK(mappings.Secrets())
+		if err == nil {
+			hostNamespace := translate.Default.HostName(ctx, hostName, namespace).Namespace
+			virtualName := secretMapper.HostToVirtual(ctx, types.NamespacedName{Name: hostName, Namespace: hostNamespace}, nil)
+			if virtualName.Name != "" {
+				return virtualName.Name
+			}
+		}
 	}
 
-	return virtualName
+	return translateSingleNamespaceHostNameToVirtual(ctx, hostName, namespace)
+}
+
+func translateSingleNamespaceHostNameToVirtual(ctx *synccontext.SyncContext, hostName, namespace string) string {
+	separator := "-x-"
+	for start := 0; start < len(hostName); {
+		index := strings.Index(hostName[start:], separator)
+		if index < 0 {
+			break
+		}
+
+		index += start
+		if index > 0 {
+			virtualName := hostName[:index]
+			if translate.Default.HostName(ctx, virtualName, namespace).Name == hostName {
+				return virtualName
+			}
+		}
+
+		start = index + len(separator)
+	}
+
+	return hostName
 }
 
 func translateBackupRepoLabelToVirtual(ctx *synccontext.SyncContext, from, to map[string]string) {

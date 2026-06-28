@@ -246,6 +246,118 @@ func TestTranslateBackupTargetPodNameToVirtualPreservesUnverifiedSingleNamespace
 	}
 }
 
+func TestTranslateBackupTargetConnectionCredentialSecretNameToHost(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
+	hostSecretName := translate.Default.HostName(&synccontext.SyncContext{}, virtualSecretName, namespace).Name
+	if hostSecretName == virtualSecretName || len(hostSecretName) > 63 {
+		t.Fatalf("expected a translated DNS-safe host secret name, got %q", hostSecretName)
+	}
+	to := map[string]interface{}{
+		"status": map[string]interface{}{
+			"target": map[string]interface{}{
+				"connectionCredential": map[string]interface{}{
+					"secretName": virtualSecretName,
+				},
+			},
+		},
+	}
+
+	translateBackupTargetConnectionCredentialSecretNameToHost(&synccontext.SyncContext{}, to, namespace)
+
+	secretName, ok, err := unstructured.NestedString(to, "status", "target", "connectionCredential", "secretName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.target.connectionCredential.secretName to be set")
+	} else if secretName != hostSecretName {
+		t.Fatalf("expected translated host secret name, got %q", secretName)
+	}
+}
+
+func TestTranslateBackupTargetConnectionCredentialSecretNameToHostPreservesAlreadyHostName(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
+	hostSecretName := translate.Default.HostName(&synccontext.SyncContext{}, virtualSecretName, namespace).Name
+	to := map[string]interface{}{
+		"status": map[string]interface{}{
+			"target": map[string]interface{}{
+				"connectionCredential": map[string]interface{}{
+					"secretName": hostSecretName,
+				},
+			},
+		},
+	}
+
+	translateBackupTargetConnectionCredentialSecretNameToHost(&synccontext.SyncContext{}, to, namespace)
+
+	secretName, ok, err := unstructured.NestedString(to, "status", "target", "connectionCredential", "secretName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.target.connectionCredential.secretName to be set")
+	} else if secretName != hostSecretName {
+		t.Fatalf("expected existing host secret name to be preserved, got %q", secretName)
+	}
+}
+
+func TestTranslateBackupTargetConnectionCredentialSecretNameToVirtual(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
+	hostSecretName := translate.Default.HostName(&synccontext.SyncContext{}, virtualSecretName, namespace).Name
+	from := map[string]interface{}{
+		"status": map[string]interface{}{
+			"target": map[string]interface{}{
+				"connectionCredential": map[string]interface{}{
+					"secretName": hostSecretName,
+				},
+			},
+		},
+	}
+	to := map[string]interface{}{
+		"status": map[string]interface{}{},
+	}
+
+	translateBackupTargetConnectionCredentialSecretNameToVirtual(&synccontext.SyncContext{}, from, to, namespace)
+
+	secretName, ok, err := unstructured.NestedString(to, "status", "target", "connectionCredential", "secretName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.target.connectionCredential.secretName to be set")
+	} else if secretName != virtualSecretName {
+		t.Fatalf("expected translated virtual secret name, got %q", secretName)
+	}
+}
+
+func TestTranslateBackupTargetConnectionCredentialSecretNameToVirtualPreservesUnverifiedName(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	hostSecretName := "mysql-br-readback-mysql-account-kbadmin-x-mysql-back-wronghash"
+	from := map[string]interface{}{
+		"status": map[string]interface{}{
+			"target": map[string]interface{}{
+				"connectionCredential": map[string]interface{}{
+					"secretName": hostSecretName,
+				},
+			},
+		},
+	}
+	to := map[string]interface{}{
+		"status": map[string]interface{}{},
+	}
+
+	translateBackupTargetConnectionCredentialSecretNameToVirtual(&synccontext.SyncContext{}, from, to, namespace)
+
+	secretName, ok, err := unstructured.NestedString(to, "status", "target", "connectionCredential", "secretName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.target.connectionCredential.secretName to be set")
+	} else if secretName != hostSecretName {
+		t.Fatalf("expected unverified host secret name to be preserved, got %q", secretName)
+	}
+}
+
 func TestTranslateBackupActionsToVirtual(t *testing.T) {
 	namespace := "mysql-backup-cr-readback"
 	virtualBackupName := "mysql-br-readback-xtrabackup-backup-60590"
