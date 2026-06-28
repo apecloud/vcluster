@@ -2,6 +2,7 @@ package backups
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/loft-sh/vcluster/config"
 	"github.com/loft-sh/vcluster/pkg/mappings"
@@ -176,22 +177,41 @@ func translateBackupTargetPodNameToVirtual(ctx *synccontext.SyncContext, from, t
 }
 
 func translateHostPodNameToVirtual(ctx *synccontext.SyncContext, hostName, namespace string) string {
-	if hostName == "" || namespace == "" || ctx == nil || ctx.Mappings == nil {
+	if hostName == "" || namespace == "" || ctx == nil {
 		return hostName
+	}
+
+	if ctx.Mappings == nil {
+		return translateSingleNamespaceHostPodNameToVirtual(ctx, hostName, namespace)
 	}
 
 	podMapper, err := ctx.Mappings.ByGVK(mappings.Pods())
 	if err != nil {
-		return hostName
+		return translateSingleNamespaceHostPodNameToVirtual(ctx, hostName, namespace)
 	}
 
 	hostNamespace := translate.Default.HostName(ctx, hostName, namespace).Namespace
 	virtualName := podMapper.HostToVirtual(ctx, types.NamespacedName{Name: hostName, Namespace: hostNamespace}, nil)
 	if virtualName.Name == "" {
-		return hostName
+		return translateSingleNamespaceHostPodNameToVirtual(ctx, hostName, namespace)
 	}
 
 	return virtualName.Name
+}
+
+func translateSingleNamespaceHostPodNameToVirtual(ctx *synccontext.SyncContext, hostName, namespace string) string {
+	separator := "-x-" + namespace
+	index := strings.LastIndex(hostName, separator)
+	if index <= 0 {
+		return hostName
+	}
+
+	virtualName := hostName[:index]
+	if translate.Default.HostName(ctx, virtualName, namespace).Name != hostName {
+		return hostName
+	}
+
+	return virtualName
 }
 
 func translateBackupRepoLabelToVirtual(ctx *synccontext.SyncContext, from, to map[string]string) {

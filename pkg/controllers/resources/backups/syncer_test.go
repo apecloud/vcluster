@@ -5,6 +5,7 @@ import (
 
 	"github.com/loft-sh/vcluster/pkg/mappings"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -152,6 +153,53 @@ func TestTranslateBackupTargetPodNameToVirtualFromPodMapper(t *testing.T) {
 		t.Fatal("expected status.targetPodName to be set")
 	} else if name != "mysql-br-readback-mysql-1" {
 		t.Fatalf("expected translated targetPodName, got %q", name)
+	}
+}
+
+func TestTranslateBackupTargetPodNameToVirtualFromSingleNamespaceHostName(t *testing.T) {
+	virtualPodName := "mysql-br-readback-mysql-1"
+	namespace := "mysql-backup-cr-readback"
+	hostPodName := translate.Default.HostName(&synccontext.SyncContext{}, virtualPodName, namespace).Name
+	from := map[string]interface{}{
+		"status": map[string]interface{}{
+			"targetPodName": hostPodName,
+		},
+	}
+	to := map[string]interface{}{
+		"status": map[string]interface{}{},
+	}
+
+	translateBackupTargetPodNameToVirtual(&synccontext.SyncContext{}, from, to, namespace)
+
+	name, ok, err := unstructured.NestedString(to, "status", "targetPodName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.targetPodName to be set")
+	} else if name != virtualPodName {
+		t.Fatalf("expected translated targetPodName, got %q", name)
+	}
+}
+
+func TestTranslateBackupTargetPodNameToVirtualPreservesUnverifiedSingleNamespaceName(t *testing.T) {
+	from := map[string]interface{}{
+		"status": map[string]interface{}{
+			"targetPodName": "mysql-br-readback-mysql-1-x-mysql-backup-cr-readback-wronghash",
+		},
+	}
+	to := map[string]interface{}{
+		"status": map[string]interface{}{},
+	}
+
+	translateBackupTargetPodNameToVirtual(&synccontext.SyncContext{}, from, to, "mysql-backup-cr-readback")
+
+	name, ok, err := unstructured.NestedString(to, "status", "targetPodName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.targetPodName to be set")
+	} else if name != "mysql-br-readback-mysql-1-x-mysql-backup-cr-readback-wronghash" {
+		t.Fatalf("expected unverified targetPodName to be preserved, got %q", name)
 	}
 }
 
