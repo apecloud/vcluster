@@ -4,7 +4,9 @@ import (
 	"testing"
 
 	"github.com/loft-sh/vcluster/pkg/mappings"
+	"github.com/loft-sh/vcluster/pkg/scheme"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -327,6 +329,46 @@ func TestBackupTargetConnectionCredentialSecretNameSourceSurvivesHostStatusCopy(
 	translateBackupTargetConnectionCredentialSecretNameToHost(&synccontext.SyncContext{}, source, host, namespace)
 
 	secretName, ok, err := unstructured.NestedString(host, "status", "target", "connectionCredential", "secretName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.target.connectionCredential.secretName to be set")
+	} else if secretName != hostSecretName {
+		t.Fatalf("expected translated host secret name, got %q", secretName)
+	}
+}
+
+func TestEnsureHostBackupTargetConnectionCredentialSecretNamePatchesStatus(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
+	hostSecretName := translate.Default.HostName(&synccontext.SyncContext{}, virtualSecretName, namespace).Name
+	hostBackup := NewObject()
+	hostBackup.SetNamespace("mysql-main-head-idc4-vc")
+	hostBackup.SetName("mysql-br-readback-xtrabackup-backup-10747-x-mysql-back")
+	_ = unstructured.SetNestedField(hostBackup.Object, virtualSecretName, "status", "target", "connectionCredential", "secretName")
+	from := map[string]interface{}{
+		"status": map[string]interface{}{
+			"target": map[string]interface{}{
+				"connectionCredential": map[string]interface{}{
+					"secretName": virtualSecretName,
+				},
+			},
+		},
+	}
+	pClient := testingutil.NewFakeClient(scheme.Scheme, hostBackup)
+	syncCtx := &synccontext.SyncContext{HostClient: pClient}
+
+	err := ensureHostBackupTargetConnectionCredentialSecretName(syncCtx, hostBackup.DeepCopy(), from, namespace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := NewObject()
+	err = pClient.Get(syncCtx, types.NamespacedName{Namespace: hostBackup.GetNamespace(), Name: hostBackup.GetName()}, got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretName, ok, err := unstructured.NestedString(got.Object, "status", "target", "connectionCredential", "secretName")
 	if err != nil {
 		t.Fatal(err)
 	} else if !ok {

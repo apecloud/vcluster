@@ -84,7 +84,17 @@ func (s *backupSyncer) SyncToHost(ctx *synccontext.SyncContext, event *syncconte
 		return ctrl.Result{}, err
 	}
 
-	return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), false)
+	result, err := patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), false)
+	if err != nil {
+		return result, err
+	}
+
+	err = ensureHostBackupTargetConnectionCredentialSecretName(ctx, pObj, event.Virtual.Object, event.Virtual.GetNamespace())
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return result, nil
 }
 
 func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*unstructured.Unstructured]) (_ ctrl.Result, retErr error) {
@@ -102,13 +112,17 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("new syncer patcher: %w", err)
 	}
-	defer func() {
-		if err := patch.Patch(ctx, event.Host, event.Virtual); err != nil {
-			retErr = utilerrors.NewAggregate([]error{retErr, err})
-		}
-	}()
-
 	virtualConnectionCredentialStatus := backupTargetConnectionCredentialSecretNameSource(event.Virtual.Object)
+	defer func() {
+		var errs []error
+		if err := patch.Patch(ctx, event.Host, event.Virtual); err != nil {
+			errs = append(errs, err)
+		}
+		if err := ensureHostBackupTargetConnectionCredentialSecretName(ctx, event.Host, virtualConnectionCredentialStatus, event.Virtual.GetNamespace()); err != nil {
+			errs = append(errs, err)
+		}
+		retErr = utilerrors.NewAggregate(append([]error{retErr}, errs...))
+	}()
 
 	// Host DP owns runtime state; reflect it back so virtual callers can wait on Backup phase.
 	copyNestedField(event.Host.Object, event.Virtual.Object, "status")
@@ -159,6 +173,46 @@ func backupTargetConnectionCredentialSecretNameSource(from map[string]interface{
 	to := map[string]interface{}{}
 	_ = unstructured.SetNestedField(to, value, "status", "target", "connectionCredential", "secretName")
 	return to
+}
+
+func ensureHostBackupTargetConnectionCredentialSecretName(ctx *synccontext.SyncContext, hostBackup *unstructured.Unstructured, from map[string]interface{}, namespace string) error {
+	secretName, ok, _ := unstructured.NestedString(from, "status", "target", "connectionCredential", "secretName")
+	if !ok || secretName == "" || ctx == nil || ctx.HostClient == nil || hostBackup == nil || hostBackup.GetName() == "" {
+		return nil
+	}
+
+	hostSecretName := translateVirtualSecretNameToHost(ctx, secretName, namespace)
+	if hostSecretName == "" || hostSecretName == secretName {
+		if ctx.Log != nil {
+			ctx.Log.Infof("skip host Backup credential secretName status patch for %s/%s: input=%q output=%q", hostBackup.GetNamespace(), hostBackup.GetName(), secretName, hostSecretName)
+		}
+		return nil
+	}
+
+	current := NewObject()
+	err := ctx.HostClient.Get(ctx, types.NamespacedName{Namespace: hostBackup.GetNamespace(), Name: hostBackup.GetName()}, current)
+	if apierrors.IsNotFound(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("get host backup for credential secret status patch: %w", err)
+	}
+
+	currentSecretName, _, _ := unstructured.NestedString(current.Object, "status", "target", "connectionCredential", "secretName")
+	if currentSecretName == hostSecretName {
+		return nil
+	}
+
+	before := current.DeepCopy()
+	_ = unstructured.SetNestedField(current.Object, hostSecretName, "status", "target", "connectionCredential", "secretName")
+	if ctx.Log != nil {
+		ctx.Log.Infof("patch host Backup credential secretName status for %s/%s: %q -> %q", current.GetNamespace(), current.GetName(), currentSecretName, hostSecretName)
+	}
+	err = ctx.HostClient.Status().Patch(ctx, current, client.MergeFrom(before))
+	if err != nil {
+		return fmt.Errorf("patch host backup credential secret status: %w", err)
+	}
+
+	return nil
 }
 
 func translateBackupPolicyName(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {
