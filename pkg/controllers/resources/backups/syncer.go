@@ -18,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -26,6 +25,7 @@ import (
 const (
 	dataProtectionBackupRepoLabel       = "dataprotection.kubeblocks.io/backup-repo-name"
 	dataProtectionDefaultRepoAnnotation = "dataprotection.kubeblocks.io/is-default-repo"
+	dataProtectionSkipReconciliation    = "dataprotection.kubeblocks.io/skip-reconciliation"
 )
 
 func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
@@ -75,6 +75,7 @@ func (s *backupSyncer) SyncToHost(ctx *synccontext.SyncContext, event *syncconte
 	}
 
 	pObj := translate.HostMetadata(event.Virtual, s.VirtualToHost(ctx, client.ObjectKeyFromObject(event.Virtual), event.Virtual))
+	markHostBackupReconciliationSkipped(pObj)
 	unstructured.RemoveNestedField(pObj.Object, "status")
 	translateBackupPolicyName(ctx, event.Virtual.Object, pObj.Object, event.Virtual.GetNamespace())
 
@@ -83,19 +84,10 @@ func (s *backupSyncer) SyncToHost(ctx *synccontext.SyncContext, event *syncconte
 		return ctrl.Result{}, err
 	}
 
+	markHostBackupReconciliationSkipped(pObj)
 	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, event.Virtual.Object, pObj.Object, event.Virtual.GetNamespace())
 
-	result, err := patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), false)
-	if err != nil {
-		return result, err
-	}
-
-	err = ensureHostBackupTargetConnectionCredentialSecretName(ctx, pObj, event.Virtual.Object, event.Virtual.GetNamespace())
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	return result, nil
+	return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), false)
 }
 
 func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*unstructured.Unstructured]) (_ ctrl.Result, retErr error) {
@@ -113,40 +105,13 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("new syncer patcher: %w", err)
 	}
-	virtualConnectionCredentialStatus := backupTargetConnectionCredentialSecretNameSource(event.Virtual.Object)
 	defer func() {
-		var errs []error
 		if err := patch.Patch(ctx, event.Host, event.Virtual); err != nil {
-			errs = append(errs, err)
+			retErr = err
 		}
-		if err := ensureHostBackupTargetConnectionCredentialSecretName(ctx, event.Host, virtualConnectionCredentialStatus, event.Virtual.GetNamespace()); err != nil {
-			errs = append(errs, err)
-		}
-		retErr = utilerrors.NewAggregate(append([]error{retErr}, errs...))
 	}()
 
-	// Host DP owns runtime state; reflect it back so virtual callers can wait on Backup phase.
-	copyNestedField(event.Host.Object, event.Virtual.Object, "status")
-	translateBackupRepoStatusToVirtual(ctx, event.Host.Object, event.Virtual.Object)
-	translateBackupTargetPodNameToVirtual(ctx, event.Host.Object, event.Virtual.Object, event.Virtual.GetNamespace())
-	translateBackupTargetConnectionCredentialSecretNameToVirtual(ctx, event.Host.Object, event.Virtual.Object, event.Virtual.GetNamespace())
-	translateBackupActionsToVirtual(ctx, event.Virtual.Object, event.Virtual.GetNamespace(), event.Host.GetName(), event.Host.GetUID(), event.Virtual.GetName(), event.Virtual.GetUID())
-	event.Virtual.SetFinalizers(event.Host.GetFinalizers())
-
-	// Virtual users own the desired spec; host DP owns status/finalizers.
-	copyNestedField(event.Virtual.Object, event.Host.Object, "spec")
-	translateBackupPolicyName(ctx, event.Virtual.Object, event.Host.Object, event.Virtual.GetNamespace())
-	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, virtualConnectionCredentialStatus, event.Host.Object, event.Virtual.GetNamespace())
-
-	event.Virtual.SetAnnotations(translate.VirtualAnnotations(event.Host, event.Virtual))
-	event.Host.SetAnnotations(translate.HostAnnotations(event.Virtual, event.Host))
-	virtualLabels := translate.VirtualLabels(event.Host, event.Virtual)
-	translateBackupRepoLabelToVirtual(ctx, event.Host.GetLabels(), virtualLabels)
-	event.Virtual.SetLabels(virtualLabels)
-
-	hostLabels := translate.HostLabels(event.Virtual, event.Host)
-	preserveHostBackupRepoLabel(event.Host.GetLabels(), hostLabels)
-	event.Host.SetLabels(hostLabels)
+	syncBackupDesiredStateToSkippedHost(ctx, event.Virtual, event.Host)
 
 	return ctrl.Result{}, nil
 }
@@ -165,55 +130,48 @@ func copyNestedField(from, to map[string]interface{}, fields ...string) {
 	_ = unstructured.SetNestedField(to, value, fields...)
 }
 
-func backupTargetConnectionCredentialSecretNameSource(from map[string]interface{}) map[string]interface{} {
-	value, ok, _ := unstructured.NestedFieldCopy(from, "status", "target", "connectionCredential", "secretName")
-	if !ok {
-		return nil
+func markHostBackupReconciliationSkipped(hostBackup *unstructured.Unstructured) {
+	if hostBackup == nil {
+		return
 	}
 
-	to := map[string]interface{}{}
-	_ = unstructured.SetNestedField(to, value, "status", "target", "connectionCredential", "secretName")
-	return to
+	hostBackup.SetAnnotations(skipHostBackupReconciliation(hostBackup.GetAnnotations()))
 }
 
-func ensureHostBackupTargetConnectionCredentialSecretName(ctx *synccontext.SyncContext, hostBackup *unstructured.Unstructured, from map[string]interface{}, namespace string) error {
-	secretName, ok, _ := unstructured.NestedString(from, "status", "target", "connectionCredential", "secretName")
-	if !ok || secretName == "" || ctx == nil || ctx.HostClient == nil || hostBackup == nil || hostBackup.GetName() == "" {
-		return nil
+func hostBackupAnnotations(virtualBackup, hostBackup client.Object) map[string]string {
+	return skipHostBackupReconciliation(translate.HostAnnotations(virtualBackup, hostBackup))
+}
+
+func virtualBackupAnnotations(hostBackup, virtualBackup client.Object) map[string]string {
+	annotations := translate.VirtualAnnotations(hostBackup, virtualBackup)
+	delete(annotations, dataProtectionSkipReconciliation)
+	return annotations
+}
+
+func skipHostBackupReconciliation(annotations map[string]string) map[string]string {
+	if annotations == nil {
+		annotations = map[string]string{}
 	}
 
-	hostSecretName := translateVirtualSecretNameToHost(ctx, secretName, namespace)
-	if hostSecretName == "" || hostSecretName == secretName {
-		if ctx.Log != nil {
-			ctx.Log.Infof("skip host Backup credential secretName status patch for %s/%s: input=%q output=%q", hostBackup.GetNamespace(), hostBackup.GetName(), secretName, hostSecretName)
-		}
-		return nil
-	}
+	annotations[dataProtectionSkipReconciliation] = "true"
+	return annotations
+}
 
-	current := NewObject()
-	err := ctx.HostClient.Get(ctx, types.NamespacedName{Namespace: hostBackup.GetNamespace(), Name: hostBackup.GetName()}, current)
-	if apierrors.IsNotFound(err) {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("get host backup for credential secret status patch: %w", err)
-	}
+func syncBackupDesiredStateToSkippedHost(ctx *synccontext.SyncContext, virtualBackup, hostBackup *unstructured.Unstructured) {
+	// The in-vcluster DP controller owns runtime state. The host Backup is only a
+	// translated mirror so the host DP controller must not launch a second Job.
+	copyNestedField(virtualBackup.Object, hostBackup.Object, "spec")
+	translateBackupPolicyName(ctx, virtualBackup.Object, hostBackup.Object, virtualBackup.GetNamespace())
 
-	currentSecretName, _, _ := unstructured.NestedString(current.Object, "status", "target", "connectionCredential", "secretName")
-	if currentSecretName == hostSecretName {
-		return nil
-	}
+	virtualBackup.SetAnnotations(virtualBackupAnnotations(hostBackup, virtualBackup))
+	hostBackup.SetAnnotations(hostBackupAnnotations(virtualBackup, hostBackup))
+	virtualLabels := translate.VirtualLabels(hostBackup, virtualBackup)
+	translateBackupRepoLabelToVirtual(ctx, hostBackup.GetLabels(), virtualLabels)
+	virtualBackup.SetLabels(virtualLabels)
 
-	before := current.DeepCopy()
-	_ = unstructured.SetNestedField(current.Object, hostSecretName, "status", "target", "connectionCredential", "secretName")
-	if ctx.Log != nil {
-		ctx.Log.Infof("patch host Backup credential secretName status for %s/%s: %q -> %q", current.GetNamespace(), current.GetName(), currentSecretName, hostSecretName)
-	}
-	err = ctx.HostClient.Status().Patch(ctx, current, client.MergeFrom(before))
-	if err != nil {
-		return fmt.Errorf("patch host backup credential secret status: %w", err)
-	}
-
-	return nil
+	hostLabels := translate.HostLabels(virtualBackup, hostBackup)
+	preserveHostBackupRepoLabel(hostBackup.GetLabels(), hostLabels)
+	hostBackup.SetLabels(hostLabels)
 }
 
 func translateBackupPolicyName(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {

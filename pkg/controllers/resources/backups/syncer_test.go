@@ -4,9 +4,7 @@ import (
 	"testing"
 
 	"github.com/loft-sh/vcluster/pkg/mappings"
-	"github.com/loft-sh/vcluster/pkg/scheme"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
-	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -46,6 +44,119 @@ func TestCopyNestedFieldRemovesMissingField(t *testing.T) {
 		t.Fatal(err)
 	} else if ok {
 		t.Fatal("expected status to be removed")
+	}
+}
+
+func TestMarkHostBackupReconciliationSkipped(t *testing.T) {
+	host := NewObject()
+	host.SetAnnotations(map[string]string{
+		dataProtectionSkipReconciliation: "false",
+		"keep":                           "me",
+	})
+
+	markHostBackupReconciliationSkipped(host)
+
+	annotations := host.GetAnnotations()
+	if annotations[dataProtectionSkipReconciliation] != "true" {
+		t.Fatalf("expected skip reconciliation annotation true, got %q", annotations[dataProtectionSkipReconciliation])
+	}
+	if annotations["keep"] != "me" {
+		t.Fatalf("expected unrelated annotation to be preserved, got %q", annotations["keep"])
+	}
+}
+
+func TestHostBackupAnnotationsReappliesSkipAfterTranslation(t *testing.T) {
+	virtual := NewObject()
+	virtual.SetName("mysql-br-readback-xtrabackup-backup-64999")
+	virtual.SetNamespace("mysql-backup-cr-readback")
+	host := NewObject()
+	host.SetName(translate.Default.HostName(&synccontext.SyncContext{}, virtual.GetName(), virtual.GetNamespace()).Name)
+	host.SetAnnotations(map[string]string{
+		dataProtectionSkipReconciliation: "false",
+	})
+
+	annotations := hostBackupAnnotations(virtual, host)
+
+	if annotations[dataProtectionSkipReconciliation] != "true" {
+		t.Fatalf("expected translated host annotations to force skip reconciliation true, got %q", annotations[dataProtectionSkipReconciliation])
+	}
+}
+
+func TestVirtualBackupAnnotationsDropsHostSkipReconciliation(t *testing.T) {
+	virtual := NewObject()
+	virtual.SetAnnotations(map[string]string{
+		dataProtectionSkipReconciliation: "true",
+		"virtual":                        "keep",
+	})
+	host := NewObject()
+	host.SetAnnotations(map[string]string{
+		dataProtectionSkipReconciliation: "true",
+		"host":                           "copy",
+	})
+
+	annotations := virtualBackupAnnotations(host, virtual)
+
+	if _, ok := annotations[dataProtectionSkipReconciliation]; ok {
+		t.Fatalf("expected virtual annotations to drop %s, got %#v", dataProtectionSkipReconciliation, annotations)
+	}
+	if annotations["host"] != "copy" {
+		t.Fatalf("expected ordinary host annotation to copy, got %#v", annotations)
+	}
+}
+
+func TestSyncBackupDesiredStateToSkippedHostPreservesVirtualRuntimeState(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtual := NewObject()
+	virtual.SetName("mysql-br-readback-xtrabackup-backup-64999")
+	virtual.SetNamespace(namespace)
+	virtual.SetUID(types.UID("virtual-uid"))
+	virtual.SetFinalizers([]string{"virtual-dp-finalizer"})
+	_ = unstructured.SetNestedField(virtual.Object, "Completed", "status", "phase")
+	_ = unstructured.SetNestedField(virtual.Object, "mysql-policy", "spec", "backupPolicyName")
+
+	host := NewObject()
+	host.SetName(translate.Default.HostName(&synccontext.SyncContext{}, virtual.GetName(), namespace).Name)
+	host.SetNamespace(translate.Default.HostName(&synccontext.SyncContext{}, virtual.GetName(), namespace).Namespace)
+	host.SetUID(types.UID("host-uid"))
+	host.SetFinalizers([]string{"host-dp-finalizer"})
+	_ = unstructured.SetNestedField(host.Object, "Running", "status", "phase")
+
+	syncBackupDesiredStateToSkippedHost(&synccontext.SyncContext{}, virtual, host)
+
+	phase, ok, err := unstructured.NestedString(virtual.Object, "status", "phase")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected virtual status.phase to remain set")
+	} else if phase != "Completed" {
+		t.Fatalf("expected virtual status.phase to remain Completed, got %q", phase)
+	}
+	if got := virtual.GetFinalizers(); len(got) != 1 || got[0] != "virtual-dp-finalizer" {
+		t.Fatalf("expected virtual finalizers to remain virtual-owned, got %#v", got)
+	}
+
+	hostPhase, ok, err := unstructured.NestedString(host.Object, "status", "phase")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected host status.phase to remain set")
+	} else if hostPhase != "Running" {
+		t.Fatalf("expected host status.phase to remain Running, got %q", hostPhase)
+	}
+	if host.GetAnnotations()[dataProtectionSkipReconciliation] != "true" {
+		t.Fatalf("expected host Backup to be marked skip reconciliation, got %#v", host.GetAnnotations())
+	}
+	if _, ok := virtual.GetAnnotations()[dataProtectionSkipReconciliation]; ok {
+		t.Fatalf("expected virtual Backup to omit skip reconciliation annotation, got %#v", virtual.GetAnnotations())
+	}
+
+	hostPolicyName, ok, err := unstructured.NestedString(host.Object, "spec", "backupPolicyName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected host spec.backupPolicyName to be set")
+	} else if hostPolicyName != translate.Default.HostName(&synccontext.SyncContext{}, "mysql-policy", namespace).Name {
+		t.Fatalf("expected translated host backupPolicyName, got %q", hostPolicyName)
 	}
 }
 
@@ -305,39 +416,6 @@ func TestTranslateBackupTargetConnectionCredentialSecretNameToHostPreservesAlrea
 	}
 }
 
-func TestBackupTargetConnectionCredentialSecretNameSourceSurvivesHostStatusCopy(t *testing.T) {
-	namespace := "mysql-backup-cr-readback"
-	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
-	hostSecretName := translate.Default.HostName(&synccontext.SyncContext{}, virtualSecretName, namespace).Name
-	host := map[string]interface{}{
-		"status": map[string]interface{}{
-			"phase": "Running",
-		},
-	}
-	virtual := map[string]interface{}{
-		"status": map[string]interface{}{
-			"target": map[string]interface{}{
-				"connectionCredential": map[string]interface{}{
-					"secretName": virtualSecretName,
-				},
-			},
-		},
-	}
-
-	source := backupTargetConnectionCredentialSecretNameSource(virtual)
-	copyNestedField(host, virtual, "status")
-	translateBackupTargetConnectionCredentialSecretNameToHost(&synccontext.SyncContext{}, source, host, namespace)
-
-	secretName, ok, err := unstructured.NestedString(host, "status", "target", "connectionCredential", "secretName")
-	if err != nil {
-		t.Fatal(err)
-	} else if !ok {
-		t.Fatal("expected status.target.connectionCredential.secretName to be set")
-	} else if secretName != hostSecretName {
-		t.Fatalf("expected translated host secret name, got %q", secretName)
-	}
-}
-
 func TestTranslateBackupTargetConnectionCredentialSecretNameToHostRunsAfterLateStatusCopy(t *testing.T) {
 	namespace := "mysql-backup-cr-readback"
 	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
@@ -359,46 +437,6 @@ func TestTranslateBackupTargetConnectionCredentialSecretNameToHostRunsAfterLateS
 	translateBackupTargetConnectionCredentialSecretNameToHost(&synccontext.SyncContext{}, virtual, host, namespace)
 
 	secretName, ok, err := unstructured.NestedString(host, "status", "target", "connectionCredential", "secretName")
-	if err != nil {
-		t.Fatal(err)
-	} else if !ok {
-		t.Fatal("expected status.target.connectionCredential.secretName to be set")
-	} else if secretName != hostSecretName {
-		t.Fatalf("expected translated host secret name, got %q", secretName)
-	}
-}
-
-func TestEnsureHostBackupTargetConnectionCredentialSecretNamePatchesStatus(t *testing.T) {
-	namespace := "mysql-backup-cr-readback"
-	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
-	hostSecretName := translate.Default.HostName(&synccontext.SyncContext{}, virtualSecretName, namespace).Name
-	hostBackup := NewObject()
-	hostBackup.SetNamespace("mysql-main-head-idc4-vc")
-	hostBackup.SetName("mysql-br-readback-xtrabackup-backup-10747-x-mysql-back")
-	_ = unstructured.SetNestedField(hostBackup.Object, virtualSecretName, "status", "target", "connectionCredential", "secretName")
-	from := map[string]interface{}{
-		"status": map[string]interface{}{
-			"target": map[string]interface{}{
-				"connectionCredential": map[string]interface{}{
-					"secretName": virtualSecretName,
-				},
-			},
-		},
-	}
-	pClient := testingutil.NewFakeClient(scheme.Scheme, hostBackup)
-	syncCtx := &synccontext.SyncContext{HostClient: pClient}
-
-	err := ensureHostBackupTargetConnectionCredentialSecretName(syncCtx, hostBackup.DeepCopy(), from, namespace)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	got := NewObject()
-	err = pClient.Get(syncCtx, types.NamespacedName{Namespace: hostBackup.GetNamespace(), Name: hostBackup.GetName()}, got)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secretName, ok, err := unstructured.NestedString(got.Object, "status", "target", "connectionCredential", "secretName")
 	if err != nil {
 		t.Fatal(err)
 	} else if !ok {
