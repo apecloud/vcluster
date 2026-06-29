@@ -253,7 +253,7 @@ func TestTranslateBackupTargetConnectionCredentialSecretNameToHost(t *testing.T)
 	if hostSecretName == virtualSecretName || len(hostSecretName) > 63 {
 		t.Fatalf("expected a translated DNS-safe host secret name, got %q", hostSecretName)
 	}
-	to := map[string]interface{}{
+	from := map[string]interface{}{
 		"status": map[string]interface{}{
 			"target": map[string]interface{}{
 				"connectionCredential": map[string]interface{}{
@@ -262,8 +262,9 @@ func TestTranslateBackupTargetConnectionCredentialSecretNameToHost(t *testing.T)
 			},
 		},
 	}
+	to := map[string]interface{}{}
 
-	translateBackupTargetConnectionCredentialSecretNameToHost(&synccontext.SyncContext{}, to, namespace)
+	translateBackupTargetConnectionCredentialSecretNameToHost(&synccontext.SyncContext{}, from, to, namespace)
 
 	secretName, ok, err := unstructured.NestedString(to, "status", "target", "connectionCredential", "secretName")
 	if err != nil {
@@ -279,7 +280,7 @@ func TestTranslateBackupTargetConnectionCredentialSecretNameToHostPreservesAlrea
 	namespace := "mysql-backup-cr-readback"
 	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
 	hostSecretName := translate.Default.HostName(&synccontext.SyncContext{}, virtualSecretName, namespace).Name
-	to := map[string]interface{}{
+	from := map[string]interface{}{
 		"status": map[string]interface{}{
 			"target": map[string]interface{}{
 				"connectionCredential": map[string]interface{}{
@@ -288,8 +289,9 @@ func TestTranslateBackupTargetConnectionCredentialSecretNameToHostPreservesAlrea
 			},
 		},
 	}
+	to := map[string]interface{}{}
 
-	translateBackupTargetConnectionCredentialSecretNameToHost(&synccontext.SyncContext{}, to, namespace)
+	translateBackupTargetConnectionCredentialSecretNameToHost(&synccontext.SyncContext{}, from, to, namespace)
 
 	secretName, ok, err := unstructured.NestedString(to, "status", "target", "connectionCredential", "secretName")
 	if err != nil {

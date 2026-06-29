@@ -77,6 +77,7 @@ func (s *backupSyncer) SyncToHost(ctx *synccontext.SyncContext, event *syncconte
 	pObj := translate.HostMetadata(event.Virtual, s.VirtualToHost(ctx, client.ObjectKeyFromObject(event.Virtual), event.Virtual))
 	unstructured.RemoveNestedField(pObj.Object, "status")
 	translateBackupPolicyName(ctx, event.Virtual.Object, pObj.Object, event.Virtual.GetNamespace())
+	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, event.Virtual.Object, pObj.Object, event.Virtual.GetNamespace())
 
 	err := pro.ApplyPatchesHostObject(ctx, nil, pObj, event.Virtual, s.patches, false)
 	if err != nil {
@@ -118,7 +119,7 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 	// Virtual users own the desired spec; host DP owns status/finalizers.
 	copyNestedField(event.Virtual.Object, event.Host.Object, "spec")
 	translateBackupPolicyName(ctx, event.Virtual.Object, event.Host.Object, event.Virtual.GetNamespace())
-	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, event.Host.Object, event.Virtual.GetNamespace())
+	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, event.Virtual.Object, event.Host.Object, event.Virtual.GetNamespace())
 
 	event.Virtual.SetAnnotations(translate.VirtualAnnotations(event.Host, event.Virtual))
 	event.Host.SetAnnotations(translate.HostAnnotations(event.Virtual, event.Host))
@@ -192,8 +193,8 @@ func translateBackupTargetPodNameToVirtual(ctx *synccontext.SyncContext, from, t
 	_ = unstructured.SetNestedSlice(to, selectedTargetPods, "status", "target", "selectedTargetPods")
 }
 
-func translateBackupTargetConnectionCredentialSecretNameToHost(ctx *synccontext.SyncContext, to map[string]interface{}, namespace string) {
-	secretName, ok, _ := unstructured.NestedString(to, "status", "target", "connectionCredential", "secretName")
+func translateBackupTargetConnectionCredentialSecretNameToHost(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {
+	secretName, ok, _ := unstructured.NestedString(from, "status", "target", "connectionCredential", "secretName")
 	if !ok || secretName == "" {
 		return
 	}
