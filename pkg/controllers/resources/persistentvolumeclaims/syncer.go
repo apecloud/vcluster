@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"time"
 
 	storagev1 "k8s.io/api/storage/v1"
@@ -50,6 +51,11 @@ const (
 	dataProtectionAPIGroup               = "dataprotection.kubeblocks.io"
 	dataProtectionBackupKind             = "Backup"
 	dataProtectionPopulateFromAnnotation = "dataprotection.kubeblocks.io/populate-from"
+
+	kubeBlocksRestoreSourceAPIGroupAnnotation  = "apps.kubeblocks.io/restore-source-api-group"
+	kubeBlocksRestoreSourceKindAnnotation      = "apps.kubeblocks.io/restore-source-kind"
+	kubeBlocksRestoreSourceNameAnnotation      = "apps.kubeblocks.io/restore-source-name"
+	kubeBlocksRestoreSourceNamespaceAnnotation = "apps.kubeblocks.io/restore-source-namespace"
 
 	dataProtectionMaterializationRequestLabel  = "vcluster.loft.sh/dataprotection-materialization-request"
 	dataProtectionMaterializationRequestPrefix = "dp-host-materialization-"
@@ -146,6 +152,7 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, err
 	}
 	if handled {
+		translateDataProtectionRestoreSourceAnnotationsToHost(ctx, pObj, event.Virtual.Namespace)
 		err = pro.ApplyPatchesHostObject(ctx, nil, pObj, event.Virtual, ctx.Config.Sync.ToHost.PersistentVolumeClaims.Patches, false)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -166,6 +173,7 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		)
 		return ctrl.Result{}, err
 	}
+	translateDataProtectionRestoreSourceAnnotationsToHost(ctx, pObj, event.Virtual.Namespace)
 
 	err = pro.ApplyPatchesHostObject(ctx, nil, pObj, event.Virtual, ctx.Config.Sync.ToHost.PersistentVolumeClaims.Patches, false)
 	if err != nil {
@@ -295,6 +303,14 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	// bi-directional sync of annotations and labels
 	event.Virtual.Annotations, event.Host.Annotations = translate.AnnotationsBidirectionalUpdate(event, s.excludedAnnotations...)
 	event.Virtual.Labels, event.Host.Labels = translate.LabelsBidirectionalUpdate(event)
+	translateDataProtectionRestoreSourceAnnotationsToHost(ctx, event.Host, event.Virtual.Namespace)
+	var oldHostAnnotations map[string]string
+	if event.HostOld != nil {
+		oldHostAnnotations = event.HostOld.GetAnnotations()
+	}
+	if !maps.Equal(oldHostAnnotations, event.Host.GetAnnotations()) {
+		translateDataProtectionRestoreSourceAnnotationsToVirtual(ctx, event.Virtual)
+	}
 
 	return ctrl.Result{}, nil
 }
@@ -306,6 +322,7 @@ func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext
 	}
 
 	vPvc := translate.VirtualMetadata(event.Host, s.HostToVirtual(ctx, types.NamespacedName{Name: event.Host.Name, Namespace: event.Host.Namespace}, event.Host), s.excludedAnnotations...)
+	translateDataProtectionRestoreSourceAnnotationsToVirtual(ctx, vPvc)
 	err := pro.ApplyPatchesVirtualObject(ctx, nil, vPvc, event.Host, ctx.Config.Sync.ToHost.PersistentVolumeClaims.Patches, false)
 	if err != nil {
 		return ctrl.Result{}, err

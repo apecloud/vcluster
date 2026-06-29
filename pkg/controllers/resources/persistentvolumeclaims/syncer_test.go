@@ -1,10 +1,12 @@
 package persistentvolumeclaims
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/loft-sh/vcluster/pkg/config"
+	"github.com/loft-sh/vcluster/pkg/mappings"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	syncertesting "github.com/loft-sh/vcluster/pkg/syncer/testing"
 	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
@@ -41,6 +43,20 @@ func TestSync(t *testing.T) {
 			translate.NamespaceLabel: vObjectMeta.Namespace,
 		},
 	}
+	restoreSourceAnnotations := func(name, namespace string) map[string]string {
+		return map[string]string{
+			kubeBlocksRestoreSourceAPIGroupAnnotation:  dataProtectionAPIGroup,
+			kubeBlocksRestoreSourceKindAnnotation:      dataProtectionBackupKind,
+			kubeBlocksRestoreSourceNameAnnotation:      name,
+			kubeBlocksRestoreSourceNamespaceAnnotation: namespace,
+		}
+	}
+	restoreSourceManagedAnnotations := strings.Join([]string{
+		kubeBlocksRestoreSourceAPIGroupAnnotation,
+		kubeBlocksRestoreSourceKindAnnotation,
+		kubeBlocksRestoreSourceNameAnnotation,
+		kubeBlocksRestoreSourceNamespaceAnnotation,
+	}, "\n")
 	changedResources := corev1.VolumeResourceRequirements{
 		Requests: map[corev1.ResourceName]resource.Quantity{
 			"storage": {
@@ -54,6 +70,17 @@ func TestSync(t *testing.T) {
 	createdPvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: pObjectMeta,
 	}
+	hostRestoreSourceBackupName := translate.Default.HostName(nil, "backup-1", vObjectMeta.Namespace)
+	createdPvcWithHostRestoreSourceAnnotations := createdPvc.DeepCopy()
+	createdPvcWithHostRestoreSourceAnnotations.Annotations = map[string]string{}
+	for key, value := range createdPvc.Annotations {
+		createdPvcWithHostRestoreSourceAnnotations.Annotations[key] = value
+	}
+	for key, value := range restoreSourceAnnotations(hostRestoreSourceBackupName.Name, pObjectMeta.Namespace) {
+		createdPvcWithHostRestoreSourceAnnotations.Annotations[key] = value
+	}
+	basePvcWithVirtualRestoreSourceAnnotations := basePvc.DeepCopy()
+	basePvcWithVirtualRestoreSourceAnnotations.Annotations = restoreSourceAnnotations("backup-1", vObjectMeta.Namespace)
 	deletePvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              vObjectMeta.Name,
@@ -252,9 +279,16 @@ func TestSync(t *testing.T) {
 		DataSourceRef: &corev1.TypedObjectReference{
 			APIGroup: &dataProtectionGroup,
 			Kind:     dataProtectionBackupKind,
-			Name:     translate.Default.HostName(nil, "backup-1", vObjectMeta.Namespace).Name,
+			Name:     hostRestoreSourceBackupName.Name,
 		},
 	}
+	dataProtectionBackupPendingPvcWithRestoreSourceAnnotations := dataProtectionBackupPendingPvc.DeepCopy()
+	dataProtectionBackupPendingPvcWithRestoreSourceAnnotations.Annotations = restoreSourceAnnotations("backup-1", vObjectMeta.Namespace)
+	dataProtectionDataRestoreHostPvcWithRestoreSourceAnnotations := dataProtectionDataRestoreHostPvc.DeepCopy()
+	for key, value := range restoreSourceAnnotations(hostRestoreSourceBackupName.Name, pObjectMeta.Namespace) {
+		dataProtectionDataRestoreHostPvcWithRestoreSourceAnnotations.Annotations[key] = value
+	}
+	dataProtectionDataRestoreHostPvcWithRestoreSourceAnnotations.Annotations[translate.ManagedAnnotationsAnnotation] = restoreSourceManagedAnnotations
 	dataProtectionNoDataHostDeletingWithBackupSource := dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()
 	dataProtectionNoDataHostDeletingWithBackupSource.Finalizers = []string{"kubernetes.io/pvc-protection"}
 	dataProtectionNoDataHostDeletingWithBackupSource.DeletionTimestamp = &metav1.Time{Time: time.Now()}
@@ -376,6 +410,67 @@ func TestSync(t *testing.T) {
 				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
 
 				_, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(dataProtectionBackupPendingPvc.DeepCopy()))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                "Create data protection data restore forward with host backup restore-source annotations",
+			InitialVirtualState: []runtime.Object{dataProtectionBackupPendingPvcWithRestoreSourceAnnotations.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionBackupPendingPvcWithRestoreSourceAnnotations.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionDataRestoreHostPvcWithRestoreSourceAnnotations.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(dataProtectionBackupPendingPvcWithRestoreSourceAnnotations.DeepCopy()))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                 "Update backwards with virtual backup restore-source annotations",
+			InitialVirtualState:  []runtime.Object{basePvc.DeepCopy()},
+			InitialPhysicalState: []runtime.Object{createdPvcWithHostRestoreSourceAnnotations.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {basePvcWithVirtualRestoreSourceAnnotations.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {createdPvcWithHostRestoreSourceAnnotations.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				err := syncCtx.Mappings.Store().AddReferenceAndSave(syncCtx, synccontext.NameMapping{
+					GroupVersionKind: mappings.DataProtectionBackups(),
+					VirtualName: types.NamespacedName{
+						Name:      "backup-1",
+						Namespace: vObjectMeta.Namespace,
+					},
+					HostName: types.NamespacedName{
+						Name:      hostRestoreSourceBackupName.Name,
+						Namespace: pObjectMeta.Namespace,
+					},
+				}, synccontext.NameMapping{
+					GroupVersionKind: mappings.PersistentVolumeClaims(),
+					VirtualName: types.NamespacedName{
+						Name:      vObjectMeta.Name,
+						Namespace: vObjectMeta.Namespace,
+					},
+					HostName: types.NamespacedName{
+						Name:      pObjectMeta.Name,
+						Namespace: pObjectMeta.Namespace,
+					},
+				})
+				assert.NilError(t, err)
+
+				_, err = syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					createdPvc.DeepCopy(),
+					createdPvcWithHostRestoreSourceAnnotations.DeepCopy(),
+					basePvc.DeepCopy(),
+					basePvc.DeepCopy(),
+				))
 				assert.NilError(t, err)
 			},
 		},
