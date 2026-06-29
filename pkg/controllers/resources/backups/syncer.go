@@ -108,6 +108,8 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 		}
 	}()
 
+	virtualConnectionCredentialStatus := backupTargetConnectionCredentialSecretNameSource(event.Virtual.Object)
+
 	// Host DP owns runtime state; reflect it back so virtual callers can wait on Backup phase.
 	copyNestedField(event.Host.Object, event.Virtual.Object, "status")
 	translateBackupRepoStatusToVirtual(ctx, event.Host.Object, event.Virtual.Object)
@@ -119,7 +121,7 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 	// Virtual users own the desired spec; host DP owns status/finalizers.
 	copyNestedField(event.Virtual.Object, event.Host.Object, "spec")
 	translateBackupPolicyName(ctx, event.Virtual.Object, event.Host.Object, event.Virtual.GetNamespace())
-	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, event.Virtual.Object, event.Host.Object, event.Virtual.GetNamespace())
+	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, virtualConnectionCredentialStatus, event.Host.Object, event.Virtual.GetNamespace())
 
 	event.Virtual.SetAnnotations(translate.VirtualAnnotations(event.Host, event.Virtual))
 	event.Host.SetAnnotations(translate.HostAnnotations(event.Virtual, event.Host))
@@ -146,6 +148,17 @@ func copyNestedField(from, to map[string]interface{}, fields ...string) {
 	}
 
 	_ = unstructured.SetNestedField(to, value, fields...)
+}
+
+func backupTargetConnectionCredentialSecretNameSource(from map[string]interface{}) map[string]interface{} {
+	value, ok, _ := unstructured.NestedFieldCopy(from, "status", "target", "connectionCredential", "secretName")
+	if !ok {
+		return nil
+	}
+
+	to := map[string]interface{}{}
+	_ = unstructured.SetNestedField(to, value, "status", "target", "connectionCredential", "secretName")
+	return to
 }
 
 func translateBackupPolicyName(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {
