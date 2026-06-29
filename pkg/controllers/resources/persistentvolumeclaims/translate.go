@@ -24,6 +24,10 @@ func (s *persistentVolumeClaimSyncer) translate(ctx *synccontext.SyncContext, vP
 				pPVC.Spec.DataSource.Name = mappings.VirtualToHostName(ctx, pPVC.Spec.DataSource.Name, vPvc.Namespace, mappings.VolumeSnapshots())
 			case "PersistentVolumeClaim":
 				pPVC.Spec.DataSource.Name = mappings.VirtualToHostName(ctx, pPVC.Spec.DataSource.Name, vPvc.Namespace, mappings.PersistentVolumeClaims())
+			case dataProtectionBackupKind:
+				if pPVC.Spec.DataSource.APIGroup != nil && *pPVC.Spec.DataSource.APIGroup == dataProtectionAPIGroup {
+					pPVC.Spec.DataSource.Name = translateDataProtectionBackupNameToHost(ctx, pPVC.Spec.DataSource.Name, vPvc.Namespace)
+				}
 			}
 		}
 
@@ -38,11 +42,33 @@ func (s *persistentVolumeClaimSyncer) translate(ctx *synccontext.SyncContext, vP
 				pPVC.Spec.DataSourceRef.Name = mappings.VirtualToHostName(ctx, pPVC.Spec.DataSourceRef.Name, namespace, mappings.VolumeSnapshots())
 			case "PersistentVolumeClaim":
 				pPVC.Spec.DataSourceRef.Name = mappings.VirtualToHostName(ctx, pPVC.Spec.DataSourceRef.Name, namespace, mappings.PersistentVolumeClaims())
+			case dataProtectionBackupKind:
+				if pPVC.Spec.DataSourceRef.APIGroup != nil && *pPVC.Spec.DataSourceRef.APIGroup == dataProtectionAPIGroup {
+					pPVC.Spec.DataSourceRef.Name = translateDataProtectionBackupNameToHost(ctx, pPVC.Spec.DataSourceRef.Name, namespace)
+				}
 			}
 		}
 	}
 
 	return pPVC, nil
+}
+
+func translateDataProtectionBackupNameToHost(ctx *synccontext.SyncContext, name, namespace string) string {
+	if name == "" || namespace == "" {
+		return name
+	}
+
+	if ctx != nil && ctx.Mappings != nil {
+		mapper, err := ctx.Mappings.ByGVK(mappings.DataProtectionBackups())
+		if err == nil {
+			hostName := mapper.VirtualToHost(ctx, types.NamespacedName{Name: name, Namespace: namespace}, nil)
+			if hostName.Name != "" {
+				return hostName.Name
+			}
+		}
+	}
+
+	return translate.Default.HostName(ctx, name, namespace).Name
 }
 
 func (s *persistentVolumeClaimSyncer) translateSelector(ctx *synccontext.SyncContext, vPvc *corev1.PersistentVolumeClaim) {

@@ -113,6 +113,9 @@ func TestSyncBackupDesiredStateToSkippedHostPreservesVirtualRuntimeState(t *test
 	virtual.SetFinalizers([]string{"virtual-dp-finalizer"})
 	_ = unstructured.SetNestedField(virtual.Object, "Completed", "status", "phase")
 	_ = unstructured.SetNestedField(virtual.Object, "mysql-policy", "spec", "backupPolicyName")
+	_ = unstructured.SetNestedField(virtual.Object, "mysql-br-readback-mysql-0", "status", "targetPodName")
+	_ = unstructured.SetNestedSlice(virtual.Object, []interface{}{"mysql-br-readback-mysql-0"}, "status", "target", "selectedTargetPods")
+	_ = unstructured.SetNestedField(virtual.Object, "mysql-br-readback-mysql-account-kbadmin", "status", "target", "connectionCredential", "secretName")
 
 	host := NewObject()
 	host.SetName(translate.Default.HostName(&synccontext.SyncContext{}, virtual.GetName(), namespace).Name)
@@ -140,8 +143,32 @@ func TestSyncBackupDesiredStateToSkippedHostPreservesVirtualRuntimeState(t *test
 		t.Fatal(err)
 	} else if !ok {
 		t.Fatal("expected host status.phase to remain set")
-	} else if hostPhase != "Running" {
-		t.Fatalf("expected host status.phase to remain Running, got %q", hostPhase)
+	} else if hostPhase != "Completed" {
+		t.Fatalf("expected host status.phase to mirror virtual Completed, got %q", hostPhase)
+	}
+	hostTargetPodName, ok, err := unstructured.NestedString(host.Object, "status", "targetPodName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected host status.targetPodName to be set")
+	} else if hostTargetPodName != translate.Default.HostName(&synccontext.SyncContext{}, "mysql-br-readback-mysql-0", namespace).Name {
+		t.Fatalf("expected host status.targetPodName translated, got %q", hostTargetPodName)
+	}
+	hostSelectedPods, ok, err := unstructured.NestedStringSlice(host.Object, "status", "target", "selectedTargetPods")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok || len(hostSelectedPods) != 1 {
+		t.Fatalf("expected one host selected target pod, got %#v", hostSelectedPods)
+	} else if hostSelectedPods[0] != translate.Default.HostName(&synccontext.SyncContext{}, "mysql-br-readback-mysql-0", namespace).Name {
+		t.Fatalf("expected translated selected target pod, got %#v", hostSelectedPods)
+	}
+	hostSecretName, ok, err := unstructured.NestedString(host.Object, "status", "target", "connectionCredential", "secretName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected host status.target.connectionCredential.secretName to be set")
+	} else if hostSecretName != translate.Default.HostName(&synccontext.SyncContext{}, "mysql-br-readback-mysql-account-kbadmin", namespace).Name {
+		t.Fatalf("expected translated host credential secret, got %q", hostSecretName)
 	}
 	if host.GetAnnotations()[dataProtectionSkipReconciliation] != "true" {
 		t.Fatalf("expected host Backup to be marked skip reconciliation, got %#v", host.GetAnnotations())
@@ -659,6 +686,65 @@ func TestTranslateBackupRepoNameToVirtualLeavesAmbiguousRepos(t *testing.T) {
 	got := translateBackupRepoNameToVirtualFromList("host-repo", backupRepos)
 	if got != "host-repo" {
 		t.Fatalf("expected ambiguous repo list to preserve host repo, got %q", got)
+	}
+}
+
+func TestTranslateBackupRepoNameToHostFromDefaultRepo(t *testing.T) {
+	backupRepos := &unstructured.UnstructuredList{
+		Items: []unstructured.Unstructured{
+			newBackupRepoForTest("host-repo", true),
+		},
+	}
+
+	got := translateBackupRepoNameToHostFromList("virtual-repo", backupRepos)
+	if got != "host-repo" {
+		t.Fatalf("expected default host repo, got %q", got)
+	}
+}
+
+func TestTranslateBackupTargetsToHost(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtualPodName := "mysql-br-readback-mysql-0"
+	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
+	to := map[string]interface{}{
+		"status": map[string]interface{}{
+			"targets": []interface{}{
+				map[string]interface{}{
+					"selectedTargetPods": []interface{}{virtualPodName},
+					"connectionCredential": map[string]interface{}{
+						"secretName": virtualSecretName,
+					},
+				},
+			},
+		},
+	}
+
+	translateBackupTargetsToHost(&synccontext.SyncContext{}, to, namespace)
+
+	targets, ok, err := unstructured.NestedSlice(to, "status", "targets")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok || len(targets) != 1 {
+		t.Fatalf("expected one translated target, got %#v", targets)
+	}
+	target := targets[0].(map[string]interface{})
+	selectedPods, ok, err := unstructured.NestedStringSlice(target, "selectedTargetPods")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok || len(selectedPods) != 1 {
+		t.Fatalf("expected one translated selected target pod, got %#v", selectedPods)
+	}
+	if selectedPods[0] != translate.Default.HostName(&synccontext.SyncContext{}, virtualPodName, namespace).Name {
+		t.Fatalf("expected translated selected target pod, got %#v", selectedPods)
+	}
+	secretName, ok, err := unstructured.NestedString(target, "connectionCredential", "secretName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected translated secretName")
+	}
+	if secretName != translate.Default.HostName(&synccontext.SyncContext{}, virtualSecretName, namespace).Name {
+		t.Fatalf("expected translated secretName, got %q", secretName)
 	}
 }
 

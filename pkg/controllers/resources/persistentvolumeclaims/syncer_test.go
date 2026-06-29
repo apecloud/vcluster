@@ -252,7 +252,7 @@ func TestSync(t *testing.T) {
 		DataSourceRef: &corev1.TypedObjectReference{
 			APIGroup: &dataProtectionGroup,
 			Kind:     dataProtectionBackupKind,
-			Name:     "backup-1",
+			Name:     translate.Default.HostName(nil, "backup-1", vObjectMeta.Namespace).Name,
 		},
 	}
 	dataProtectionNoDataHostDeletingWithBackupSource := dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()

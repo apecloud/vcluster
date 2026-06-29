@@ -160,8 +160,12 @@ func skipHostBackupReconciliation(annotations map[string]string) map[string]stri
 func syncBackupDesiredStateToSkippedHost(ctx *synccontext.SyncContext, virtualBackup, hostBackup *unstructured.Unstructured) {
 	// The in-vcluster DP controller owns runtime state. The host Backup is only a
 	// translated mirror so the host DP controller must not launch a second Job.
+	// Host-side restore consumers still read Backup status, so mirror translated
+	// status while keeping host Backup reconciliation disabled.
 	copyNestedField(virtualBackup.Object, hostBackup.Object, "spec")
+	copyNestedField(virtualBackup.Object, hostBackup.Object, "status")
 	translateBackupPolicyName(ctx, virtualBackup.Object, hostBackup.Object, virtualBackup.GetNamespace())
+	translateBackupRestoreStatusToHost(ctx, hostBackup.Object, virtualBackup.GetNamespace())
 
 	virtualBackup.SetAnnotations(virtualBackupAnnotations(hostBackup, virtualBackup))
 	hostBackup.SetAnnotations(hostBackupAnnotations(virtualBackup, hostBackup))
@@ -172,6 +176,13 @@ func syncBackupDesiredStateToSkippedHost(ctx *synccontext.SyncContext, virtualBa
 	hostLabels := translate.HostLabels(virtualBackup, hostBackup)
 	preserveHostBackupRepoLabel(hostBackup.GetLabels(), hostLabels)
 	hostBackup.SetLabels(hostLabels)
+}
+
+func translateBackupRestoreStatusToHost(ctx *synccontext.SyncContext, to map[string]interface{}, namespace string) {
+	translateBackupRepoStatusToHost(ctx, to)
+	translateBackupTargetPodNameToHost(ctx, to, namespace)
+	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, to, to, namespace)
+	translateBackupTargetsToHost(ctx, to, namespace)
 }
 
 func translateBackupPolicyName(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {
@@ -195,6 +206,24 @@ func translateBackupRepoStatusToVirtual(ctx *synccontext.SyncContext, from, to m
 	}
 
 	_ = unstructured.SetNestedField(to, translateBackupRepoNameToVirtual(ctx, backupRepoName), "status", "backupRepoName")
+}
+
+func translateBackupRepoStatusToHost(ctx *synccontext.SyncContext, to map[string]interface{}) {
+	backupRepoName, ok, _ := unstructured.NestedString(to, "status", "backupRepoName")
+	if !ok || backupRepoName == "" {
+		return
+	}
+
+	_ = unstructured.SetNestedField(to, translateBackupRepoNameToHost(ctx, backupRepoName), "status", "backupRepoName")
+}
+
+func translateBackupTargetPodNameToHost(ctx *synccontext.SyncContext, to map[string]interface{}, namespace string) {
+	targetPodName, ok, _ := unstructured.NestedString(to, "status", "targetPodName")
+	if ok && targetPodName != "" {
+		_ = unstructured.SetNestedField(to, translateVirtualPodNameToHost(ctx, targetPodName, namespace), "status", "targetPodName")
+	}
+
+	translateSelectedTargetPodsToHost(ctx, to, namespace, "status", "target", "selectedTargetPods")
 }
 
 func translateBackupTargetPodNameToVirtual(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {
@@ -226,6 +255,45 @@ func translateBackupTargetConnectionCredentialSecretNameToHost(ctx *synccontext.
 	}
 
 	_ = unstructured.SetNestedField(to, translateVirtualSecretNameToHost(ctx, secretName, namespace), "status", "target", "connectionCredential", "secretName")
+}
+
+func translateBackupTargetsToHost(ctx *synccontext.SyncContext, to map[string]interface{}, namespace string) {
+	targets, ok, _ := unstructured.NestedSlice(to, "status", "targets")
+	if !ok || len(targets) == 0 {
+		return
+	}
+
+	for i := range targets {
+		target, ok := targets[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		translateSelectedTargetPodsToHost(ctx, target, namespace, "selectedTargetPods")
+		secretName, ok, _ := unstructured.NestedString(target, "connectionCredential", "secretName")
+		if ok && secretName != "" {
+			_ = unstructured.SetNestedField(target, translateVirtualSecretNameToHost(ctx, secretName, namespace), "connectionCredential", "secretName")
+		}
+	}
+
+	_ = unstructured.SetNestedSlice(to, targets, "status", "targets")
+}
+
+func translateSelectedTargetPodsToHost(ctx *synccontext.SyncContext, to map[string]interface{}, namespace string, fields ...string) {
+	selectedTargetPods, ok, _ := unstructured.NestedSlice(to, fields...)
+	if !ok || len(selectedTargetPods) == 0 {
+		return
+	}
+
+	for i := range selectedTargetPods {
+		podName, ok := selectedTargetPods[i].(string)
+		if !ok || podName == "" {
+			continue
+		}
+
+		selectedTargetPods[i] = translateVirtualPodNameToHost(ctx, podName, namespace)
+	}
+	_ = unstructured.SetNestedSlice(to, selectedTargetPods, fields...)
 }
 
 func translateBackupTargetConnectionCredentialSecretNameToVirtual(ctx *synccontext.SyncContext, from, to map[string]interface{}, namespace string) {
@@ -326,6 +394,28 @@ func translateHostPodNameToVirtual(ctx *synccontext.SyncContext, hostName, names
 	}
 
 	return virtualName.Name
+}
+
+func translateVirtualPodNameToHost(ctx *synccontext.SyncContext, virtualName, namespace string) string {
+	if virtualName == "" || namespace == "" {
+		return virtualName
+	}
+
+	if translateHostPodNameToVirtual(ctx, virtualName, namespace) != virtualName {
+		return virtualName
+	}
+
+	if ctx != nil && ctx.Mappings != nil {
+		podMapper, err := ctx.Mappings.ByGVK(mappings.Pods())
+		if err == nil {
+			hostName := podMapper.VirtualToHost(ctx, types.NamespacedName{Name: virtualName, Namespace: namespace}, nil)
+			if hostName.Name != "" {
+				return hostName.Name
+			}
+		}
+	}
+
+	return translate.Default.HostName(ctx, virtualName, namespace).Name
 }
 
 func translateSingleNamespaceHostPodNameToVirtual(ctx *synccontext.SyncContext, hostName, namespace string) string {
@@ -443,6 +533,28 @@ func translateBackupRepoNameToVirtual(ctx *synccontext.SyncContext, hostName str
 	return translateBackupRepoNameToVirtualFromList(hostName, backupRepos)
 }
 
+func translateBackupRepoNameToHost(ctx *synccontext.SyncContext, virtualName string) string {
+	if virtualName == "" || ctx == nil || ctx.HostClient == nil {
+		return virtualName
+	}
+
+	backupRepos := &unstructured.UnstructuredList{}
+	backupRepos.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "dataprotection.kubeblocks.io",
+		Version: "v1alpha1",
+		Kind:    "BackupRepoList",
+	})
+	err := ctx.HostClient.List(ctx, backupRepos)
+	if err != nil {
+		if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			return virtualName
+		}
+		return virtualName
+	}
+
+	return translateBackupRepoNameToHostFromList(virtualName, backupRepos)
+}
+
 func translateBackupRepoNameToVirtualFromList(hostName string, backupRepos *unstructured.UnstructuredList) string {
 	if backupRepos == nil || len(backupRepos.Items) == 0 {
 		return hostName
@@ -472,6 +584,37 @@ func translateBackupRepoNameToVirtualFromList(hostName string, backupRepos *unst
 	}
 
 	return hostName
+}
+
+func translateBackupRepoNameToHostFromList(virtualName string, backupRepos *unstructured.UnstructuredList) string {
+	if backupRepos == nil || len(backupRepos.Items) == 0 {
+		return virtualName
+	}
+
+	for i := range backupRepos.Items {
+		if backupRepos.Items[i].GetName() == virtualName {
+			return virtualName
+		}
+	}
+
+	defaultRepo := ""
+	for i := range backupRepos.Items {
+		if isDefaultBackupRepo(&backupRepos.Items[i]) {
+			if defaultRepo != "" {
+				return virtualName
+			}
+			defaultRepo = backupRepos.Items[i].GetName()
+		}
+	}
+	if defaultRepo != "" {
+		return defaultRepo
+	}
+
+	if len(backupRepos.Items) == 1 {
+		return backupRepos.Items[0].GetName()
+	}
+
+	return virtualName
 }
 
 func isDefaultBackupRepo(repo *unstructured.Unstructured) bool {
