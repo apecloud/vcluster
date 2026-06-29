@@ -87,10 +87,15 @@ func (s *backupSyncer) SyncToHost(ctx *synccontext.SyncContext, event *syncconte
 	markHostBackupReconciliationSkipped(pObj)
 	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, event.Virtual.Object, pObj.Object, event.Virtual.GetNamespace())
 
-	return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), false)
+	result, err := patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), false)
+	if err != nil {
+		return result, err
+	}
+
+	return result, ensureHostBackupRestoreStatus(ctx, event.Virtual, pObj)
 }
 
-func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*unstructured.Unstructured]) (_ ctrl.Result, retErr error) {
+func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*unstructured.Unstructured]) (ctrl.Result, error) {
 	if event.Host.GetDeletionTimestamp() != nil {
 		if event.Virtual.GetDeletionTimestamp() == nil {
 			return patcher.DeleteVirtualObject(ctx, event.Virtual, event.Host, "host dataprotection backup is being deleted")
@@ -105,15 +110,14 @@ func (s *backupSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.Syn
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("new syncer patcher: %w", err)
 	}
-	defer func() {
-		if err := patch.Patch(ctx, event.Host, event.Virtual); err != nil {
-			retErr = err
-		}
-	}()
 
 	syncBackupDesiredStateToSkippedHost(ctx, event.Virtual, event.Host)
 
-	return ctrl.Result{}, nil
+	if err := patch.Patch(ctx, event.Host, event.Virtual); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, ensureHostBackupRestoreStatus(ctx, event.Virtual, event.Host)
 }
 
 func (s *backupSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*unstructured.Unstructured]) (ctrl.Result, error) {
@@ -176,6 +180,31 @@ func syncBackupDesiredStateToSkippedHost(ctx *synccontext.SyncContext, virtualBa
 	hostLabels := translate.HostLabels(virtualBackup, hostBackup)
 	preserveHostBackupRepoLabel(hostBackup.GetLabels(), hostLabels)
 	hostBackup.SetLabels(hostLabels)
+}
+
+func ensureHostBackupRestoreStatus(ctx *synccontext.SyncContext, virtualBackup, hostBackup *unstructured.Unstructured) error {
+	if ctx == nil || ctx.HostClient == nil || virtualBackup == nil || hostBackup == nil {
+		return nil
+	}
+
+	status, ok, err := unstructured.NestedMap(virtualBackup.Object, "status")
+	if err != nil || !ok || len(status) == 0 {
+		return err
+	}
+
+	latest := NewObject()
+	if err := ctx.HostClient.Get(ctx, client.ObjectKeyFromObject(hostBackup), latest); err != nil {
+		return fmt.Errorf("get host backup before status mirror: %w", err)
+	}
+
+	copyNestedField(virtualBackup.Object, latest.Object, "status")
+	translateBackupRestoreStatusToHost(ctx, latest.Object, virtualBackup.GetNamespace())
+
+	if err := ctx.HostClient.Status().Update(ctx, latest); err != nil {
+		return fmt.Errorf("mirror host backup status: %w", err)
+	}
+
+	return nil
 }
 
 func translateBackupRestoreStatusToHost(ctx *synccontext.SyncContext, to map[string]interface{}, namespace string) {

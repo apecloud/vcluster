@@ -148,6 +148,17 @@ rules:
     resources: ["customresourcedefinitions"]
     verbs: ["get", "list", "watch"]
   {{- end }}
+  {{- $toHostCustomResources := .Values.sync.toHost.customResources | default dict }}
+  {{- $fromHostCustomResources := .Values.sync.fromHost.customResources | default dict }}
+  {{- $backupsToHost := get $toHostCustomResources "backups.dataprotection.kubeblocks.io/v1alpha1" | default dict }}
+  {{- $backupsFromHost := get $fromHostCustomResources "backups.dataprotection.kubeblocks.io/v1alpha1" | default dict }}
+  {{- $backupReposToHost := get $toHostCustomResources "backuprepos.dataprotection.kubeblocks.io/v1alpha1" | default dict }}
+  {{- $backupReposFromHost := get $fromHostCustomResources "backuprepos.dataprotection.kubeblocks.io/v1alpha1" | default dict }}
+  {{- if or (dig "enabled" false $backupsToHost) (dig "enabled" false $backupsFromHost) (dig "enabled" false $backupReposToHost) (dig "enabled" false $backupReposFromHost) }}
+  - apiGroups: ["dataprotection.kubeblocks.io"]
+    resources: ["backuprepos"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
   {{- if and .Values.integrations.externalSecrets.enabled .Values.integrations.externalSecrets.sync.fromHost.clusterStores.enabled }}
   - apiGroups: ["external-secrets.io"]
     resources: ["clustersecretstores"]

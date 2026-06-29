@@ -1,15 +1,18 @@
 package backups
 
 import (
+	"context"
 	"testing"
 
 	"github.com/loft-sh/vcluster/pkg/mappings"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestCopyNestedField(t *testing.T) {
@@ -44,6 +47,68 @@ func TestCopyNestedFieldRemovesMissingField(t *testing.T) {
 		t.Fatal(err)
 	} else if ok {
 		t.Fatal("expected status to be removed")
+	}
+}
+
+func TestEnsureHostBackupRestoreStatusMirrorsTranslatedStatus(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtual := NewObject()
+	virtual.SetName("mysql-br-readback-xtrabackup-backup-34414")
+	virtual.SetNamespace(namespace)
+	_ = unstructured.SetNestedField(virtual.Object, "Completed", "status", "phase")
+	_ = unstructured.SetNestedField(virtual.Object, "virtual-repo", "status", "backupRepoName")
+	_ = unstructured.SetNestedField(virtual.Object, "mysql-br-readback-mysql-0", "status", "targetPodName")
+	_ = unstructured.SetNestedSlice(virtual.Object, []interface{}{"mysql-br-readback-mysql-0"}, "status", "target", "selectedTargetPods")
+	_ = unstructured.SetNestedField(virtual.Object, "mysql-br-readback-mysql-account-kbadmin", "status", "target", "connectionCredential", "secretName")
+
+	host := NewObject()
+	host.SetName(translate.Default.HostName(&synccontext.SyncContext{}, virtual.GetName(), virtual.GetNamespace()).Name)
+	host.SetNamespace(translate.Default.HostName(&synccontext.SyncContext{}, virtual.GetName(), virtual.GetNamespace()).Namespace)
+	host.SetAnnotations(map[string]string{dataProtectionSkipReconciliation: "true"})
+
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypeWithName(mappings.DataProtectionBackups(), NewObject())
+	hostClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(NewObject()).
+		WithObjects(host).
+		Build()
+
+	ctx := &synccontext.SyncContext{
+		Context:    context.Background(),
+		HostClient: hostClient,
+	}
+	if err := ensureHostBackupRestoreStatus(ctx, virtual, host); err != nil {
+		t.Fatal(err)
+	}
+
+	updated := NewObject()
+	if err := hostClient.Get(context.Background(), client.ObjectKeyFromObject(host), updated); err != nil {
+		t.Fatal(err)
+	}
+	phase, ok, err := unstructured.NestedString(updated.Object, "status", "phase")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok || phase != "Completed" {
+		t.Fatalf("expected mirrored status.phase Completed, got ok=%v phase=%q", ok, phase)
+	}
+	targetPodName, ok, err := unstructured.NestedString(updated.Object, "status", "targetPodName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected translated status.targetPodName")
+	}
+	if targetPodName == "mysql-br-readback-mysql-0" {
+		t.Fatalf("expected host target pod name, got virtual name %q", targetPodName)
+	}
+	secretName, ok, err := unstructured.NestedString(updated.Object, "status", "target", "connectionCredential", "secretName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected translated status.target.connectionCredential.secretName")
+	}
+	if secretName == "mysql-br-readback-mysql-account-kbadmin" {
+		t.Fatalf("expected host secret name, got virtual name %q", secretName)
 	}
 }
 
