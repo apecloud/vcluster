@@ -77,12 +77,13 @@ func (s *backupSyncer) SyncToHost(ctx *synccontext.SyncContext, event *syncconte
 	pObj := translate.HostMetadata(event.Virtual, s.VirtualToHost(ctx, client.ObjectKeyFromObject(event.Virtual), event.Virtual))
 	unstructured.RemoveNestedField(pObj.Object, "status")
 	translateBackupPolicyName(ctx, event.Virtual.Object, pObj.Object, event.Virtual.GetNamespace())
-	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, event.Virtual.Object, pObj.Object, event.Virtual.GetNamespace())
 
 	err := pro.ApplyPatchesHostObject(ctx, nil, pObj, event.Virtual, s.patches, false)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
+	translateBackupTargetConnectionCredentialSecretNameToHost(ctx, event.Virtual.Object, pObj.Object, event.Virtual.GetNamespace())
 
 	result, err := patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), false)
 	if err != nil {

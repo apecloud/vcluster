@@ -338,6 +338,36 @@ func TestBackupTargetConnectionCredentialSecretNameSourceSurvivesHostStatusCopy(
 	}
 }
 
+func TestTranslateBackupTargetConnectionCredentialSecretNameToHostRunsAfterLateStatusCopy(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
+	hostSecretName := translate.Default.HostName(&synccontext.SyncContext{}, virtualSecretName, namespace).Name
+	virtual := map[string]interface{}{
+		"status": map[string]interface{}{
+			"target": map[string]interface{}{
+				"connectionCredential": map[string]interface{}{
+					"secretName": virtualSecretName,
+				},
+			},
+		},
+	}
+	host := map[string]interface{}{}
+
+	// Simulate any late host patch/copy restoring virtual status on the object
+	// after the first create preparation steps.
+	copyNestedField(virtual, host, "status")
+	translateBackupTargetConnectionCredentialSecretNameToHost(&synccontext.SyncContext{}, virtual, host, namespace)
+
+	secretName, ok, err := unstructured.NestedString(host, "status", "target", "connectionCredential", "secretName")
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected status.target.connectionCredential.secretName to be set")
+	} else if secretName != hostSecretName {
+		t.Fatalf("expected translated host secret name, got %q", secretName)
+	}
+}
+
 func TestEnsureHostBackupTargetConnectionCredentialSecretNamePatchesStatus(t *testing.T) {
 	namespace := "mysql-backup-cr-readback"
 	virtualSecretName := "mysql-br-readback-mysql-account-kbadmin"
