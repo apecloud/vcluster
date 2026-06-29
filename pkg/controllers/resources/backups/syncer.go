@@ -13,11 +13,13 @@ import (
 	translator2 "github.com/loft-sh/vcluster/pkg/syncer/translator"
 	syncertypes "github.com/loft-sh/vcluster/pkg/syncer/types"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -187,24 +189,50 @@ func ensureHostBackupRestoreStatus(ctx *synccontext.SyncContext, virtualBackup, 
 		return nil
 	}
 
-	status, ok, err := unstructured.NestedMap(virtualBackup.Object, "status")
-	if err != nil || !ok || len(status) == 0 {
+	desiredStatus, ok, err := desiredHostBackupRestoreStatus(ctx, virtualBackup)
+	if err != nil || !ok || len(desiredStatus) == 0 {
 		return err
 	}
 
-	latest := NewObject()
-	if err := ctx.HostClient.Get(ctx, client.ObjectKeyFromObject(hostBackup), latest); err != nil {
-		return fmt.Errorf("get host backup before status mirror: %w", err)
-	}
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest := NewObject()
+		if err := ctx.HostClient.Get(ctx, client.ObjectKeyFromObject(hostBackup), latest); err != nil {
+			return fmt.Errorf("get host backup before status mirror: %w", err)
+		}
 
-	copyNestedField(virtualBackup.Object, latest.Object, "status")
-	translateBackupRestoreStatusToHost(ctx, latest.Object, virtualBackup.GetNamespace())
+		if !hostBackupRestoreStatusNeedsMirror(latest, desiredStatus) {
+			return nil
+		}
 
-	if err := ctx.HostClient.Status().Update(ctx, latest); err != nil {
+		if err := unstructured.SetNestedMap(latest.Object, desiredStatus, "status"); err != nil {
+			return fmt.Errorf("set translated host backup status: %w", err)
+		}
+		return ctx.HostClient.Status().Update(ctx, latest)
+	}); err != nil {
 		return fmt.Errorf("mirror host backup status: %w", err)
 	}
 
 	return nil
+}
+
+func desiredHostBackupRestoreStatus(ctx *synccontext.SyncContext, virtualBackup *unstructured.Unstructured) (map[string]interface{}, bool, error) {
+	status, ok, err := unstructured.NestedMap(virtualBackup.Object, "status")
+	if err != nil || !ok || len(status) == 0 {
+		return nil, ok, err
+	}
+
+	desired := map[string]interface{}{"status": status}
+	translateBackupRestoreStatusToHost(ctx, desired, virtualBackup.GetNamespace())
+	return desired["status"].(map[string]interface{}), true, nil
+}
+
+func hostBackupRestoreStatusNeedsMirror(hostBackup *unstructured.Unstructured, desiredStatus map[string]interface{}) bool {
+	currentStatus, ok, err := unstructured.NestedMap(hostBackup.Object, "status")
+	if err != nil || !ok {
+		return true
+	}
+
+	return !apiequality.Semantic.DeepEqual(currentStatus, desiredStatus)
 }
 
 func translateBackupRestoreStatusToHost(ctx *synccontext.SyncContext, to map[string]interface{}, namespace string) {

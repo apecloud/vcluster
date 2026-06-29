@@ -112,6 +112,37 @@ func TestEnsureHostBackupRestoreStatusMirrorsTranslatedStatus(t *testing.T) {
 	}
 }
 
+func TestHostBackupRestoreStatusNeedsMirrorSkipsTranslatedNoop(t *testing.T) {
+	namespace := "mysql-backup-cr-readback"
+	virtual := NewObject()
+	virtual.SetName("mysql-br-readback-xtrabackup-backup-34414")
+	virtual.SetNamespace(namespace)
+	_ = unstructured.SetNestedField(virtual.Object, "Completed", "status", "phase")
+	_ = unstructured.SetNestedField(virtual.Object, "mysql-br-readback-mysql-0", "status", "targetPodName")
+	_ = unstructured.SetNestedField(virtual.Object, "mysql-br-readback-mysql-account-kbadmin", "status", "target", "connectionCredential", "secretName")
+
+	desired, ok, err := desiredHostBackupRestoreStatus(&synccontext.SyncContext{}, virtual)
+	if err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected desired status")
+	}
+
+	host := NewObject()
+	if err := unstructured.SetNestedMap(host.Object, desired, "status"); err != nil {
+		t.Fatal(err)
+	}
+
+	if hostBackupRestoreStatusNeedsMirror(host, desired) {
+		t.Fatal("expected translated identical host status to skip mirror update")
+	}
+
+	_ = unstructured.SetNestedField(host.Object, "Running", "status", "phase")
+	if !hostBackupRestoreStatusNeedsMirror(host, desired) {
+		t.Fatal("expected changed host status to require mirror update")
+	}
+}
+
 func TestMarkHostBackupReconciliationSkipped(t *testing.T) {
 	host := NewObject()
 	host.SetAnnotations(map[string]string{
