@@ -125,15 +125,15 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, nil
 	}
 
+	guardLiveRestorePVC := isLiveRestoreDataSourcePVC(event.Virtual)
 	preserveDeletingHostPVC, err := s.shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(ctx, event.Virtual)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if event.HostOld != nil && preserveDeletingHostPVC && event.Virtual.DeletionTimestamp == nil {
-		// The host PVC was intentionally deleted so it can be recreated without
-		// the Backup dataSource. Keep the virtual restore PVC and continue into
-		// the create path below.
+	if event.HostOld != nil && event.Virtual.DeletionTimestamp == nil && (guardLiveRestorePVC || preserveDeletingHostPVC) {
+		logPersistentVolumeClaimDecision(ctx, "create-host", event.Virtual, event.HostOld, "host pvc is missing while live restore/dataSourceRef pvc still exists")
 	} else if event.HostOld != nil || event.Virtual.DeletionTimestamp != nil {
+		logPersistentVolumeClaimDecision(ctx, "delete-virtual", event.Virtual, event.HostOld, "host object was deleted")
 		return patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.HostOld, "host object was deleted", &client.DeleteOptions{
 			GracePeriodSeconds: &zero,
 		})
@@ -158,6 +158,7 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 			return ctrl.Result{}, err
 		}
 
+		logPersistentVolumeClaimDecision(ctx, "create-host", event.Virtual, pObj, "data protection no-data restore host pvc")
 		return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), true)
 	}
 
@@ -180,6 +181,7 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, err
 	}
 
+	logPersistentVolumeClaimDecision(ctx, "create-host", event.Virtual, pObj, "host pvc missing")
 	return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), true)
 }
 
@@ -205,21 +207,29 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 	// if pvs are deleted check the corresponding pvc is deleted as well
 	if event.Host.DeletionTimestamp != nil {
+		if isLiveRestoreDataSourcePVC(event.Virtual) {
+			logPersistentVolumeClaimDecision(ctx, "preserve-virtual", event.Virtual, event.Host, "host pvc is deleting while live restore/dataSourceRef pvc still exists")
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 		preserveDeletingHostPVC, err := s.shouldPreserveDataProtectionNoDataRestorePVCWhileHostDeleting(ctx, event.Virtual)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if preserveDeletingHostPVC {
+			logPersistentVolumeClaimDecision(ctx, "preserve-virtual", event.Virtual, event.Host, "host pvc is deleting during no-data restore recovery")
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 		if event.Virtual.DeletionTimestamp == nil {
+			logPersistentVolumeClaimDecision(ctx, "delete-virtual", event.Virtual, event.Host, "host persistent volume claim is being deleted")
 			return patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.Host, "host persistent volume claim is being deleted", &client.DeleteOptions{GracePeriodSeconds: &minimumGracePeriodInSeconds})
 		} else if *event.Virtual.DeletionGracePeriodSeconds != *event.Host.DeletionGracePeriodSeconds {
+			logPersistentVolumeClaimDecision(ctx, "delete-virtual", event.Virtual, event.Host, "match host pvc deletion grace period")
 			return patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.Host, fmt.Sprintf("with grace period seconds %v", *event.Host.DeletionGracePeriodSeconds), &client.DeleteOptions{GracePeriodSeconds: event.Host.DeletionGracePeriodSeconds, Preconditions: metav1.NewUIDPreconditions(string(event.Virtual.UID))})
 		}
 
 		return ctrl.Result{}, nil
 	} else if event.Virtual.DeletionTimestamp != nil {
+		logPersistentVolumeClaimDecision(ctx, "delete-host", event.Virtual, event.Host, "virtual persistent volume claim is being deleted")
 		return patcher.DeleteHostObjectWithOptions(ctx, event.Host, event.Virtual, "virtual persistent volume claim is being deleted", &client.DeleteOptions{
 			GracePeriodSeconds: event.Virtual.DeletionGracePeriodSeconds,
 			Preconditions:      metav1.NewUIDPreconditions(string(event.Host.UID)),
@@ -230,6 +240,11 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		return ctrl.Result{}, err
 	}
 	if recreateHostPVC {
+		if shouldGuardLiveRestorePVCFromHostRecreate(event.Virtual) {
+			logPersistentVolumeClaimDecision(ctx, "preserve-host", event.Virtual, event.Host, "skip no-data restore host pvc delete/recreate because live restore-source pvc still exists")
+			return ctrl.Result{}, nil
+		}
+		logPersistentVolumeClaimDecision(ctx, "delete-host", event.Virtual, event.Host, "data protection restore pvc was provisioned without data restore")
 		return deleteDataProtectionNoDataRestoreHostPVC(ctx, event.Host, event.Virtual)
 	}
 
@@ -299,6 +314,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 	// allow storage size to be increased
 	event.Host.Spec.Resources.Requests = event.Virtual.Spec.Resources.Requests
+	logPersistentVolumeClaimDecision(ctx, "update", event.Virtual, event.Host, "bidirectional pvc sync")
 
 	// bi-directional sync of annotations and labels
 	event.Virtual.Annotations, event.Host.Annotations = translate.AnnotationsBidirectionalUpdate(event, s.excludedAnnotations...)
@@ -750,6 +766,49 @@ func hasExternalPopulatorDataSource(pvc *corev1.PersistentVolumeClaim) bool {
 	default:
 		return true
 	}
+}
+
+func hasKubeBlocksRestoreSourceAnnotations(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc == nil {
+		return false
+	}
+
+	annotations := pvc.GetAnnotations()
+	return annotations[kubeBlocksRestoreSourceAPIGroupAnnotation] != "" &&
+		annotations[kubeBlocksRestoreSourceKindAnnotation] != "" &&
+		annotations[kubeBlocksRestoreSourceNameAnnotation] != ""
+}
+
+func isLiveRestoreDataSourcePVC(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc == nil || pvc.DeletionTimestamp != nil {
+		return false
+	}
+
+	return hasExternalPopulatorDataSource(pvc) || hasKubeBlocksRestoreSourceAnnotations(pvc)
+}
+
+func shouldGuardLiveRestorePVCFromHostRecreate(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc == nil || pvc.DeletionTimestamp != nil {
+		return false
+	}
+
+	return hasKubeBlocksRestoreSourceAnnotations(pvc)
+}
+
+func logPersistentVolumeClaimDecision(ctx *synccontext.SyncContext, decision string, vObj, pObj *corev1.PersistentVolumeClaim, reason string) {
+	if ctx == nil || ctx.Log == nil {
+		return
+	}
+
+	virtualName, hostName := "<nil>", "<nil>"
+	if vObj != nil {
+		virtualName = vObj.Namespace + "/" + vObj.Name
+	}
+	if pObj != nil {
+		hostName = pObj.Namespace + "/" + pObj.Name
+	}
+
+	ctx.Log.Infof("persistent volume claim sync decision=%s virtual=%s host=%s reason=%s", decision, virtualName, hostName, reason)
 }
 
 func isVirtualPVCBound(pvc *corev1.PersistentVolumeClaim) bool {

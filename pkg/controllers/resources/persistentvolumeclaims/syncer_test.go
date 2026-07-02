@@ -255,6 +255,8 @@ func TestSync(t *testing.T) {
 			Reason: dataProtectionRestoreConditionReasonProvisioned,
 		},
 	}
+	dataProtectionNoDataRestorePvcWithRestoreSourceAnnotations := dataProtectionNoDataRestorePvc.DeepCopy()
+	dataProtectionNoDataRestorePvcWithRestoreSourceAnnotations.Annotations = restoreSourceAnnotations("backup-1", vObjectMeta.Namespace)
 	dataProtectionNoDataHostPvc := dataProtectionHostPendingPvcWithUID.DeepCopy()
 	dataProtectionNoDataHostPvc.Spec = corev1.PersistentVolumeClaimSpec{}
 	dataProtectionNoDataHostPvc.Status = dataProtectionNoDataRestorePvc.Status
@@ -714,6 +716,29 @@ func TestSync(t *testing.T) {
 					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
 					dataProtectionNoDataRestorePvc.DeepCopy(),
 					dataProtectionNoDataRestorePvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                 "Do not delete live restore-source host backup data source pvc after no-data restore is provisioned",
+			InitialVirtualState:  []runtime.Object{dataProtectionNoDataRestorePvcWithRestoreSourceAnnotations.DeepCopy()},
+			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestorePvcWithRestoreSourceAnnotations.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataRestorePvcWithRestoreSourceAnnotations.DeepCopy(),
+					dataProtectionNoDataRestorePvcWithRestoreSourceAnnotations.DeepCopy(),
 				))
 				assert.NilError(t, err)
 			},
@@ -1448,6 +1473,88 @@ func TestHasExternalPopulatorDataSource(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, hasExternalPopulatorDataSource(tt.pvc), tt.expected)
+		})
+	}
+}
+
+func TestLiveRestoreDataSourcePVCGuard(t *testing.T) {
+	apiGroup := dataProtectionAPIGroup
+	now := metav1.Now()
+
+	tests := []struct {
+		name                    string
+		pvc                     *corev1.PersistentVolumeClaim
+		liveRestoreDataSource   bool
+		guardHostDeleteRecreate bool
+	}{
+		{
+			name: "nil pvc",
+		},
+		{
+			name: "plain pvc",
+			pvc:  &corev1.PersistentVolumeClaim{},
+		},
+		{
+			name: "live data protection backup datasource",
+			pvc: &corev1.PersistentVolumeClaim{
+				Spec: corev1.PersistentVolumeClaimSpec{
+					DataSourceRef: &corev1.TypedObjectReference{
+						APIGroup: &apiGroup,
+						Kind:     dataProtectionBackupKind,
+						Name:     "backup-1",
+					},
+				},
+			},
+			liveRestoreDataSource: true,
+		},
+		{
+			name: "deleting data protection backup datasource",
+			pvc: &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					DeletionTimestamp: &now,
+					Finalizers:        []string{"kubernetes.io/pvc-protection"},
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					DataSourceRef: &corev1.TypedObjectReference{
+						APIGroup: &apiGroup,
+						Kind:     dataProtectionBackupKind,
+						Name:     "backup-1",
+					},
+				},
+			},
+		},
+		{
+			name: "live kubeblocks restore source annotations",
+			pvc: &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						kubeBlocksRestoreSourceAPIGroupAnnotation:  dataProtectionAPIGroup,
+						kubeBlocksRestoreSourceKindAnnotation:      dataProtectionBackupKind,
+						kubeBlocksRestoreSourceNameAnnotation:      "backup-1",
+						kubeBlocksRestoreSourceNamespaceAnnotation: "testns",
+					},
+				},
+			},
+			liveRestoreDataSource:   true,
+			guardHostDeleteRecreate: true,
+		},
+		{
+			name: "missing restore source name annotation",
+			pvc: &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						kubeBlocksRestoreSourceAPIGroupAnnotation: dataProtectionAPIGroup,
+						kubeBlocksRestoreSourceKindAnnotation:     dataProtectionBackupKind,
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, isLiveRestoreDataSourcePVC(tt.pvc), tt.liveRestoreDataSource)
+			assert.Equal(t, shouldGuardLiveRestorePVCFromHostRecreate(tt.pvc), tt.guardHostDeleteRecreate)
 		})
 	}
 }
