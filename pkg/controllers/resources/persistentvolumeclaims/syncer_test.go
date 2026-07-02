@@ -282,6 +282,8 @@ func TestSync(t *testing.T) {
 			Name:     hostRestoreSourceBackupName.Name,
 		},
 	}
+	dataProtectionDataRestoreHostPvcWithoutBackupSource := dataProtectionDataRestoreHostPvc.DeepCopy()
+	dataProtectionDataRestoreHostPvcWithoutBackupSource.Spec = corev1.PersistentVolumeClaimSpec{}
 	dataProtectionBackupPendingPvcWithRestoreSourceAnnotations := dataProtectionBackupPendingPvc.DeepCopy()
 	dataProtectionBackupPendingPvcWithRestoreSourceAnnotations.Annotations = restoreSourceAnnotations("backup-1", vObjectMeta.Namespace)
 	dataProtectionDataRestoreHostPvcWithRestoreSourceAnnotations := dataProtectionDataRestoreHostPvc.DeepCopy()
@@ -289,6 +291,8 @@ func TestSync(t *testing.T) {
 		dataProtectionDataRestoreHostPvcWithRestoreSourceAnnotations.Annotations[key] = value
 	}
 	dataProtectionDataRestoreHostPvcWithRestoreSourceAnnotations.Annotations[translate.ManagedAnnotationsAnnotation] = restoreSourceManagedAnnotations
+	dataProtectionDataRestoreHostPvcWithoutBackupSourceWithRestoreSourceAnnotations := dataProtectionDataRestoreHostPvcWithRestoreSourceAnnotations.DeepCopy()
+	dataProtectionDataRestoreHostPvcWithoutBackupSourceWithRestoreSourceAnnotations.Spec = corev1.PersistentVolumeClaimSpec{}
 	dataProtectionNoDataHostDeletingWithBackupSource := dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()
 	dataProtectionNoDataHostDeletingWithBackupSource.Finalizers = []string{"kubernetes.io/pvc-protection"}
 	dataProtectionNoDataHostDeletingWithBackupSource.DeletionTimestamp = &metav1.Time{Time: time.Now()}
@@ -397,13 +401,13 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
-			Name:                "Create data protection data restore forward with host backup data source",
+			Name:                "Create data protection data restore forward without host backup data source",
 			InitialVirtualState: []runtime.Object{dataProtectionBackupPendingPvc.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionBackupPendingPvc.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionDataRestoreHostPvc.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionDataRestoreHostPvcWithoutBackupSource.DeepCopy()},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
 				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
@@ -414,13 +418,13 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
-			Name:                "Create data protection data restore forward with host backup restore-source annotations",
+			Name:                "Create data protection data restore forward without host backup data source and with restore-source annotations",
 			InitialVirtualState: []runtime.Object{dataProtectionBackupPendingPvcWithRestoreSourceAnnotations.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionBackupPendingPvcWithRestoreSourceAnnotations.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionDataRestoreHostPvcWithRestoreSourceAnnotations.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionDataRestoreHostPvcWithoutBackupSourceWithRestoreSourceAnnotations.DeepCopy()},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
 				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)

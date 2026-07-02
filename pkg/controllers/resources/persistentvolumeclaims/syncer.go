@@ -332,11 +332,7 @@ func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext
 }
 
 func (s *persistentVolumeClaimSyncer) translateDataProtectionBackupToHost(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolumeClaim, bool, error) {
-	noDataRestore, err := s.isDataProtectionNoDataRestorePVC(ctx, vObj)
-	if err != nil {
-		return nil, true, err
-	}
-	if !noDataRestore {
+	if !isDataProtectionBackupPVC(vObj) {
 		return nil, false, nil
 	}
 
