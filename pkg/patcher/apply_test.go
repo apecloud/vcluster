@@ -1,13 +1,79 @@
 package patcher
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
+	"github.com/loft-sh/vcluster/pkg/scheme"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+func TestApplyObjectStatusPatchUsesLatestObjectOnUpdate(t *testing.T) {
+	live := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pvc",
+			Namespace: "ns",
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase: corev1.ClaimPending,
+			Conditions: []corev1.PersistentVolumeClaimCondition{
+				{
+					Type:   corev1.PersistentVolumeClaimFileSystemResizePending,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+	before := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      live.Name,
+			Namespace: live.Namespace,
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase: corev1.ClaimPending,
+		},
+	}
+	after := before.DeepCopy()
+	after.Status = corev1.PersistentVolumeClaimStatus{
+		Phase:       corev1.ClaimBound,
+		AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		Capacity: corev1.ResourceList{
+			corev1.ResourceStorage: resource.MustParse("1Gi"),
+		},
+	}
+
+	vClient := testingutil.NewFakeClient(scheme.Scheme, live)
+	ctx := &synccontext.SyncContext{
+		Context:       context.Background(),
+		HostClient:    testingutil.NewFakeClient(scheme.Scheme),
+		VirtualClient: vClient,
+	}
+
+	if err := ApplyObject(ctx, before, after, synccontext.SyncHostToVirtual, true); err != nil {
+		t.Fatalf("ApplyObject() error = %v", err)
+	}
+
+	got := &corev1.PersistentVolumeClaim{}
+	if err := vClient.Get(ctx, client.ObjectKeyFromObject(live), got); err != nil {
+		t.Fatalf("get live object: %v", err)
+	}
+	if got.Status.Phase != corev1.ClaimBound {
+		t.Fatalf("status phase = %s, want %s", got.Status.Phase, corev1.ClaimBound)
+	}
+	storage := got.Status.Capacity[corev1.ResourceStorage]
+	if storage.IsZero() {
+		t.Fatalf("status capacity missing after patch: %#v", got.Status.Capacity)
+	}
+	if len(got.Status.Conditions) != 1 || got.Status.Conditions[0].Type != corev1.PersistentVolumeClaimFileSystemResizePending {
+		t.Fatalf("live status condition was lost by stale status patch: %#v", got.Status.Conditions)
+	}
+}
 
 func TestSanitizePatchForLog(t *testing.T) {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "ns"}}
