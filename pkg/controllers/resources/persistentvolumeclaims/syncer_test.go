@@ -301,8 +301,15 @@ func TestSync(t *testing.T) {
 			corev1.ResourceStorage: resource.MustParse("1Gi"),
 		},
 	}
+	dataProtectionNoDataHostBoundWithBackupSource.Annotations[bindCompletedAnnotation] = "yes"
+	dataProtectionNoDataHostBoundWithBackupSource.Annotations[boundByControllerAnnotation] = "yes"
 	dataProtectionNoDataRestorePvcWithHostBoundStatus := dataProtectionNoDataRestorePvc.DeepCopy()
 	dataProtectionNoDataRestorePvcWithHostBoundStatus.Status = *dataProtectionNoDataHostBoundWithBackupSource.Status.DeepCopy()
+	if dataProtectionNoDataRestorePvcWithHostBoundStatus.Annotations == nil {
+		dataProtectionNoDataRestorePvcWithHostBoundStatus.Annotations = map[string]string{}
+	}
+	dataProtectionNoDataRestorePvcWithHostBoundStatus.Annotations[bindCompletedAnnotation] = "yes"
+	dataProtectionNoDataRestorePvcWithHostBoundStatus.Annotations[boundByControllerAnnotation] = "yes"
 	dataProtectionNoDataHostPendingWithoutBackupSource := dataProtectionHostPendingPvcWithUID.DeepCopy()
 	dataProtectionNoDataHostPendingWithoutBackupSource.Spec = corev1.PersistentVolumeClaimSpec{}
 	dataProtectionNoDataHostDeletingWithoutBackupSource := dataProtectionNoDataHostPendingWithoutBackupSource.DeepCopy()

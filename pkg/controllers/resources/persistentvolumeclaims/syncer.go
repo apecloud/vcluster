@@ -311,6 +311,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	if !maps.Equal(oldHostAnnotations, event.Host.GetAnnotations()) {
 		translateDataProtectionRestoreSourceAnnotationsToVirtual(ctx, event.Virtual)
 	}
+	ensureVirtualPVCBindCompletionAnnotations(event.Host, event.Virtual)
 
 	return ctrl.Result{}, nil
 }
@@ -328,6 +329,7 @@ func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext
 		return ctrl.Result{}, err
 	}
 
+	ensureVirtualPVCBindCompletionAnnotations(event.Host, vPvc)
 	return patcher.CreateVirtualObject(ctx, event.Host, vPvc, s.EventRecorder(), true)
 }
 
@@ -757,6 +759,28 @@ func isVirtualPVCBound(pvc *corev1.PersistentVolumeClaim) bool {
 
 	storage, ok := pvc.Status.Capacity[corev1.ResourceStorage]
 	return ok && !storage.IsZero()
+}
+
+func ensureVirtualPVCBindCompletionAnnotations(pObj, vObj *corev1.PersistentVolumeClaim) {
+	if pObj == nil || vObj == nil || !isVirtualPVCBound(vObj) || pObj.Spec.VolumeName == "" || pObj.Status.Phase != corev1.ClaimBound {
+		return
+	}
+
+	hostAnnotations := pObj.GetAnnotations()
+	bindCompleted, ok := hostAnnotations[bindCompletedAnnotation]
+	if !ok {
+		return
+	}
+
+	annotations := maps.Clone(vObj.GetAnnotations())
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[bindCompletedAnnotation] = bindCompleted
+	if boundByController, ok := hostAnnotations[boundByControllerAnnotation]; ok {
+		annotations[boundByControllerAnnotation] = boundByController
+	}
+	vObj.SetAnnotations(annotations)
 }
 
 func isHostPVCWaitingForVolume(pvc *corev1.PersistentVolumeClaim) bool {
