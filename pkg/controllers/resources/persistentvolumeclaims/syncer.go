@@ -53,6 +53,7 @@ const (
 	externalPopulatorMaterializationRequestLabel  = "vcluster.loft.sh/external-populator-materialization-request"
 	externalPopulatorMaterializationRequestPrefix = "external-populator-materialization-"
 	externalPopulatorMaterializationStatePending  = "pending"
+	externalPopulatorPopulateHelperPrefix         = "kb-populate-"
 
 	externalPopulatorRestoreConditionType              = corev1.PersistentVolumeClaimConditionType("Restore")
 	externalPopulatorPopulateConditionType             = corev1.PersistentVolumeClaimConditionType("Populating")
@@ -122,7 +123,7 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, nil
 	}
 
-	preserveDeletingHostPVC, err := s.shouldPreserveExternalPopulatorNoDataRestorePVCWhileHostDeleting(ctx, event.Virtual)
+	preserveDeletingHostPVC, err := s.shouldPreserveExternalPopulatorNoDataRestorePVCWhileHostDeleting(ctx, event.Virtual, event.HostOld)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -200,7 +201,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 	// if pvs are deleted check the corresponding pvc is deleted as well
 	if event.Host.DeletionTimestamp != nil {
-		preserveDeletingHostPVC, err := s.shouldPreserveExternalPopulatorNoDataRestorePVCWhileHostDeleting(ctx, event.Virtual)
+		preserveDeletingHostPVC, err := s.shouldPreserveExternalPopulatorNoDataRestorePVCWhileHostDeleting(ctx, event.Virtual, event.Host)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -215,6 +216,14 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 		return ctrl.Result{}, nil
 	} else if event.Virtual.DeletionTimestamp != nil {
+		preserveDeletingHostPVC, err := s.shouldPreserveDeletingExternalPopulatorPopulateHelper(ctx, event.Virtual, event.Host)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if preserveDeletingHostPVC {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
 		return patcher.DeleteHostObjectWithOptions(ctx, event.Host, event.Virtual, "virtual persistent volume claim is being deleted", &client.DeleteOptions{
 			GracePeriodSeconds: event.Virtual.DeletionGracePeriodSeconds,
 			Preconditions:      metav1.NewUIDPreconditions(string(event.Host.UID)),
@@ -800,8 +809,69 @@ func (s *persistentVolumeClaimSyncer) shouldRecreateExternalPopulatorHostNoDataR
 	return true, nil
 }
 
-func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorNoDataRestorePVCWhileHostDeleting(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (bool, error) {
-	return s.isExternalPopulatorNoDataRestorePVC(ctx, vObj)
+func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorNoDataRestorePVCWhileHostDeleting(ctx *synccontext.SyncContext, vObj, pObj *corev1.PersistentVolumeClaim) (bool, error) {
+	noDataRestore, err := s.isExternalPopulatorNoDataRestorePVC(ctx, vObj)
+	if err != nil || noDataRestore {
+		return noDataRestore, err
+	}
+
+	return s.shouldPreserveDeletingExternalPopulatorPopulateHelper(ctx, vObj, pObj)
+}
+
+func (s *persistentVolumeClaimSyncer) shouldPreserveDeletingExternalPopulatorPopulateHelper(ctx *synccontext.SyncContext, helperVirtual, helperHost *corev1.PersistentVolumeClaim) (bool, error) {
+	if helperVirtual == nil || helperHost == nil || helperVirtual.DeletionTimestamp == nil || !strings.HasPrefix(helperVirtual.Name, externalPopulatorPopulateHelperPrefix) {
+		return false, nil
+	}
+
+	targetUID := strings.TrimPrefix(helperVirtual.Name, externalPopulatorPopulateHelperPrefix)
+	if targetUID == "" {
+		return false, nil
+	}
+
+	targetVirtual, ok, err := s.findExternalPopulatorTargetPVCByUID(ctx, helperVirtual.Namespace, types.UID(targetUID))
+	if err != nil || !ok {
+		return false, err
+	}
+
+	targetHostName := s.VirtualToHost(ctx, types.NamespacedName{Name: targetVirtual.Name, Namespace: targetVirtual.Namespace}, targetVirtual)
+	targetHost := &corev1.PersistentVolumeClaim{}
+	err = ctx.HostClient.Get(ctx.Context, targetHostName, targetHost)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if !isHostPVCWaitingForVolume(targetHost) {
+		return false, nil
+	}
+	if targetHost.Spec.VolumeName == "" || helperHost.Spec.VolumeName == "" {
+		return true, nil
+	}
+
+	return targetHost.Spec.VolumeName == helperHost.Spec.VolumeName, nil
+}
+
+func (s *persistentVolumeClaimSyncer) findExternalPopulatorTargetPVCByUID(ctx *synccontext.SyncContext, namespace string, uid types.UID) (*corev1.PersistentVolumeClaim, bool, error) {
+	if uid == "" {
+		return nil, false, nil
+	}
+
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err := ctx.VirtualClient.List(ctx.Context, pvcList, client.InNamespace(namespace))
+	if err != nil {
+		return nil, false, err
+	}
+
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if pvc.UID == uid && isExternalPopulatorPVC(pvc) && pvc.DeletionTimestamp == nil {
+			return pvc.DeepCopy(), true, nil
+		}
+	}
+
+	return nil, false, nil
 }
 
 func (s *persistentVolumeClaimSyncer) isExternalPopulatorNoDataRestorePVC(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (bool, error) {

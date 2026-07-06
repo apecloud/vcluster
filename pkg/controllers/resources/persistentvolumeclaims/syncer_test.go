@@ -347,6 +347,12 @@ func TestSync(t *testing.T) {
 			},
 		},
 	}
+	dataProtectionHostPendingPopulateHelperPvc := dataProtectionHostPopulateHelperPvc.DeepCopy()
+	dataProtectionHostPendingPopulateHelperPvc.Spec.VolumeName = ""
+	dataProtectionHostPendingPopulateHelperPvc.Status = corev1.PersistentVolumeClaimStatus{}
+	dataProtectionDeletingPopulateHelperPvc := dataProtectionPopulateHelperPvc.DeepCopy()
+	dataProtectionDeletingPopulateHelperPvc.Finalizers = []string{"kubernetes.io/pvc-protection"}
+	dataProtectionDeletingPopulateHelperPvc.DeletionTimestamp = &metav1.Time{Time: time.Now()}
 	dataProtectionHostPVBoundToHelper := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: dataProtectionPopulatedPV.Name,
@@ -877,6 +883,42 @@ func TestSync(t *testing.T) {
 					customExternalPopulatorPvc.DeepCopy(),
 				))
 				assert.NilError(t, err)
+			},
+		},
+		{
+			Name: "Preserve host populate helper pvc while helper volume name has not converged",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
+				dataProtectionDeletingPopulateHelperPvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostPendingPvcWithFakeVolumeNameAndUID.DeepCopy(),
+				dataProtectionHostPendingPopulateHelperPvc.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
+					dataProtectionDeletingPopulateHelperPvc.DeepCopy(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostPendingPvcWithFakeVolumeNameAndUID.DeepCopy(),
+					dataProtectionHostPendingPopulateHelperPvc.DeepCopy(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostPendingPopulateHelperPvc.DeepCopy(),
+					dataProtectionHostPendingPopulateHelperPvc.DeepCopy(),
+					dataProtectionDeletingPopulateHelperPvc.DeepCopy(),
+					dataProtectionDeletingPopulateHelperPvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.RequeueAfter == 2*time.Second)
 			},
 		},
 		{
