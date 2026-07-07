@@ -48,17 +48,9 @@ const (
 	storageProvisionerAnnotation = "volume.beta.kubernetes.io/storage-provisioner"
 	selectedNodeAnnotation       = "volume.kubernetes.io/selected-node"
 
-	legacyDataProtectionPopulateFromAnnotation = "dataprotection.kubeblocks.io/populate-from"
-
 	externalPopulatorMaterializationRequestLabel  = "vcluster.loft.sh/external-populator-materialization-request"
 	externalPopulatorMaterializationRequestPrefix = "external-populator-materialization-"
 	externalPopulatorMaterializationStatePending  = "pending"
-
-	externalPopulatorRestoreConditionType              = corev1.PersistentVolumeClaimConditionType("Restore")
-	externalPopulatorPopulateConditionType             = corev1.PersistentVolumeClaimConditionType("Populating")
-	externalPopulatorRestoreConditionReasonProvisioned = "Provisioned"
-	externalPopulatorRestoreConditionReasonProcessing  = "Processing"
-	externalPopulatorNoDataRestoreMessage              = "Provisioning PVC without data restore"
 )
 
 func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
