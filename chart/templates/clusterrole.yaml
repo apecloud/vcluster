@@ -78,6 +78,14 @@ rules:
     resources: ["persistentvolumes"]
     verbs: ["create", "delete", "patch", "update", "watch"]
   {{- end }}
+  {{- if and .Values.sync.toHost.persistentVolumeClaims.enabled (not .Values.sync.toHost.persistentVolumes.enabled) }}
+  # The external populator restore bridge re-binds populated host PVs from the
+  # populate helper PVC to the target PVC, which requires reading and patching
+  # host PVs even when PV sync to host is disabled (fake PV mode).
+  - apiGroups: [ "" ]
+    resources: [ "persistentvolumes" ]
+    verbs: [ "get", "list", "patch" ]
+  {{- end }}
   {{- if .Values.sync.fromHost.ingressClasses.enabled }}
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingressclasses"]
