@@ -707,11 +707,14 @@ func TestSync(t *testing.T) {
 			},
 			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostPendingWithBackupSourceAndFakeVolumeName.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionBackupPendingPvcWithVolumeNameBoundStatus.DeepCopy()},
+				// the populated host PV does not exist, so the virtual PVC must
+				// not be reported Bound
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionBackupPendingPvcWithVolumeName.DeepCopy()},
 				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {dataProtectionPopulatedPV.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataHostPendingWithBackupSourceAndFakeVolumeName.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("ConfigMap"):             {dataProtectionMaterializationRequestCM.DeepCopy()},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
 				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
@@ -1146,14 +1149,17 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
-			Name: "Derive data protection populated virtual status from bound populated pv while host pvc waits",
+			Name: "Do not derive populated virtual status while populated host pv is missing",
 			InitialVirtualState: []runtime.Object{
 				dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
 				dataProtectionPopulatedPV.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{dataProtectionHostPendingPvc.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionBackupPendingPvcWithVolumeNameBoundStatus.DeepCopy()},
+				// only a materialization request is emitted; reporting Bound here
+				// would tell the guest the restore succeeded while the host has no
+				// volume at all
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionBackupPendingPvcWithVolumeName.DeepCopy()},
 				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {dataProtectionPopulatedPV.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
@@ -1174,14 +1180,14 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
-			Name: "Derive data protection populated virtual status while host pvc waits with stale fake volume name",
+			Name: "Do not derive populated virtual status with stale fake volume name while populated host pv is missing",
 			InitialVirtualState: []runtime.Object{
 				dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
 				dataProtectionPopulatedPV.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{dataProtectionHostPendingPvcWithFakeVolumeName.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionBackupPendingPvcWithVolumeNameBoundStatus.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionBackupPendingPvcWithVolumeName.DeepCopy()},
 				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {dataProtectionPopulatedPV.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{

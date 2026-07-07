@@ -296,11 +296,17 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		return ctrl.Result{}, err
 	}
 	if preserveVirtualStatus {
-		err = s.ensureExternalPopulatorHostMaterialization(ctx, event.Host, event.Virtual, vPV)
+		hostConverged, err := s.ensureExternalPopulatorHostMaterialization(ctx, event.Host, event.Virtual, vPV)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		ensureExternalPopulatorVirtualPopulateStatus(event.Virtual, vPV)
+		// Only report the virtual PVC as Bound once the populated PV actually
+		// exists on the host and is re-bound to the host target PVC. Doing it
+		// earlier makes the guest (and the restore controller inside it) see a
+		// successful restore while the host has no volume at all.
+		if hostConverged {
+			ensureExternalPopulatorVirtualPopulateStatus(event.Virtual, vPV)
+		}
 	} else {
 		preserveExternalPopulatorStatus, err := s.shouldPreserveExternalPopulatorVirtualStatus(ctx, event.Host, event.Virtual)
 		if err != nil {
@@ -479,24 +485,36 @@ func (s *persistentVolumeClaimSyncer) findExternalPopulatorPersistentVolumeByCla
 	return match, true, nil
 }
 
-func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) error {
+// ensureExternalPopulatorHostMaterialization bridges the populated PV to the
+// host target PVC. It reports whether the host side has converged: only then
+// may the virtual PVC's status be synthesized as Bound. When the populated
+// host PV does not exist (e.g. it was reclaimed before the bridge could run),
+// a materialization request is emitted for an external materializer and false
+// is returned — the guest must keep seeing a pending claim, not a false
+// success.
+func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) (bool, error) {
 	hostPVName := s.externalPopulatorHostPersistentVolumeName(ctx, vPV)
 	hostPV := &corev1.PersistentVolume{}
 	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, hostPV)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
-			return s.upsertExternalPopulatorMaterializationRequest(ctx, pObj, vObj, vPV)
+			return false, s.upsertExternalPopulatorMaterializationRequest(ctx, pObj, vObj, vPV)
 		}
-		return err
+		return false, err
 	}
 
 	helperPVC, helperFound, err := s.findExternalPopulatorHelperPVC(ctx, vObj, vPV)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	pObj.Spec.VolumeName = hostPVName
-	return s.ensureExternalPopulatorHostPVClaimRef(ctx, hostPVName, pObj, helperPVC, helperFound)
+	err = s.ensureExternalPopulatorHostPVClaimRef(ctx, hostPVName, pObj, helperPVC, helperFound)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 func (s *persistentVolumeClaimSyncer) upsertExternalPopulatorMaterializationRequest(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) error {

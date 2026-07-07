@@ -84,7 +84,7 @@ rules:
   # host PVs even when PV sync to host is disabled (fake PV mode).
   - apiGroups: [ "" ]
     resources: [ "persistentvolumes" ]
-    verbs: [ "get", "list", "patch" ]
+    verbs: [ "get", "list", "watch", "patch" ]
   {{- end }}
   {{- if .Values.sync.fromHost.ingressClasses.enabled }}
   - apiGroups: ["networking.k8s.io"]
