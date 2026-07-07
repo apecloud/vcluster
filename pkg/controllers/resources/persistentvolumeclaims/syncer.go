@@ -215,6 +215,19 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 		return ctrl.Result{}, nil
 	} else if event.Virtual.DeletionTimestamp != nil {
+		// Deleting the host populate helper PVC before the populated host PV has
+		// been re-bound to the target PVC releases the PV and lets the host CSI
+		// driver reclaim it, which breaks the restore. Keep the host helper PVC
+		// until the bridge to the target PVC has converged.
+		preserveHelper, err := s.shouldPreserveExternalPopulatorPopulateHelperHostPVC(ctx, event.Host, event.Virtual.Namespace, event.Virtual.Name, event.Virtual.Spec.VolumeName)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if preserveHelper {
+			ctx.Log.Infof("preserve host populate helper pvc %s/%s because restore populate bridge has not converged yet", event.Host.Namespace, event.Host.Name)
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
 		return patcher.DeleteHostObjectWithOptions(ctx, event.Host, event.Virtual, "virtual persistent volume claim is being deleted", &client.DeleteOptions{
 			GracePeriodSeconds: event.Virtual.DeletionGracePeriodSeconds,
 			Preconditions:      metav1.NewUIDPreconditions(string(event.Host.UID)),
@@ -310,6 +323,21 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*corev1.PersistentVolumeClaim]) (_ ctrl.Result, retErr error) {
 	if event.VirtualOld != nil || translate.ShouldDeleteHostObject(event.Host) {
+		// The virtual populate helper PVC may already be gone while the populated
+		// host PV is still bound to the host helper PVC. Deleting the host helper
+		// PVC now would release the PV before it is re-bound to the target PVC.
+		vName := s.HostToVirtual(ctx, types.NamespacedName{Name: event.Host.Name, Namespace: event.Host.Namespace}, event.Host)
+		if vName.Name != "" {
+			preserveHelper, err := s.shouldPreserveExternalPopulatorPopulateHelperHostPVC(ctx, event.Host, vName.Namespace, vName.Name, "")
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if preserveHelper {
+				ctx.Log.Infof("preserve host populate helper pvc %s/%s because restore populate bridge has not converged yet", event.Host.Namespace, event.Host.Name)
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+		}
+
 		// virtual object is not here anymore, so we delete
 		return patcher.DeleteHostObject(ctx, event.Host, event.VirtualOld, "virtual object was deleted")
 	}
@@ -548,20 +576,67 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 			return nil
 		}
 	} else if hostPV.Spec.ClaimRef != nil {
-		if !helperFound {
-			return fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
-		}
-		ok, err := s.hostPVClaimRefMatchesVirtualPVC(ctx, hostPV.Spec.ClaimRef, helperPVC)
+		ok, err := s.canReleaseExternalPopulatorHostPVClaimRef(ctx, hostPV, helperPVC, helperFound)
 		if err != nil {
 			return err
 		} else if !ok {
-			return fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
+			return fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or an expected populate helper pvc", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
 		}
 	}
 
 	updated := hostPV.DeepCopy()
 	updated.Spec.ClaimRef = targetRef
 	return ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(hostPV))
+}
+
+// canReleaseExternalPopulatorHostPVClaimRef reports whether the populated host
+// PV's claimRef may be re-pointed to the target PVC. That is the case when the
+// claimRef references the populate helper PVC, a stale incarnation of a host
+// PVC, or an orphaned vcluster-managed helper whose virtual PVC is already gone.
+// It must never release a claim that a live, unrelated host PVC still holds.
+func (s *persistentVolumeClaimSyncer) canReleaseExternalPopulatorHostPVClaimRef(ctx *synccontext.SyncContext, hostPV *corev1.PersistentVolume, helperPVC *corev1.PersistentVolumeClaim, helperFound bool) (bool, error) {
+	ref := hostPV.Spec.ClaimRef
+	refPVC := &corev1.PersistentVolumeClaim{}
+	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}, refPVC)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			// the claimRef is dangling (e.g. the host helper PVC was already
+			// deleted), re-binding to the target recovers the populated PV
+			return true, nil
+		}
+		return false, err
+	}
+	if ref.UID != "" && ref.UID != refPVC.UID {
+		// the claimRef points at an old incarnation of that host PVC
+		return true, nil
+	}
+
+	if helperFound {
+		ok, err := s.hostPVClaimRefMatchesVirtualPVC(ctx, ref, helperPVC)
+		if err != nil || ok {
+			return ok, err
+		}
+	}
+
+	// orphaned populate helper: a vcluster managed host PVC bound to this PV
+	// whose virtual counterpart is gone or being deleted
+	if refPVC.Labels[translate.MarkerLabel] == "" || refPVC.Spec.VolumeName != hostPV.Name {
+		return false, nil
+	}
+	vName := s.HostToVirtual(ctx, types.NamespacedName{Name: refPVC.Name, Namespace: refPVC.Namespace}, refPVC)
+	if vName.Name == "" {
+		return true, nil
+	}
+	vPVC := &corev1.PersistentVolumeClaim{}
+	err = ctx.VirtualClient.Get(ctx, vName, vPVC)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+
+	return vPVC.DeletionTimestamp != nil, nil
 }
 
 func (s *persistentVolumeClaimSyncer) hostPVClaimRefMatchesVirtualPVC(ctx *synccontext.SyncContext, ref *corev1.ObjectReference, vPVC *corev1.PersistentVolumeClaim) (bool, error) {
@@ -798,6 +873,111 @@ func (s *persistentVolumeClaimSyncer) shouldRecreateExternalPopulatorHostNoDataR
 	}
 
 	return true, nil
+}
+
+// shouldPreserveExternalPopulatorPopulateHelperHostPVC reports whether pObj is the
+// host populate helper PVC of an in-flight external populator restore whose
+// populated PV has not been re-bound to the target PVC yet. While that bridge is
+// pending, the host helper PVC must not be deleted: releasing the PV would let
+// the host CSI driver reclaim it and the restored data would be lost.
+//
+// helperVolumeName is the virtual helper PVC's spec.volumeName if the virtual
+// object is still available, otherwise empty.
+func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorPopulateHelperHostPVC(ctx *synccontext.SyncContext, pObj *corev1.PersistentVolumeClaim, vNamespace, vName, helperVolumeName string) (bool, error) {
+	hostPVName := pObj.Spec.VolumeName
+	if hostPVName == "" {
+		// the host helper PVC never bound, so there is no populated PV to protect
+		return false, nil
+	}
+
+	vPVName := helperVolumeName
+	if vPVName == "" {
+		vPVName = mappings.HostToVirtual(ctx, hostPVName, "", nil, mappings.PersistentVolumes()).Name
+		if vPVName == "" {
+			// host created PVs keep their name in the virtual cluster
+			vPVName = hostPVName
+		}
+	}
+
+	target, found, err := s.findExternalPopulatorPopulateTargetPVC(ctx, vNamespace, vName, vPVName)
+	if err != nil || !found {
+		return false, err
+	}
+
+	return s.isExternalPopulatorPopulateBridgePending(ctx, hostPVName, target)
+}
+
+// findExternalPopulatorPopulateTargetPVC looks for a live external populator
+// target PVC in the virtual namespace that expects the populated virtual PV
+// vPVName, either because its own volumeName already points there or because the
+// virtual PV's claimRef was re-pointed to it by the populator.
+func (s *persistentVolumeClaimSyncer) findExternalPopulatorPopulateTargetPVC(ctx *synccontext.SyncContext, vNamespace, helperName, vPVName string) (*corev1.PersistentVolumeClaim, bool, error) {
+	vPV := &corev1.PersistentVolume{}
+	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: vPVName}, vPV)
+	if err != nil {
+		if !kerrors.IsNotFound(err) {
+			return nil, false, err
+		}
+		vPV = nil
+	}
+
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err = ctx.VirtualClient.List(ctx.Context, pvcList, client.InNamespace(vNamespace))
+	if err != nil {
+		return nil, false, err
+	}
+
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if pvc.Name == helperName || pvc.DeletionTimestamp != nil || !isExternalPopulatorPVC(pvc) {
+			continue
+		}
+		if pvc.Spec.VolumeName == vPVName {
+			return pvc.DeepCopy(), true, nil
+		}
+		if vPV != nil && isExternalPopulatorPersistentVolumeForPVC(vPV, pvc, false) {
+			return pvc.DeepCopy(), true, nil
+		}
+	}
+
+	return nil, false, nil
+}
+
+// isExternalPopulatorPopulateBridgePending reports whether the populated host PV
+// still has to be re-bound from the host populate helper PVC to the target PVC.
+// The bridge has converged once the host PV's claimRef points at the host target
+// PVC and the host target PVC's volumeName points back at the host PV.
+func (s *persistentVolumeClaimSyncer) isExternalPopulatorPopulateBridgePending(ctx *synccontext.SyncContext, hostPVName string, target *corev1.PersistentVolumeClaim) (bool, error) {
+	hostTargetName := s.VirtualToHost(ctx, types.NamespacedName{Name: target.Name, Namespace: target.Namespace}, target)
+	hostTarget := &corev1.PersistentVolumeClaim{}
+	err := ctx.HostClient.Get(ctx.Context, hostTargetName, hostTarget)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			// the host target PVC does not exist yet, so the bridge cannot have converged
+			return true, nil
+		}
+		return false, err
+	}
+
+	if !isHostPVCWaitingForVolume(hostTarget) {
+		// the host target PVC is already bound, the helper is not needed anymore
+		return false, nil
+	}
+	if hostTarget.Spec.VolumeName != hostPVName {
+		return true, nil
+	}
+
+	hostPV := &corev1.PersistentVolume{}
+	err = ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, hostPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			// the populated host PV is gone, so preserving the helper cannot protect it anymore
+			return false, nil
+		}
+		return false, err
+	}
+
+	return !claimRefMatchesPersistentVolumeClaim(hostPV.Spec.ClaimRef, hostTarget), nil
 }
 
 func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorNoDataRestorePVCWhileHostDeleting(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (bool, error) {

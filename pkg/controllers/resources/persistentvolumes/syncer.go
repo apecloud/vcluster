@@ -297,6 +297,9 @@ func (s *persistentVolumeSyncer) shouldSync(ctx *synccontext.SyncContext, pObj *
 		if translate.Default.IsManaged(ctx, pObj) {
 			return true, nil, nil
 		}
+		if target, ok, err := s.findExternalPopulatorTargetForPersistentVolume(ctx, pObj); err != nil || ok {
+			return ok, target, err
+		}
 
 		return translate.Default.IsTargetedNamespace(ctx, pObj.Spec.ClaimRef.Namespace) && pObj.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimRetain, nil, nil
 	}
@@ -309,6 +312,9 @@ func (s *persistentVolumeSyncer) shouldSync(ctx *synccontext.SyncContext, pObj *
 		} else if translate.Default.IsManaged(ctx, pObj) {
 			return true, nil, nil
 		}
+		if target, ok, err := s.findExternalPopulatorTargetForPersistentVolume(ctx, pObj); err != nil || ok {
+			return ok, target, err
+		}
 		if translate.Default.IsTargetedNamespace(ctx, pObj.Spec.ClaimRef.Namespace) && pObj.Status.Phase == corev1.VolumeReleased {
 			return true, nil, nil
 		}
@@ -317,6 +323,71 @@ func (s *persistentVolumeSyncer) shouldSync(ctx *synccontext.SyncContext, pObj *
 	}
 
 	return true, vPvc, nil
+}
+
+// findExternalPopulatorTargetForPersistentVolume looks for a live external
+// populator target PVC in the virtual cluster that still expects this populated
+// PV. While the populate helper PVC is being torn down, the host PV's claimRef
+// still references the helper, so the regular claimRef based resolution above
+// fails. Without this, the virtual PV would be deleted (or never recreated)
+// while the target PVC still needs it to finish the restore bridge.
+func (s *persistentVolumeSyncer) findExternalPopulatorTargetForPersistentVolume(ctx *synccontext.SyncContext, pObj *corev1.PersistentVolume) (*corev1.PersistentVolumeClaim, bool, error) {
+	vPVName := mappings.HostToVirtual(ctx, pObj.Name, "", nil, mappings.PersistentVolumes()).Name
+	if vPVName == "" {
+		// host created PVs keep their name in the virtual cluster
+		vPVName = pObj.Name
+	}
+
+	// prefer the virtual PV's claimRef, the populator re-points it to the target
+	vPV := &corev1.PersistentVolume{}
+	err := s.virtualClient.Get(ctx, types.NamespacedName{Name: vPVName}, vPV)
+	if err != nil {
+		if !kerrors.IsNotFound(err) {
+			return nil, false, err
+		}
+	} else if vPV.Spec.ClaimRef != nil {
+		vPvc := &corev1.PersistentVolumeClaim{}
+		err = s.virtualClient.Get(ctx, types.NamespacedName{Name: vPV.Spec.ClaimRef.Name, Namespace: vPV.Spec.ClaimRef.Namespace}, vPvc)
+		if err != nil {
+			if !kerrors.IsNotFound(err) {
+				return nil, false, err
+			}
+		} else if vPvc.DeletionTimestamp == nil &&
+			hasExternalPopulatorDataSource(vPvc) &&
+			(vPV.Spec.ClaimRef.UID == "" || vPV.Spec.ClaimRef.UID == vPvc.UID) {
+			return vPvc, true, nil
+		}
+	}
+
+	// fall back to a target PVC whose volumeName already points at the populated PV
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err = s.virtualClient.List(ctx, pvcList)
+	if err != nil {
+		return nil, false, err
+	}
+	for i := range pvcList.Items {
+		vPvc := &pvcList.Items[i]
+		if vPvc.DeletionTimestamp == nil && hasExternalPopulatorDataSource(vPvc) && vPvc.Spec.VolumeName == vPVName {
+			return vPvc.DeepCopy(), true, nil
+		}
+	}
+
+	return nil, false, nil
+}
+
+// hasExternalPopulatorDataSource mirrors the check in the persistentvolumeclaims
+// package, which cannot be imported here without creating an import cycle.
+func hasExternalPopulatorDataSource(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc.Spec.DataSourceRef == nil || pvc.Spec.DataSourceRef.Name == "" {
+		return false
+	}
+
+	switch pvc.Spec.DataSourceRef.Kind {
+	case "VolumeSnapshot", "PersistentVolumeClaim":
+		return false
+	default:
+		return true
+	}
 }
 
 func (s *persistentVolumeSyncer) IsManaged(ctx *synccontext.SyncContext, pObj client.Object) (bool, error) {

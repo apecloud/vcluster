@@ -576,3 +576,122 @@ func TestTranslateUpdateBackwards_ClaimRefResourceVersionPreserved(t *testing.T)
 
 	test.Run(t, createContext)
 }
+
+func externalPopulatorRestoreFixtures() (*corev1.PersistentVolumeClaim, *corev1.PersistentVolume, *corev1.PersistentVolume) {
+	dataProtectionGroup := "dataprotection.kubeblocks.io"
+	targetPvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "testpvc",
+			Namespace: "test",
+			UID:       types.UID("target-pvc-uid"),
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: "restore-populated-pv",
+			DataSourceRef: &corev1.TypedObjectReference{
+				APIGroup: &dataProtectionGroup,
+				Kind:     "Backup",
+				Name:     "backup-1",
+			},
+		},
+	}
+	vPv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "restore-populated-pv",
+			Annotations: map[string]string{
+				constants.HostClusterPersistentVolumeAnnotation: "restore-populated-pv",
+			},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{
+				Name:      targetPvc.Name,
+				Namespace: targetPvc.Namespace,
+				UID:       targetPvc.UID,
+			},
+		},
+		Status: corev1.PersistentVolumeStatus{
+			Phase: corev1.VolumeBound,
+		},
+	}
+	// the populated host PV is still bound to the host populate helper PVC whose
+	// virtual counterpart is already gone
+	pPv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "restore-populated-pv",
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+			ClaimRef: &corev1.ObjectReference{
+				Name:      "kb-populate-host-helper",
+				Namespace: "test",
+				UID:       types.UID("host-helper-uid"),
+			},
+		},
+		Status: corev1.PersistentVolumeStatus{
+			Phase: corev1.VolumeBound,
+		},
+	}
+
+	return targetPvc, vPv, pPv
+}
+
+func TestSyncKeepsVirtualPVForExternalPopulatorTarget(t *testing.T) {
+	targetPvc, vPv, pPv := externalPopulatorRestoreFixtures()
+
+	test := &syncertesting.SyncTest{
+		Name:                 "Keep virtual pv for external populator target while host claim ref is orphaned",
+		InitialVirtualState:  []runtime.Object{targetPvc.DeepCopy(), vPv.DeepCopy()},
+		InitialPhysicalState: []runtime.Object{pPv.DeepCopy()},
+		Sync: func(ctx *synccontext.RegisterContext) {
+			syncContext, syncer := newFakeSyncer(t, ctx)
+
+			_, err := syncer.Sync(syncContext, synccontext.NewSyncEventWithOld(
+				pPv.DeepCopy(),
+				pPv.DeepCopy(),
+				vPv.DeepCopy(),
+				vPv.DeepCopy(),
+			))
+			assert.NilError(t, err)
+
+			keptPv := &corev1.PersistentVolume{}
+			err = syncer.virtualClient.Get(syncContext, types.NamespacedName{Name: vPv.Name}, keptPv)
+			assert.NilError(t, err)
+			assert.Assert(t, keptPv.Spec.ClaimRef != nil)
+			assert.Equal(t, keptPv.Spec.ClaimRef.Name, targetPvc.Name)
+			assert.Equal(t, keptPv.Spec.ClaimRef.Namespace, targetPvc.Namespace)
+		},
+	}
+
+	test.Run(t, func(vConfig *config.VirtualClusterConfig, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient) *synccontext.RegisterContext {
+		vConfig.Sync.ToHost.PersistentVolumes.Enabled = true
+		return syncertesting.NewFakeRegisterContext(vConfig, pClient, vClient)
+	})
+}
+
+func TestSyncToVirtualRecreatesExternalPopulatorTargetPV(t *testing.T) {
+	targetPvc, vPv, pPv := externalPopulatorRestoreFixtures()
+
+	test := &syncertesting.SyncTest{
+		Name:                 "Recreate virtual pv for external populator target after it was deleted",
+		InitialVirtualState:  []runtime.Object{targetPvc.DeepCopy()},
+		InitialPhysicalState: []runtime.Object{pPv.DeepCopy()},
+		Sync: func(ctx *synccontext.RegisterContext) {
+			syncContext, syncer := newFakeSyncer(t, ctx)
+
+			_, err := syncer.SyncToVirtual(syncContext, synccontext.NewSyncToVirtualEvent(pPv.DeepCopy()))
+			assert.NilError(t, err)
+
+			recreatedPv := &corev1.PersistentVolume{}
+			err = syncer.virtualClient.Get(syncContext, types.NamespacedName{Name: vPv.Name}, recreatedPv)
+			assert.NilError(t, err)
+			assert.Assert(t, recreatedPv.Spec.ClaimRef != nil)
+			assert.Equal(t, recreatedPv.Spec.ClaimRef.Name, targetPvc.Name)
+			assert.Equal(t, recreatedPv.Spec.ClaimRef.Namespace, targetPvc.Namespace)
+			assert.Equal(t, string(recreatedPv.Spec.ClaimRef.UID), string(targetPvc.UID))
+		},
+	}
+
+	test.Run(t, func(vConfig *config.VirtualClusterConfig, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient) *synccontext.RegisterContext {
+		vConfig.Sync.ToHost.PersistentVolumes.Enabled = true
+		return syncertesting.NewFakeRegisterContext(vConfig, pClient, vClient)
+	})
+}
