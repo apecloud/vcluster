@@ -353,6 +353,12 @@ func TestSync(t *testing.T) {
 	dataProtectionDeletingPopulateHelperPvc := dataProtectionPopulateHelperPvc.DeepCopy()
 	dataProtectionDeletingPopulateHelperPvc.Finalizers = []string{"kubernetes.io/pvc-protection"}
 	dataProtectionDeletingPopulateHelperPvc.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	dataProtectionPopulatedPVBoundToHelper := dataProtectionPopulatedPV.DeepCopy()
+	dataProtectionPopulatedPVBoundToHelper.Spec.ClaimRef = &corev1.ObjectReference{
+		Namespace: dataProtectionPopulateHelperPvc.Namespace,
+		Name:      dataProtectionPopulateHelperPvc.Name,
+		UID:       dataProtectionPopulateHelperPvc.UID,
+	}
 	dataProtectionHostPVBoundToHelper := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: dataProtectionPopulatedPV.Name,
@@ -919,6 +925,77 @@ func TestSync(t *testing.T) {
 				))
 				assert.NilError(t, err)
 				assert.Check(t, result.RequeueAfter == 2*time.Second)
+			},
+		},
+		{
+			Name: "Requeue after deriving data protection pvc volume name from populated helper pvc",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionBackupPendingPvc.DeepCopy(),
+				dataProtectionPopulateHelperPvc.DeepCopy(),
+				dataProtectionPopulatedPVBoundToHelper.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{dataProtectionHostPendingPvc.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
+					dataProtectionPopulateHelperPvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionPopulatedPVBoundToHelper.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionHostPendingPvc.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionBackupPendingPvc.DeepCopy(),
+					dataProtectionBackupPendingPvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.Requeue)
+			},
+		},
+		{
+			Name: "Bridge data protection populated host pv from helper pvc after target volume name is derived",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
+				dataProtectionPopulatedPVBoundToHelper.DeepCopy(),
+				dataProtectionPopulateHelperPvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostPendingPvc.DeepCopy(),
+				dataProtectionHostPopulateHelperPvc.DeepCopy(),
+				dataProtectionHostPVBoundToHelper.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionBackupPendingPvcWithVolumeNameBoundStatus.DeepCopy(),
+					dataProtectionPopulateHelperPvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionPopulatedPVBoundToHelper.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostMaterializedTargetPvc.DeepCopy(),
+					dataProtectionHostPopulateHelperPvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionHostPVBoundToTarget.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionHostPendingPvc.DeepCopy(),
+					dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
+					dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
+				))
+				assert.NilError(t, err)
 			},
 		},
 		{

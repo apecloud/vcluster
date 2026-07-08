@@ -419,7 +419,10 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorPersistentVolumeNam
 
 	vPV, ok, err := s.findExternalPopulatorPersistentVolumeByClaimRef(ctx, vObj)
 	if err != nil || !ok {
-		return false, err
+		vPV, ok, err = s.findExternalPopulatorPersistentVolumeByPopulateHelper(ctx, vObj)
+		if err != nil || !ok {
+			return false, err
+		}
 	}
 
 	log.Infof("update virtual external populator pvc %s/%s volume name to populated pv %s", vObj.Namespace, vObj.Name, vPV.Name)
@@ -453,6 +456,59 @@ func (s *persistentVolumeClaimSyncer) findExternalPopulatorPersistentVolumeByCla
 		match = vPV.DeepCopy()
 	}
 
+	if match == nil {
+		return nil, false, nil
+	}
+
+	return match, true, nil
+}
+
+func (s *persistentVolumeClaimSyncer) findExternalPopulatorPersistentVolumeByPopulateHelper(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolume, bool, error) {
+	helperPVC, ok, err := s.findExternalPopulatorHelperPVCByTargetUID(ctx, vObj)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	if helperPVC.Spec.VolumeName == "" {
+		return nil, false, nil
+	}
+
+	vPV := &corev1.PersistentVolume{}
+	err = ctx.VirtualClient.Get(ctx.Context, types.NamespacedName{Name: helperPVC.Spec.VolumeName}, vPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if !isExternalPopulatorPersistentVolumeForPVC(vPV, helperPVC, true) {
+		return nil, false, nil
+	}
+
+	return vPV, true, nil
+}
+
+func (s *persistentVolumeClaimSyncer) findExternalPopulatorHelperPVCByTargetUID(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolumeClaim, bool, error) {
+	if vObj.UID == "" {
+		return nil, false, nil
+	}
+
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err := ctx.VirtualClient.List(ctx.Context, pvcList, client.InNamespace(vObj.Namespace))
+	if err != nil {
+		return nil, false, err
+	}
+
+	var match *corev1.PersistentVolumeClaim
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if !isExternalPopulatorPopulateHelperPVCForTarget(pvc, vObj) {
+			continue
+		}
+		if match != nil && match.Name != pvc.Name {
+			return nil, false, fmt.Errorf("multiple external populator helper persistent volume claims match target pvc %s/%s", vObj.Namespace, vObj.Name)
+		}
+		match = pvc.DeepCopy()
+	}
 	if match == nil {
 		return nil, false, nil
 	}
@@ -627,7 +683,14 @@ func (s *persistentVolumeClaimSyncer) externalPopulatorPersistentVolume(ctx *syn
 	}
 
 	if !isExternalPopulatorPersistentVolumeForPVC(vPV, vObj, false) {
-		return nil, false, nil
+		helperPVC, ok, err := s.findExternalPopulatorHelperPVC(ctx, vObj, vPV)
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		if !isExternalPopulatorPopulateHelperPVCForTarget(helperPVC, vObj) ||
+			!isExternalPopulatorPersistentVolumeForPVC(vPV, helperPVC, false) {
+			return nil, false, nil
+		}
 	}
 	if !isVirtualPVCBound(vObj) && vPV.Status.Phase != corev1.VolumeBound {
 		return nil, false, nil
@@ -691,6 +754,16 @@ func isExternalPopulatorPersistentVolumeForPVC(vPV *corev1.PersistentVolume, vOb
 	}
 
 	return true
+}
+
+func isExternalPopulatorPopulateHelperPVCForTarget(helperPVC, targetPVC *corev1.PersistentVolumeClaim) bool {
+	if helperPVC == nil || targetPVC == nil || targetPVC.UID == "" {
+		return false
+	}
+
+	return helperPVC.Namespace == targetPVC.Namespace &&
+		helperPVC.Name == externalPopulatorPopulateHelperPrefix+string(targetPVC.UID) &&
+		helperPVC.DeletionTimestamp == nil
 }
 
 func externalPopulatorMaterializationRequest(hostNamespace string, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) *corev1.ConfigMap {
