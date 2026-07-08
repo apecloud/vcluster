@@ -237,6 +237,13 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		return deleteExternalPopulatorNoDataRestoreHostPVC(ctx, event.Host, event.Virtual)
 	}
 
+	requeue, err := s.ensureExternalPopulatorTargetVolumeNameFromHelper(ctx, event.Virtual, ctx.Log)
+	if err != nil {
+		return ctrl.Result{}, err
+	} else if requeue {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// make sure the persistent volume is synced / faked
 	if event.Host.Spec.VolumeName != "" {
 		requeue, err := s.ensurePersistentVolume(ctx, event.Host, event.Virtual, ctx.Log)
@@ -435,6 +442,37 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorPersistentVolumeNam
 	// The direct update changes the virtual PVC resourceVersion. Stop this
 	// reconcile here so the following status patch uses a fresh object.
 	return true, nil
+}
+
+func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorTargetVolumeNameFromHelper(ctx *synccontext.SyncContext, helperPVC *corev1.PersistentVolumeClaim, log loghelper.Logger) (bool, error) {
+	if helperPVC.Spec.VolumeName == "" || !strings.HasPrefix(helperPVC.Name, externalPopulatorPopulateHelperPrefix) {
+		return false, nil
+	}
+
+	targetUID := strings.TrimPrefix(helperPVC.Name, externalPopulatorPopulateHelperPrefix)
+	targetPVC, ok, err := s.findExternalPopulatorTargetPVCByUID(ctx, helperPVC.Namespace, types.UID(targetUID))
+	if err != nil || !ok {
+		return false, err
+	}
+	if targetPVC.Spec.VolumeName != "" {
+		return false, nil
+	}
+
+	vPV := &corev1.PersistentVolume{}
+	err = ctx.VirtualClient.Get(ctx.Context, types.NamespacedName{Name: helperPVC.Spec.VolumeName}, vPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !isExternalPopulatorPersistentVolumeForPVC(vPV, helperPVC, true) {
+		return false, nil
+	}
+
+	log.Infof("update virtual external populator target pvc %s/%s volume name to populated helper pv %s", targetPVC.Namespace, targetPVC.Name, vPV.Name)
+	targetPVC.Spec.VolumeName = vPV.Name
+	return true, ctx.VirtualClient.Update(ctx.Context, targetPVC)
 }
 
 func (s *persistentVolumeClaimSyncer) findExternalPopulatorPersistentVolumeByClaimRef(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolume, bool, error) {
