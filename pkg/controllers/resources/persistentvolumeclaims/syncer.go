@@ -1,12 +1,16 @@
 package persistentvolumeclaims
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	storagev1 "k8s.io/api/storage/v1"
 
 	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/api/equality"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/klog/v2"
 
@@ -42,6 +46,23 @@ const (
 	bindCompletedAnnotation      = "pv.kubernetes.io/bind-completed"
 	boundByControllerAnnotation  = "pv.kubernetes.io/bound-by-controller"
 	storageProvisionerAnnotation = "volume.beta.kubernetes.io/storage-provisioner"
+	selectedNodeAnnotation       = "volume.kubernetes.io/selected-node"
+
+	legacyDataProtectionPopulateFromAnnotation = "dataprotection.kubeblocks.io/populate-from"
+	dataProtectionAPIGroup                     = "dataprotection.kubeblocks.io"
+	dataProtectionBackupKind                   = "Backup"
+
+	externalPopulatorMaterializationRequestLabel  = "vcluster.loft.sh/external-populator-materialization-request"
+	externalPopulatorMaterializationRequestPrefix = "external-populator-materialization-"
+	externalPopulatorMaterializationStatePending  = "pending"
+	externalPopulatorPopulateHelperPrefix         = "kb-populate-"
+
+	externalPopulatorRestoreConditionType              = corev1.PersistentVolumeClaimConditionType("Restore")
+	externalPopulatorPopulateConditionType             = corev1.PersistentVolumeClaimConditionType("Populating")
+	externalPopulatorRestoreConditionReasonProvisioned = "Provisioned"
+	externalPopulatorRestoreConditionReasonProcessing  = "Processing"
+	externalPopulatorNoDataRestoreMessage              = "Provisioning PVC without data restore"
+	externalPopulatorNoDataRestoreBackoff              = 15 * time.Second
 )
 
 func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
@@ -105,13 +126,46 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, nil
 	}
 
-	if event.HostOld != nil || event.Virtual.DeletionTimestamp != nil {
+	preserveDeletingHostPVC, err := s.shouldPreserveExternalPopulatorNoDataRestorePVCWhileHostDeleting(ctx, event.Virtual, event.HostOld)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if event.HostOld != nil && preserveDeletingHostPVC && event.Virtual.DeletionTimestamp == nil {
+		// The host PVC was intentionally deleted so it can be recreated without
+		// the external dataSource. Keep the virtual restore PVC and continue into
+		// the create path below.
+	} else if event.HostOld != nil || event.Virtual.DeletionTimestamp != nil {
 		return patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.HostOld, "host object was deleted", &client.DeleteOptions{
 			GracePeriodSeconds: &zero,
 		})
 	}
 
-	pObj, err := s.translate(ctx, event.Virtual)
+	pObj, handled, err := s.translateExternalPopulatorNoDataRestoreToHost(ctx, event.Virtual)
+	if err != nil {
+		s.EventRecorder().Eventf(
+			event.Virtual,
+			nil,
+			"Warning",
+			"SyncError",
+			fmt.Sprintf("Sync%s", event.Virtual.GetObjectKind().GroupVersionKind().Kind),
+			err.Error(),
+		)
+		return ctrl.Result{}, err
+	}
+	if handled {
+		err = pro.ApplyPatchesHostObject(ctx, nil, pObj, event.Virtual, ctx.Config.Sync.ToHost.PersistentVolumeClaims.Patches, false)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		blocked, err := s.shouldBlockExternalPopulatorHostPVCUntilGuestBackupMaterialized(ctx, event.Virtual, pObj)
+		if err != nil || blocked {
+			return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, err
+		}
+
+		return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), true)
+	}
+
+	pObj, err = s.translate(ctx, event.Virtual)
 	if err != nil {
 		s.EventRecorder().Eventf(
 			event.Virtual,
@@ -128,11 +182,15 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	blocked, err := s.shouldBlockExternalPopulatorHostPVCUntilGuestBackupMaterialized(ctx, event.Virtual, pObj)
+	if err != nil || blocked {
+		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, err
+	}
 
 	return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), true)
 }
 
-func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*corev1.PersistentVolumeClaim]) (_ ctrl.Result, retErr error) {
+func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*corev1.PersistentVolumeClaim]) (result ctrl.Result, retErr error) {
 	if s.applyLimitByClass(ctx, event.Virtual) {
 		return ctrl.Result{}, nil
 	}
@@ -154,6 +212,13 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 	// if pvs are deleted check the corresponding pvc is deleted as well
 	if event.Host.DeletionTimestamp != nil {
+		preserveDeletingHostPVC, err := s.shouldPreserveExternalPopulatorNoDataRestorePVCWhileHostDeleting(ctx, event.Virtual, event.Host)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if preserveDeletingHostPVC {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 		if event.Virtual.DeletionTimestamp == nil {
 			return patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.Host, "host persistent volume claim is being deleted", &client.DeleteOptions{GracePeriodSeconds: &minimumGracePeriodInSeconds})
 		} else if *event.Virtual.DeletionGracePeriodSeconds != *event.Host.DeletionGracePeriodSeconds {
@@ -162,10 +227,26 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 		return ctrl.Result{}, nil
 	} else if event.Virtual.DeletionTimestamp != nil {
+		preserveDeletingHostPVC, err := s.shouldPreserveDeletingExternalPopulatorPopulateHelper(ctx, event.Virtual, event.Host)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if preserveDeletingHostPVC {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
 		return patcher.DeleteHostObjectWithOptions(ctx, event.Host, event.Virtual, "virtual persistent volume claim is being deleted", &client.DeleteOptions{
 			GracePeriodSeconds: event.Virtual.DeletionGracePeriodSeconds,
 			Preconditions:      metav1.NewUIDPreconditions(string(event.Host.UID)),
 		})
+	}
+	backoffHostPVC, err := s.shouldBackoffExternalPopulatorHostNoDataRestorePVC(ctx, event.Host, event.Virtual)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if backoffHostPVC {
+		logExternalPopulatorNoDataRestoreBackoff(ctx.Log, event.Host, event.Virtual)
+		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
 	}
 
 	// make sure the persistent volume is synced / faked
@@ -177,6 +258,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 			return ctrl.Result{Requeue: true}, nil
 		}
 	}
+	clearExternalPopulatorHostDataSourceAfterGuestMaterialized(event.Host, event.Virtual)
 
 	// patch objects
 	patch, err := patcher.NewSyncerPatcher(ctx, event.Host, event.Virtual, patcher.TranslatePatches(ctx.Config.Sync.ToHost.PersistentVolumeClaims.Patches, false))
@@ -186,6 +268,12 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	defer func() {
 		if err := patch.Patch(ctx, event.Host, event.Virtual); err != nil {
 			retErr = utilerrors.NewAggregate([]error{retErr, err})
+		}
+
+		if kerrors.IsConflict(retErr) {
+			result = ctrl.Result{RequeueAfter: time.Second}
+			retErr = nil
+			return
 		}
 
 		if retErr != nil {
@@ -205,7 +293,25 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	s.translateUpdateBackwards(event.Host, event.Virtual)
 
 	// copy host status
-	event.Virtual.Status = *event.Host.Status.DeepCopy()
+	vPV, preserveVirtualStatus, err := s.externalPopulatorPersistentVolume(ctx, event.Host, event.Virtual)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if preserveVirtualStatus {
+		err = s.ensureExternalPopulatorHostMaterialization(ctx, event.Host, event.Virtual, vPV)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		ensureExternalPopulatorVirtualPopulateStatus(event.Virtual, vPV)
+	} else {
+		preserveExternalPopulatorStatus, err := s.shouldPreserveExternalPopulatorVirtualStatus(ctx, event.Host, event.Virtual)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !preserveExternalPopulatorStatus {
+			event.Virtual.Status = *event.Host.Status.DeepCopy()
+		}
+	}
 
 	// allow storage size to be increased
 	event.Host.Spec.Resources.Requests = event.Virtual.Spec.Resources.Requests
@@ -230,6 +336,23 @@ func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext
 	}
 
 	return patcher.CreateVirtualObject(ctx, event.Host, vPvc, s.EventRecorder(), true)
+}
+
+func (s *persistentVolumeClaimSyncer) translateExternalPopulatorNoDataRestoreToHost(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolumeClaim, bool, error) {
+	noDataRestore, err := s.isExternalPopulatorNoDataRestorePVC(ctx, vObj)
+	if err != nil {
+		return nil, true, err
+	}
+	if !noDataRestore {
+		return nil, false, nil
+	}
+
+	pObj, err := s.translate(ctx, vObj)
+	if err != nil {
+		return nil, true, err
+	}
+	pObj.Spec.VolumeName = ""
+	return pObj, true, nil
 }
 
 func (s *persistentVolumeClaimSyncer) ensurePersistentVolume(ctx *synccontext.SyncContext, pObj *corev1.PersistentVolumeClaim, vObj *corev1.PersistentVolumeClaim, log loghelper.Logger) (bool, error) {
@@ -283,10 +406,641 @@ func (s *persistentVolumeClaimSyncer) ensurePersistentVolume(ctx *synccontext.Sy
 			if err != nil {
 				return false, err
 			}
+
+			// The direct update changes the virtual PVC resourceVersion. Stop this
+			// reconcile here so the following status patch uses a fresh object.
+			return true, nil
 		}
 	}
 
 	return false, nil
+}
+
+func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) error {
+	hostPVName := s.externalPopulatorHostPersistentVolumeName(ctx, vPV)
+	hostPV := &corev1.PersistentVolume{}
+	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, hostPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return s.upsertExternalPopulatorMaterializationRequest(ctx, pObj, vObj, vPV)
+		}
+		return err
+	}
+
+	helperPVC, helperFound, err := s.findExternalPopulatorHelperPVC(ctx, vObj, vPV)
+	if err != nil {
+		return err
+	}
+
+	pObj.Spec.VolumeName = hostPVName
+	return s.ensureExternalPopulatorHostPVClaimRef(ctx, hostPVName, pObj, helperPVC, helperFound)
+}
+
+func (s *persistentVolumeClaimSyncer) upsertExternalPopulatorMaterializationRequest(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) error {
+	desired := externalPopulatorMaterializationRequest(ctx.Config.HostNamespace, pObj, vObj, vPV)
+	existing := &corev1.ConfigMap{}
+	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{
+		Namespace: desired.Namespace,
+		Name:      desired.Name,
+	}, existing)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return ctx.HostClient.Create(ctx.Context, desired)
+		}
+		return err
+	}
+
+	updated := existing.DeepCopy()
+	updated.Labels = desired.Labels
+	updated.Data = desired.Data
+	if equality.Semantic.DeepEqual(existing.Labels, updated.Labels) &&
+		equality.Semantic.DeepEqual(existing.Data, updated.Data) {
+		return nil
+	}
+
+	return ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(existing))
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorHostPersistentVolumeName(ctx *synccontext.SyncContext, vPV *corev1.PersistentVolume) string {
+	if s.useFakePersistentVolumes {
+		return vPV.Name
+	}
+
+	return mappings.VirtualToHostName(ctx, vPV.Name, "", mappings.PersistentVolumes())
+}
+
+func (s *persistentVolumeClaimSyncer) findExternalPopulatorHelperPVC(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) (*corev1.PersistentVolumeClaim, bool, error) {
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err := ctx.VirtualClient.List(ctx.Context, pvcList, client.InNamespace(vObj.Namespace))
+	if err != nil {
+		return nil, false, err
+	}
+
+	var match *corev1.PersistentVolumeClaim
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if pvc.Name == vObj.Name || pvc.Spec.VolumeName != vPV.Name {
+			continue
+		}
+		if match != nil && match.Name != pvc.Name {
+			return nil, false, fmt.Errorf("multiple external populator helper persistent volume claims match pv %s for pvc %s/%s", vPV.Name, vObj.Namespace, vObj.Name)
+		}
+		match = pvc.DeepCopy()
+	}
+	if match == nil {
+		return nil, false, nil
+	}
+
+	return match, true, nil
+}
+
+func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx *synccontext.SyncContext, hostPVName string, pObj *corev1.PersistentVolumeClaim, helperPVC *corev1.PersistentVolumeClaim, helperFound bool) error {
+	hostPV := &corev1.PersistentVolume{}
+	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, hostPV)
+	if err != nil {
+		return err
+	}
+
+	targetRef := &corev1.ObjectReference{
+		APIVersion: corev1.SchemeGroupVersion.Version,
+		Kind:       "PersistentVolumeClaim",
+		Namespace:  pObj.Namespace,
+		Name:       pObj.Name,
+		UID:        pObj.UID,
+	}
+	if claimRefReferencesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) {
+		if hostPV.Spec.ClaimRef.UID == pObj.UID {
+			return nil
+		}
+	} else if hostPV.Spec.ClaimRef != nil {
+		if !helperFound {
+			return fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
+		}
+		ok, err := s.hostPVClaimRefMatchesVirtualPVC(ctx, hostPV.Spec.ClaimRef, helperPVC)
+		if err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
+		}
+	}
+
+	updated := hostPV.DeepCopy()
+	updated.Spec.ClaimRef = targetRef
+	return ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(hostPV))
+}
+
+func (s *persistentVolumeClaimSyncer) hostPVClaimRefMatchesVirtualPVC(ctx *synccontext.SyncContext, ref *corev1.ObjectReference, vPVC *corev1.PersistentVolumeClaim) (bool, error) {
+	if ref == nil || vPVC == nil {
+		return false, nil
+	}
+
+	hostPVCName := s.VirtualToHost(ctx, types.NamespacedName{Name: vPVC.Name, Namespace: vPVC.Namespace}, vPVC)
+	if ref.Namespace != hostPVCName.Namespace || ref.Name != hostPVCName.Name {
+		return false, nil
+	}
+
+	hostPVC := &corev1.PersistentVolumeClaim{}
+	err := ctx.HostClient.Get(ctx.Context, hostPVCName, hostPVC)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return ref.UID == "" || ref.UID == hostPVC.UID, nil
+}
+
+func claimRefMatchesPersistentVolumeClaim(ref *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim) bool {
+	if ref == nil || pvc == nil {
+		return false
+	}
+
+	return claimRefReferencesPersistentVolumeClaim(ref, pvc) &&
+		(ref.UID == "" || ref.UID == pvc.UID)
+}
+
+func claimRefReferencesPersistentVolumeClaim(ref *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim) bool {
+	if ref == nil || pvc == nil {
+		return false
+	}
+
+	return ref.Namespace == pvc.Namespace && ref.Name == pvc.Name
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorPersistentVolume(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolume, bool, error) {
+	if !isExternalPopulatorPVC(vObj) || vObj.Spec.VolumeName == "" || !isHostPVCWaitingForVolume(pObj) {
+		return nil, false, nil
+	}
+
+	vPV := &corev1.PersistentVolume{}
+	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: vObj.Spec.VolumeName}, vPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+
+	if !isExternalPopulatorPersistentVolumeForPVC(vPV, vObj, false) {
+		helperPVC, ok, err := s.findExternalPopulatorHelperPVC(ctx, vObj, vPV)
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		if !isExternalPopulatorPopulateHelperPVCForTarget(helperPVC, vObj) ||
+			!isExternalPopulatorPersistentVolumeForPVC(vPV, helperPVC, false) {
+			return nil, false, nil
+		}
+	}
+	if !isVirtualPVCBound(vObj) && vPV.Status.Phase != corev1.VolumeBound {
+		return nil, false, nil
+	}
+
+	return vPV, true, nil
+}
+
+func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorVirtualStatus(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (bool, error) {
+	if !hasExternalPopulatorDataSource(vObj) {
+		return false, nil
+	}
+	if !isHostPVCWaitingForVolume(pObj) {
+		return false, nil
+	}
+	if vObj.Spec.VolumeName == "" {
+		return true, nil
+	}
+
+	vPV := &corev1.PersistentVolume{}
+	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: vObj.Spec.VolumeName}, vPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return isExternalPopulatorPersistentVolumeForPVC(vPV, vObj, false), nil
+}
+
+func ensureExternalPopulatorVirtualPopulateStatus(vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) {
+	if isVirtualPVCBound(vObj) {
+		return
+	}
+
+	if vPV.Status.Phase != corev1.VolumeBound {
+		return
+	}
+
+	vObj.Status.Phase = corev1.ClaimBound
+	if len(vObj.Status.AccessModes) == 0 {
+		vObj.Status.AccessModes = append([]corev1.PersistentVolumeAccessMode(nil), vPV.Spec.AccessModes...)
+	}
+	storage, ok := vObj.Status.Capacity[corev1.ResourceStorage]
+	if vObj.Status.Capacity == nil || !ok || storage.IsZero() {
+		vObj.Status.Capacity = vPV.Spec.Capacity.DeepCopy()
+	}
+}
+
+func isExternalPopulatorPersistentVolumeForPVC(vPV *corev1.PersistentVolume, vObj *corev1.PersistentVolumeClaim, requireBoundPV bool) bool {
+	if requireBoundPV && vPV.Status.Phase != corev1.VolumeBound {
+		return false
+	}
+	if vPV.Spec.ClaimRef == nil ||
+		vPV.Spec.ClaimRef.Namespace != vObj.Namespace ||
+		vPV.Spec.ClaimRef.Name != vObj.Name {
+		return false
+	}
+	if vPV.Spec.ClaimRef.UID != "" && vPV.Spec.ClaimRef.UID != vObj.UID {
+		return false
+	}
+
+	return true
+}
+
+func isExternalPopulatorPopulateHelperPVCForTarget(helperPVC, targetPVC *corev1.PersistentVolumeClaim) bool {
+	if helperPVC == nil || targetPVC == nil || targetPVC.UID == "" {
+		return false
+	}
+
+	return helperPVC.Namespace == targetPVC.Namespace &&
+		helperPVC.Name == externalPopulatorPopulateHelperPrefix+string(targetPVC.UID) &&
+		helperPVC.DeletionTimestamp == nil
+}
+
+func externalPopulatorMaterializationRequest(hostNamespace string, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: hostNamespace,
+			Name:      externalPopulatorMaterializationRequestName(pObj),
+			Labels: map[string]string{
+				externalPopulatorMaterializationRequestLabel: "true",
+			},
+		},
+		Data: map[string]string{
+			"state":               externalPopulatorMaterializationStatePending,
+			"hostPVCNamespace":    pObj.Namespace,
+			"hostPVCName":         pObj.Name,
+			"virtualPVCNamespace": vObj.Namespace,
+			"virtualPVCName":      vObj.Name,
+			"virtualPVCUID":       string(vObj.UID),
+			"virtualPVName":       vPV.Name,
+			"virtualPVUID":        string(vPV.UID),
+			"dataSourceAPIGroup":  externalPopulatorDataSourceAPIGroup(vObj.Spec.DataSourceRef),
+			"dataSourceKind":      vObj.Spec.DataSourceRef.Kind,
+			"dataSourceName":      vObj.Spec.DataSourceRef.Name,
+			"populateFrom":        vPV.Annotations[legacyDataProtectionPopulateFromAnnotation],
+		},
+	}
+}
+
+func externalPopulatorMaterializationRequestName(pObj *corev1.PersistentVolumeClaim) string {
+	sum := sha256.Sum256([]byte(pObj.Namespace + "/" + pObj.Name))
+	return externalPopulatorMaterializationRequestPrefix + hex.EncodeToString(sum[:])[:16]
+}
+
+func isExternalPopulatorPVC(pvc *corev1.PersistentVolumeClaim) bool {
+	return hasExternalPopulatorDataSource(pvc)
+}
+
+func hasExternalPopulatorDataSource(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc.Spec.DataSourceRef == nil || pvc.Spec.DataSourceRef.Name == "" {
+		return false
+	}
+
+	switch pvc.Spec.DataSourceRef.Kind {
+	case "VolumeSnapshot", "PersistentVolumeClaim":
+		return false
+	default:
+		return true
+	}
+}
+
+func isVirtualPVCBound(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc.Spec.VolumeName == "" || pvc.Status.Phase != corev1.ClaimBound {
+		return false
+	}
+
+	storage, ok := pvc.Status.Capacity[corev1.ResourceStorage]
+	return ok && !storage.IsZero()
+}
+
+func isHostPVCWaitingForVolume(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc.Status.Phase == corev1.ClaimBound {
+		return false
+	}
+
+	storage, ok := pvc.Status.Capacity[corev1.ResourceStorage]
+	return !ok || storage.IsZero()
+}
+
+func isExternalPopulatorRestoreProvisionedWithoutDataRestore(pvc *corev1.PersistentVolumeClaim) bool {
+	for _, condition := range pvc.Status.Conditions {
+		if condition.Type == externalPopulatorRestoreConditionType &&
+			condition.Status == corev1.ConditionTrue &&
+			condition.Reason == externalPopulatorRestoreConditionReasonProvisioned {
+			return true
+		}
+	}
+
+	return false
+}
+
+func externalPopulatorNoDataRestoreCondition(pvc *corev1.PersistentVolumeClaim) *corev1.PersistentVolumeClaimCondition {
+	for i := range pvc.Status.Conditions {
+		condition := &pvc.Status.Conditions[i]
+		if condition.Type == externalPopulatorRestoreConditionType &&
+			condition.Status == corev1.ConditionTrue &&
+			condition.Reason == externalPopulatorRestoreConditionReasonProvisioned {
+			return condition
+		}
+		if condition.Type != externalPopulatorRestoreConditionType &&
+			condition.Type != externalPopulatorPopulateConditionType {
+			continue
+		}
+		if condition.Status == corev1.ConditionFalse ||
+			condition.Reason != externalPopulatorRestoreConditionReasonProcessing ||
+			!strings.Contains(condition.Message, externalPopulatorNoDataRestoreMessage) {
+			continue
+		}
+
+		return condition
+	}
+
+	return nil
+}
+
+func isExternalPopulatorRestoreProvisioningWithoutDataRestore(pvc *corev1.PersistentVolumeClaim) bool {
+	for _, condition := range pvc.Status.Conditions {
+		if condition.Type != externalPopulatorRestoreConditionType &&
+			condition.Type != externalPopulatorPopulateConditionType {
+			continue
+		}
+
+		if condition.Status == corev1.ConditionFalse ||
+			condition.Reason != externalPopulatorRestoreConditionReasonProcessing ||
+			!strings.Contains(condition.Message, externalPopulatorNoDataRestoreMessage) {
+			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
+func (s *persistentVolumeClaimSyncer) shouldBlockExternalPopulatorHostPVCUntilGuestBackupMaterialized(ctx *synccontext.SyncContext, vObj, pObj *corev1.PersistentVolumeClaim) (bool, error) {
+	ref := pObj.Spec.DataSourceRef
+	if !isDataProtectionBackupDataSourceRef(ref) {
+		return false, nil
+	}
+
+	noDataRestore, err := s.isExternalPopulatorNoDataRestorePVC(ctx, vObj)
+	if err != nil {
+		return false, err
+	}
+	if noDataRestore {
+		ctx.Log.Infof("block host external populator pvc because guest backup materialized without restored data: guestPVC=%s/%s guestUID=%s hostPVC=%s/%s dataSourceRef=%s",
+			vObj.Namespace,
+			vObj.Name,
+			vObj.UID,
+			pObj.Namespace,
+			pObj.Name,
+			externalPopulatorDataSourceRefDescription(ref),
+		)
+		return true, nil
+	}
+
+	if pObj.Spec.VolumeName != "" || vObj.Spec.VolumeName != "" {
+		clearExternalPopulatorHostDataSource(pObj)
+		return false, nil
+	}
+
+	ctx.Log.Infof("allow host external populator pvc to wait for guest backup materialization: guestPVC=%s/%s guestUID=%s hostPVC=%s/%s dataSourceRef=%s",
+		vObj.Namespace,
+		vObj.Name,
+		vObj.UID,
+		pObj.Namespace,
+		pObj.Name,
+		externalPopulatorDataSourceRefDescription(ref),
+	)
+	return false, nil
+}
+
+func isDataProtectionBackupDataSourceRef(ref *corev1.TypedObjectReference) bool {
+	return ref != nil &&
+		ref.Name != "" &&
+		ref.APIGroup != nil &&
+		*ref.APIGroup == dataProtectionAPIGroup &&
+		ref.Kind == dataProtectionBackupKind
+}
+
+func clearExternalPopulatorHostDataSource(pvc *corev1.PersistentVolumeClaim) {
+	pvc.Spec.DataSource = nil
+	pvc.Spec.DataSourceRef = nil
+}
+
+func clearExternalPopulatorHostDataSourceAfterGuestMaterialized(pObj, vObj *corev1.PersistentVolumeClaim) {
+	if pObj == nil || vObj == nil || !isDataProtectionBackupDataSourceRef(pObj.Spec.DataSourceRef) {
+		return
+	}
+	if pObj.Spec.VolumeName == "" && vObj.Spec.VolumeName == "" {
+		return
+	}
+
+	clearExternalPopulatorHostDataSource(pObj)
+}
+
+func (s *persistentVolumeClaimSyncer) shouldBackoffExternalPopulatorHostNoDataRestorePVC(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (bool, error) {
+	if !isHostPVCWaitingForVolume(pObj) ||
+		(!isExternalPopulatorDataSource(pObj.Spec.DataSource) && !isExternalPopulatorDataSourceRef(pObj.Spec.DataSourceRef)) {
+		return false, nil
+	}
+
+	noDataRestore, err := s.isExternalPopulatorNoDataRestorePVC(ctx, vObj)
+	if err != nil || !noDataRestore {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func logExternalPopulatorNoDataRestoreBackoff(log loghelper.Logger, pObj, vObj *corev1.PersistentVolumeClaim) {
+	condition := externalPopulatorNoDataRestoreCondition(vObj)
+	conditionType, conditionStatus, conditionReason, conditionMessage, transitionTime := "", "", "", "", ""
+	if condition != nil {
+		conditionType = string(condition.Type)
+		conditionStatus = string(condition.Status)
+		conditionReason = condition.Reason
+		conditionMessage = condition.Message
+		transitionTime = condition.LastTransitionTime.String()
+	}
+
+	hostDeletionTimestamp := ""
+	if pObj.DeletionTimestamp != nil {
+		hostDeletionTimestamp = pObj.DeletionTimestamp.String()
+	}
+
+	log.Infof("preserve host external populator pvc after no-data restore condition: guestPVC=%s/%s guestUID=%s hostPVC=%s/%s hostUID=%s hostResourceVersion=%s hostPhase=%s hostDeletionTimestamp=%s dataSourceRef=%s noDataConditionType=%s noDataConditionStatus=%s noDataConditionReason=%s noDataConditionMessage=%q noDataConditionLastTransitionTime=%s",
+		vObj.Namespace,
+		vObj.Name,
+		vObj.UID,
+		pObj.Namespace,
+		pObj.Name,
+		pObj.UID,
+		pObj.ResourceVersion,
+		pObj.Status.Phase,
+		hostDeletionTimestamp,
+		externalPopulatorDataSourceRefDescription(pObj.Spec.DataSourceRef),
+		conditionType,
+		conditionStatus,
+		conditionReason,
+		conditionMessage,
+		transitionTime,
+	)
+}
+
+func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorNoDataRestorePVCWhileHostDeleting(ctx *synccontext.SyncContext, vObj, pObj *corev1.PersistentVolumeClaim) (bool, error) {
+	noDataRestore, err := s.isExternalPopulatorNoDataRestorePVC(ctx, vObj)
+	if err != nil || noDataRestore {
+		return noDataRestore, err
+	}
+
+	return s.shouldPreserveDeletingExternalPopulatorPopulateHelper(ctx, vObj, pObj)
+}
+
+func (s *persistentVolumeClaimSyncer) shouldPreserveDeletingExternalPopulatorPopulateHelper(ctx *synccontext.SyncContext, helperVirtual, helperHost *corev1.PersistentVolumeClaim) (bool, error) {
+	if helperVirtual == nil || helperHost == nil || helperVirtual.DeletionTimestamp == nil || !strings.HasPrefix(helperVirtual.Name, externalPopulatorPopulateHelperPrefix) {
+		return false, nil
+	}
+
+	targetUID := strings.TrimPrefix(helperVirtual.Name, externalPopulatorPopulateHelperPrefix)
+	if targetUID == "" {
+		return false, nil
+	}
+
+	targetVirtual, ok, err := s.findExternalPopulatorTargetPVCByUID(ctx, helperVirtual.Namespace, types.UID(targetUID))
+	if err != nil || !ok {
+		return false, err
+	}
+
+	targetHostName := s.VirtualToHost(ctx, types.NamespacedName{Name: targetVirtual.Name, Namespace: targetVirtual.Namespace}, targetVirtual)
+	targetHost := &corev1.PersistentVolumeClaim{}
+	err = ctx.HostClient.Get(ctx.Context, targetHostName, targetHost)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if !isHostPVCWaitingForVolume(targetHost) {
+		return false, nil
+	}
+	if targetHost.Spec.VolumeName == "" || helperHost.Spec.VolumeName == "" {
+		return true, nil
+	}
+
+	return targetHost.Spec.VolumeName == helperHost.Spec.VolumeName, nil
+}
+
+func (s *persistentVolumeClaimSyncer) findExternalPopulatorTargetPVCByUID(ctx *synccontext.SyncContext, namespace string, uid types.UID) (*corev1.PersistentVolumeClaim, bool, error) {
+	if uid == "" {
+		return nil, false, nil
+	}
+
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err := ctx.VirtualClient.List(ctx.Context, pvcList, client.InNamespace(namespace))
+	if err != nil {
+		return nil, false, err
+	}
+
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if pvc.UID == uid && isExternalPopulatorPVC(pvc) && pvc.DeletionTimestamp == nil {
+			return pvc.DeepCopy(), true, nil
+		}
+	}
+
+	return nil, false, nil
+}
+
+func (s *persistentVolumeClaimSyncer) isExternalPopulatorNoDataRestorePVC(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (bool, error) {
+	if !isExternalPopulatorPVC(vObj) {
+		return false, nil
+	}
+
+	return isExternalPopulatorRestoreProvisionedWithoutDataRestore(vObj) ||
+		isExternalPopulatorRestoreProvisioningWithoutDataRestore(vObj), nil
+}
+
+func deleteExternalPopulatorNoDataRestoreHostPVC(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (ctrl.Result, error) {
+	result, err := patcher.DeleteHostObjectWithOptions(ctx, pObj, vObj, "external populator restore pvc was provisioned without data restore", &client.DeleteOptions{
+		GracePeriodSeconds: &zero,
+		Preconditions:      hostDeletePreconditions(pObj),
+	})
+	if kerrors.IsConflict(err) {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	return result, err
+}
+
+func hostDeletePreconditions(obj client.Object) *metav1.Preconditions {
+	preconditions := &metav1.Preconditions{}
+	if obj.GetUID() != "" {
+		uid := obj.GetUID()
+		preconditions.UID = &uid
+	}
+	if obj.GetResourceVersion() != "" {
+		resourceVersion := obj.GetResourceVersion()
+		preconditions.ResourceVersion = &resourceVersion
+	}
+	if preconditions.UID == nil && preconditions.ResourceVersion == nil {
+		return nil
+	}
+
+	return preconditions
+}
+
+func isExternalPopulatorDataSource(ref *corev1.TypedLocalObjectReference) bool {
+	if ref == nil || ref.Name == "" {
+		return false
+	}
+
+	switch ref.Kind {
+	case "VolumeSnapshot", "PersistentVolumeClaim":
+		return false
+	default:
+		return true
+	}
+}
+
+func isExternalPopulatorDataSourceRef(ref *corev1.TypedObjectReference) bool {
+	if ref == nil || ref.Name == "" {
+		return false
+	}
+
+	switch ref.Kind {
+	case "VolumeSnapshot", "PersistentVolumeClaim":
+		return false
+	default:
+		return true
+	}
+}
+
+func externalPopulatorDataSourceAPIGroup(ref *corev1.TypedObjectReference) string {
+	if ref == nil || ref.APIGroup == nil {
+		return ""
+	}
+
+	return *ref.APIGroup
+}
+
+func externalPopulatorDataSourceRefDescription(ref *corev1.TypedObjectReference) string {
+	if ref == nil {
+		return "<nil>"
+	}
+
+	return fmt.Sprintf("%s/%s/%s", externalPopulatorDataSourceAPIGroup(ref), ref.Kind, ref.Name)
 }
 
 func (s *persistentVolumeClaimSyncer) isHostVolumeRestoreInProgress(ctx *synccontext.SyncContext, pObj types.NamespacedName) (bool, error) {
