@@ -258,8 +258,6 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 			return ctrl.Result{Requeue: true}, nil
 		}
 	}
-	clearExternalPopulatorHostDataSourceAfterGuestMaterialized(event.Host, event.Virtual)
-
 	// patch objects
 	patch, err := patcher.NewSyncerPatcher(ctx, event.Host, event.Virtual, patcher.TranslatePatches(ctx.Config.Sync.ToHost.PersistentVolumeClaims.Patches, false))
 	if err != nil {
@@ -298,6 +296,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		return ctrl.Result{}, err
 	}
 	if preserveVirtualStatus {
+		clearExternalPopulatorHostDataSourceAfterGuestMaterialized(event.Host, event.Virtual)
 		err = s.ensureExternalPopulatorHostMaterialization(ctx, event.Host, event.Virtual, vPV)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -842,7 +841,7 @@ func clearExternalPopulatorHostDataSourceAfterGuestMaterialized(pObj, vObj *core
 	if pObj == nil || vObj == nil || !isDataProtectionBackupDataSourceRef(pObj.Spec.DataSourceRef) {
 		return
 	}
-	if pObj.Spec.VolumeName == "" && vObj.Spec.VolumeName == "" {
+	if vObj.Spec.VolumeName == "" || externalPopulatorNoDataRestoreCondition(vObj) == nil {
 		return
 	}
 
@@ -858,6 +857,24 @@ func (s *persistentVolumeClaimSyncer) shouldBackoffExternalPopulatorHostNoDataRe
 	noDataRestore, err := s.isExternalPopulatorNoDataRestorePVC(ctx, vObj)
 	if err != nil || !noDataRestore {
 		return false, err
+	}
+	if vObj.Spec.VolumeName != "" {
+		currentHost := &corev1.PersistentVolumeClaim{}
+		err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{
+			Namespace: pObj.Namespace,
+			Name:      pObj.Name,
+		}, currentHost)
+		if err != nil {
+			if kerrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if currentHost.Spec.VolumeName != "" || currentHost.Status.Phase == corev1.ClaimBound {
+			return true, nil
+		}
+
+		return false, nil
 	}
 
 	return true, nil
