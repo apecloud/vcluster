@@ -296,7 +296,6 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		return ctrl.Result{}, err
 	}
 	if preserveVirtualStatus {
-		clearExternalPopulatorHostDataSourceAfterGuestMaterialized(event.Host, event.Virtual)
 		err = s.ensureExternalPopulatorHostMaterialization(ctx, event.Host, event.Virtual, vPV)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -431,8 +430,10 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization
 		return err
 	}
 
-	pObj.Spec.VolumeName = hostPVName
-	return s.ensureExternalPopulatorHostPVClaimRef(ctx, hostPVName, pObj, helperPVC, helperFound)
+	if !shouldKeepExternalPopulatorHostPVCSpecImmutable(pObj, vObj) {
+		pObj.Spec.VolumeName = hostPVName
+	}
+	return s.ensureExternalPopulatorHostPVClaimRef(ctx, hostPVName, pObj, vObj, helperPVC, helperFound)
 }
 
 func (s *persistentVolumeClaimSyncer) upsertExternalPopulatorMaterializationRequest(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) error {
@@ -493,7 +494,7 @@ func (s *persistentVolumeClaimSyncer) findExternalPopulatorHelperPVC(ctx *syncco
 	return match, true, nil
 }
 
-func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx *synccontext.SyncContext, hostPVName string, pObj *corev1.PersistentVolumeClaim, helperPVC *corev1.PersistentVolumeClaim, helperFound bool) error {
+func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx *synccontext.SyncContext, hostPVName string, pObj, vObj *corev1.PersistentVolumeClaim, helperPVC *corev1.PersistentVolumeClaim, helperFound bool) error {
 	hostPV := &corev1.PersistentVolume{}
 	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, hostPV)
 	if err != nil {
@@ -513,19 +514,51 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 		}
 	} else if hostPV.Spec.ClaimRef != nil {
 		if !helperFound {
-			return fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
-		}
-		ok, err := s.hostPVClaimRefMatchesVirtualPVC(ctx, hostPV.Spec.ClaimRef, helperPVC)
-		if err != nil {
-			return err
-		} else if !ok {
-			return fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
+			if !s.hostPVClaimRefMatchesExpectedPopulateHelper(ctx, hostPV.Spec.ClaimRef, vObj) {
+				return fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
+			}
+		} else {
+			ok, err := s.hostPVClaimRefMatchesVirtualPVC(ctx, hostPV.Spec.ClaimRef, helperPVC)
+			if err != nil {
+				return err
+			} else if !ok {
+				return fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
+			}
 		}
 	}
 
 	updated := hostPV.DeepCopy()
 	updated.Spec.ClaimRef = targetRef
 	return ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(hostPV))
+}
+
+func shouldKeepExternalPopulatorHostPVCSpecImmutable(pObj, vObj *corev1.PersistentVolumeClaim) bool {
+	return pObj != nil &&
+		vObj != nil &&
+		pObj.Spec.VolumeName == "" &&
+		isHostPVCWaitingForVolume(pObj) &&
+		isDataProtectionBackupDataSourceRef(pObj.Spec.DataSourceRef) &&
+		vObj.Spec.VolumeName != "" &&
+		externalPopulatorNoDataRestoreCondition(vObj) != nil
+}
+
+func (s *persistentVolumeClaimSyncer) hostPVClaimRefMatchesExpectedPopulateHelper(ctx *synccontext.SyncContext, ref *corev1.ObjectReference, targetPVC *corev1.PersistentVolumeClaim) bool {
+	if ref == nil || targetPVC == nil || targetPVC.UID == "" {
+		return false
+	}
+
+	helperPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: targetPVC.Namespace,
+			Name:      externalPopulatorPopulateHelperPrefix + string(targetPVC.UID),
+		},
+	}
+	hostName := s.VirtualToHost(ctx, types.NamespacedName{
+		Namespace: helperPVC.Namespace,
+		Name:      helperPVC.Name,
+	}, helperPVC)
+
+	return ref.Namespace == hostName.Namespace && ref.Name == hostName.Name
 }
 
 func (s *persistentVolumeClaimSyncer) hostPVClaimRefMatchesVirtualPVC(ctx *synccontext.SyncContext, ref *corev1.ObjectReference, vPVC *corev1.PersistentVolumeClaim) (bool, error) {
