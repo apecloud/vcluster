@@ -1,8 +1,6 @@
 package persistentvolumeclaims
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -10,7 +8,6 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 
 	"github.com/pkg/errors"
-	"k8s.io/apimachinery/pkg/api/equality"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/klog/v2"
 
@@ -48,14 +45,10 @@ const (
 	storageProvisionerAnnotation = "volume.beta.kubernetes.io/storage-provisioner"
 	selectedNodeAnnotation       = "volume.kubernetes.io/selected-node"
 
-	legacyDataProtectionPopulateFromAnnotation = "dataprotection.kubeblocks.io/populate-from"
-	dataProtectionAPIGroup                     = "dataprotection.kubeblocks.io"
-	dataProtectionBackupKind                   = "Backup"
+	dataProtectionAPIGroup   = "dataprotection.kubeblocks.io"
+	dataProtectionBackupKind = "Backup"
 
-	externalPopulatorMaterializationRequestLabel  = "vcluster.loft.sh/external-populator-materialization-request"
-	externalPopulatorMaterializationRequestPrefix = "external-populator-materialization-"
-	externalPopulatorMaterializationStatePending  = "pending"
-	externalPopulatorPopulateHelperPrefix         = "kb-populate-"
+	externalPopulatorPopulateHelperPrefix = "kb-populate-"
 
 	externalPopulatorRestoreConditionType              = corev1.PersistentVolumeClaimConditionType("Restore")
 	externalPopulatorPopulateConditionType             = corev1.PersistentVolumeClaimConditionType("Populating")
@@ -296,11 +289,18 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		return ctrl.Result{}, err
 	}
 	if preserveVirtualStatus {
-		err = s.ensureExternalPopulatorHostMaterialization(ctx, event.Host, event.Virtual, vPV)
+		hostConverged, err := s.ensureExternalPopulatorHostMaterialization(ctx, event.Host, event.Virtual, vPV)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		ensureExternalPopulatorVirtualPopulateStatus(event.Virtual, vPV)
+		if hostConverged {
+			ensureExternalPopulatorVirtualPopulateStatus(event.Virtual, vPV)
+		} else {
+			// the populated host PV is missing or its claimRef has not been handed off
+			// to the target PVC yet; do NOT report the virtual PVC as Bound, keep it
+			// pending so the real state stays visible and retry
+			result = ctrl.Result{RequeueAfter: 2 * time.Second}
+		}
 	} else {
 		preserveExternalPopulatorStatus, err := s.shouldPreserveExternalPopulatorVirtualStatus(ctx, event.Host, event.Virtual)
 		if err != nil {
@@ -318,7 +318,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	event.Virtual.Annotations, event.Host.Annotations = translate.AnnotationsBidirectionalUpdate(event, s.excludedAnnotations...)
 	event.Virtual.Labels, event.Host.Labels = translate.LabelsBidirectionalUpdate(event)
 
-	return ctrl.Result{}, nil
+	return result, nil
 }
 
 func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*corev1.PersistentVolumeClaim]) (_ ctrl.Result, retErr error) {
@@ -425,51 +425,32 @@ func (s *persistentVolumeClaimSyncer) ensurePersistentVolume(ctx *synccontext.Sy
 	return false, nil
 }
 
-func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) error {
+// ensureExternalPopulatorHostMaterialization returns true only when the populated host
+// PV exists and its claimRef references the host target PVC. Callers must not report the
+// virtual PVC as Bound before that: a missing host PV means there is no volume behind
+// the claim (e.g. the populate helper was released and the PV got reclaimed), and there
+// is no host-side consumer that could re-materialize it on demand.
+func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) (bool, error) {
 	hostPVName := s.externalPopulatorHostPersistentVolumeName(ctx, vPV)
 	hostPV := &corev1.PersistentVolume{}
 	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, hostPV)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
-			return s.upsertExternalPopulatorMaterializationRequest(ctx, pObj, vObj, vPV)
+			ctx.Log.Infof("populated host pv %s for external populator pvc %s/%s not found, keeping virtual pvc pending", hostPVName, vObj.Namespace, vObj.Name)
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 
 	helperPVC, helperFound, err := s.findExternalPopulatorHelperPVC(ctx, vObj, vPV)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if !shouldKeepExternalPopulatorHostPVCSpecImmutable(pObj, vObj) {
 		pObj.Spec.VolumeName = hostPVName
 	}
 	return s.ensureExternalPopulatorHostPVClaimRef(ctx, hostPVName, pObj, vObj, helperPVC, helperFound)
-}
-
-func (s *persistentVolumeClaimSyncer) upsertExternalPopulatorMaterializationRequest(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) error {
-	desired := externalPopulatorMaterializationRequest(ctx.Config.HostNamespace, pObj, vObj, vPV)
-	existing := &corev1.ConfigMap{}
-	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{
-		Namespace: desired.Namespace,
-		Name:      desired.Name,
-	}, existing)
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			return ctx.HostClient.Create(ctx.Context, desired)
-		}
-		return err
-	}
-
-	updated := existing.DeepCopy()
-	updated.Labels = desired.Labels
-	updated.Data = desired.Data
-	if equality.Semantic.DeepEqual(existing.Labels, updated.Labels) &&
-		equality.Semantic.DeepEqual(existing.Data, updated.Data) {
-		return nil
-	}
-
-	return ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(existing))
 }
 
 func (s *persistentVolumeClaimSyncer) externalPopulatorHostPersistentVolumeName(ctx *synccontext.SyncContext, vPV *corev1.PersistentVolume) string {
@@ -505,11 +486,13 @@ func (s *persistentVolumeClaimSyncer) findExternalPopulatorHelperPVC(ctx *syncco
 	return match, true, nil
 }
 
-func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx *synccontext.SyncContext, hostPVName string, pObj, vObj *corev1.PersistentVolumeClaim, helperPVC *corev1.PersistentVolumeClaim, helperFound bool) error {
+// ensureExternalPopulatorHostPVClaimRef returns true when the host PV claimRef
+// references the host target PVC, either already or after a successful handoff patch.
+func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx *synccontext.SyncContext, hostPVName string, pObj, vObj *corev1.PersistentVolumeClaim, helperPVC *corev1.PersistentVolumeClaim, helperFound bool) (bool, error) {
 	hostPV := &corev1.PersistentVolume{}
 	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, hostPV)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	targetRef := &corev1.ObjectReference{
@@ -521,26 +504,31 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 	}
 	if claimRefReferencesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) {
 		if hostPV.Spec.ClaimRef.UID == pObj.UID {
-			return nil
+			return true, nil
 		}
 	} else if hostPV.Spec.ClaimRef != nil {
 		if !helperFound {
 			if !s.hostPVClaimRefMatchesExpectedPopulateHelper(ctx, hostPV.Spec.ClaimRef, vObj) {
-				return fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
+				return false, fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
 			}
 		} else {
 			ok, err := s.hostPVClaimRefMatchesVirtualPVC(ctx, hostPV.Spec.ClaimRef, helperPVC)
 			if err != nil {
-				return err
+				return false, err
 			} else if !ok {
-				return fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
+				return false, fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
 			}
 		}
 	}
 
 	updated := hostPV.DeepCopy()
 	updated.Spec.ClaimRef = targetRef
-	return ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(hostPV))
+	err = ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(hostPV))
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 func shouldKeepExternalPopulatorHostPVCSpecImmutable(pObj, vObj *corev1.PersistentVolumeClaim) bool {
@@ -707,37 +695,6 @@ func isExternalPopulatorPopulateHelperPVCForTarget(helperPVC, targetPVC *corev1.
 	return helperPVC.Namespace == targetPVC.Namespace &&
 		helperPVC.Name == externalPopulatorPopulateHelperPrefix+string(targetPVC.UID) &&
 		helperPVC.DeletionTimestamp == nil
-}
-
-func externalPopulatorMaterializationRequest(hostNamespace string, pObj, vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) *corev1.ConfigMap {
-	return &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: hostNamespace,
-			Name:      externalPopulatorMaterializationRequestName(pObj),
-			Labels: map[string]string{
-				externalPopulatorMaterializationRequestLabel: "true",
-			},
-		},
-		Data: map[string]string{
-			"state":               externalPopulatorMaterializationStatePending,
-			"hostPVCNamespace":    pObj.Namespace,
-			"hostPVCName":         pObj.Name,
-			"virtualPVCNamespace": vObj.Namespace,
-			"virtualPVCName":      vObj.Name,
-			"virtualPVCUID":       string(vObj.UID),
-			"virtualPVName":       vPV.Name,
-			"virtualPVUID":        string(vPV.UID),
-			"dataSourceAPIGroup":  externalPopulatorDataSourceAPIGroup(vObj.Spec.DataSourceRef),
-			"dataSourceKind":      vObj.Spec.DataSourceRef.Kind,
-			"dataSourceName":      vObj.Spec.DataSourceRef.Name,
-			"populateFrom":        vPV.Annotations[legacyDataProtectionPopulateFromAnnotation],
-		},
-	}
-}
-
-func externalPopulatorMaterializationRequestName(pObj *corev1.PersistentVolumeClaim) string {
-	sum := sha256.Sum256([]byte(pObj.Namespace + "/" + pObj.Name))
-	return externalPopulatorMaterializationRequestPrefix + hex.EncodeToString(sum[:])[:16]
 }
 
 func isExternalPopulatorPVC(pvc *corev1.PersistentVolumeClaim) bool {
