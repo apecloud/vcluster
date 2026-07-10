@@ -127,8 +127,39 @@ func (r *fakePersistentVolumeSyncer) pvNeeded(ctx *synccontext.SyncContext, pvNa
 	if err != nil {
 		return false, err
 	}
+	if len(pvcList.Items) > 0 {
+		return true, nil
+	}
 
-	return len(pvcList.Items) > 0, nil
+	// A fake PV whose claimRef still references a live PVC is still needed. An
+	// external populator re-points the PV's claimRef to the restore target PVC
+	// before the target's volumeName is derived from it; deleting the fake PV in
+	// that window would break the restore handoff to the populated host PV.
+	pv := &corev1.PersistentVolume{}
+	err = ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: pvName}, pv)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Kind != "PersistentVolumeClaim" {
+		return false, nil
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{}
+	err = ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: pv.Spec.ClaimRef.Name, Namespace: pv.Spec.ClaimRef.Namespace}, pvc)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if pvc.DeletionTimestamp != nil {
+		return false, nil
+	}
+
+	return pv.Spec.ClaimRef.UID == "" || pv.Spec.ClaimRef.UID == pvc.UID, nil
 }
 
 func CreateFakePersistentVolume(ctx context.Context, virtualClient client.Client, name types.NamespacedName, vPvc *corev1.PersistentVolumeClaim) error {

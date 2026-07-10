@@ -82,8 +82,25 @@ func TestFakeSync(t *testing.T) {
 	}
 	pvWithFinalizers := basePv.DeepCopy()
 	pvWithFinalizers.Finalizers = []string{"myfinalizer"}
+	// a restore target PVC whose volumeName is not derived yet, while the fake
+	// PV's claimRef was already re-pointed to it by an external populator
+	rePointedTargetPvc := basePvc.DeepCopy()
+	rePointedTargetPvc.Spec.VolumeName = ""
 
 	syncertesting.RunTests(t, []*syncertesting.SyncTest{
+		{
+			Name:                "Keep pv while claim ref references live pvc without volume name",
+			InitialVirtualState: []runtime.Object{basePv, rePointedTargetPvc},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {basePv},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {rePointedTargetPvc},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
+				_, err := syncer.FakeSync(syncContext, basePv.DeepCopy())
+				assert.NilError(t, err)
+			},
+		},
 		{
 			Name:                "Create",
 			InitialVirtualState: []runtime.Object{basePvc},
