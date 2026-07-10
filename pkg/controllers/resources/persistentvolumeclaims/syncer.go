@@ -323,6 +323,17 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 
 func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*corev1.PersistentVolumeClaim]) (_ ctrl.Result, retErr error) {
 	if event.VirtualOld != nil || translate.ShouldDeleteHostObject(event.Host) {
+		// the virtual populate helper PVC can be fully gone (finalizer removed) while
+		// the populated host PV still has to be handed off to the target PVC; deleting
+		// the host helper PVC in that window releases and possibly reclaims the PV
+		preserveOrphanedHelper, err := s.shouldPreserveOrphanedExternalPopulatorPopulateHelperHost(ctx, event.Host)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if preserveOrphanedHelper {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
 		// virtual object is not here anymore, so we delete
 		return patcher.DeleteHostObject(ctx, event.Host, event.VirtualOld, "virtual object was deleted")
 	}
@@ -972,12 +983,44 @@ func (s *persistentVolumeClaimSyncer) shouldPreserveDeletingExternalPopulatorPop
 		return false, err
 	}
 
+	return s.externalPopulatorHandoffPendingForTarget(ctx, targetVirtual, helperHost)
+}
+
+// shouldPreserveOrphanedExternalPopulatorPopulateHelperHost guards the SyncToVirtual
+// deletion path: the virtual helper PVC no longer exists at all, so the helper can only
+// be identified through the host object's virtual name mapping.
+func (s *persistentVolumeClaimSyncer) shouldPreserveOrphanedExternalPopulatorPopulateHelperHost(ctx *synccontext.SyncContext, helperHost *corev1.PersistentVolumeClaim) (bool, error) {
+	if helperHost == nil {
+		return false, nil
+	}
+
+	helperVirtualName := s.HostToVirtual(ctx, types.NamespacedName{Name: helperHost.Name, Namespace: helperHost.Namespace}, helperHost)
+	if helperVirtualName.Name == "" || !strings.HasPrefix(helperVirtualName.Name, externalPopulatorPopulateHelperPrefix) {
+		return false, nil
+	}
+
+	targetUID := strings.TrimPrefix(helperVirtualName.Name, externalPopulatorPopulateHelperPrefix)
+	if targetUID == "" {
+		return false, nil
+	}
+
+	targetVirtual, ok, err := s.findExternalPopulatorTargetPVCByUID(ctx, helperVirtualName.Namespace, types.UID(targetUID))
+	if err != nil || !ok {
+		return false, err
+	}
+
+	return s.externalPopulatorHandoffPendingForTarget(ctx, targetVirtual, helperHost)
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorHandoffPendingForTarget(ctx *synccontext.SyncContext, targetVirtual, helperHost *corev1.PersistentVolumeClaim) (bool, error) {
 	targetHostName := s.VirtualToHost(ctx, types.NamespacedName{Name: targetVirtual.Name, Namespace: targetVirtual.Namespace}, targetVirtual)
 	targetHost := &corev1.PersistentVolumeClaim{}
-	err = ctx.HostClient.Get(ctx.Context, targetHostName, targetHost)
+	err := ctx.HostClient.Get(ctx.Context, targetHostName, targetHost)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
-			return false, nil
+			// the host target PVC does not exist yet; releasing the helper now would
+			// reclaim the populated PV before the handoff can happen
+			return true, nil
 		}
 		return false, err
 	}

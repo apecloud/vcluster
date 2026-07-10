@@ -1459,6 +1459,67 @@ func TestSync(t *testing.T) {
 				assert.NilError(t, err)
 			},
 		},
+		{
+			Name: "Preserve orphaned host populate helper pvc in sync to virtual while target handoff is pending",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostPopulateHelperPvc.DeepCopy(),
+				dataProtectionHostPendingPvcWithUID.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostPopulateHelperPvc.DeepCopy(),
+					dataProtectionHostPendingPvcWithUID.DeepCopy(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).SyncToVirtual(syncCtx, synccontext.NewSyncToVirtualEvent(
+					dataProtectionHostPopulateHelperPvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, 2*time.Second)
+			},
+		},
+		{
+			Name: "Delete orphaned host populate helper pvc in sync to virtual after target handoff converged",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionBackupPvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostPopulateHelperPvc.DeepCopy(),
+				dataProtectionDataRestoreHostPvc.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionBackupPvc.DeepCopy(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionDataRestoreHostPvc.DeepCopy(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).SyncToVirtual(syncCtx, synccontext.NewSyncToVirtualEvent(
+					dataProtectionHostPopulateHelperPvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, time.Duration(0))
+			},
+		},
 	})
 }
 
