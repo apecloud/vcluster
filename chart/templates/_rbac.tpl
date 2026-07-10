@@ -49,6 +49,7 @@
     .Values.integrations.istio.enabled
     .Values.sync.toHost.namespaces.enabled
     (include "vcluster.enableVolumeSnapshotRules" .)
+    (and .Values.sync.toHost.persistentVolumeClaims.enabled (not .Values.sync.toHost.persistentVolumes.enabled))
      -}}
 {{- true -}}
 {{- end -}}
