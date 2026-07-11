@@ -1,8 +1,15 @@
 package storageclasses
 
 import (
+	"context"
+	"errors"
 	"testing"
 
+	vclusterconfig "github.com/loft-sh/vcluster/config"
+	"github.com/loft-sh/vcluster/pkg/config"
+	"github.com/loft-sh/vcluster/pkg/pro"
+	"github.com/loft-sh/vcluster/pkg/scheme"
+	coresyncer "github.com/loft-sh/vcluster/pkg/syncer"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	syncertesting "github.com/loft-sh/vcluster/pkg/syncer/testing"
 	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
@@ -12,6 +19,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func TestFromHostSync(t *testing.T) {
@@ -48,6 +58,10 @@ func TestFromHostSync(t *testing.T) {
 		},
 		Provisioner: "my-provisioner",
 	}
+	guestOnlyObject := vObject.DeepCopy()
+	vObject.Annotations[translate.ControllerLabel] = "host-storageclass"
+	nonMatchingHostObject := pObject.DeepCopy()
+	nonMatchingHostObject.Labels = map[string]string{"sync": "false"}
 	pObjectUpdated := pObject.DeepCopy()
 	pObjectUpdated.Labels["example.com/label-c"] = "test-3"
 	pObjectUpdated.Annotations["example.com/annotation-c"] = "test-3"
@@ -94,10 +108,59 @@ func TestFromHostSync(t *testing.T) {
 			},
 		},
 		{
+			Name:                 "Preserve unowned virtual resource after host stops matching selector",
+			InitialPhysicalState: []runtime.Object{nonMatchingHostObject.DeepCopy()},
+			InitialVirtualState:  []runtime.Object{guestOnlyObject.DeepCopy()},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {nonMatchingHostObject},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {guestOnlyObject},
+			},
+			AdjustConfig: requireSyncLabel,
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncerCtx, syncer := newFakeSyncer(t, ctx)
+				_, err := syncer.Sync(syncerCtx, synccontext.NewSyncEvent(nonMatchingHostObject.DeepCopy(), guestOnlyObject.DeepCopy()))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                 "Delete owned virtual resource after host stops matching selector",
+			InitialPhysicalState: []runtime.Object{nonMatchingHostObject.DeepCopy()},
+			InitialVirtualState:  []runtime.Object{vObject.DeepCopy()},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {nonMatchingHostObject},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {},
+			},
+			AdjustConfig: requireSyncLabel,
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncerCtx, syncer := newFakeSyncer(t, ctx)
+				_, err := syncer.Sync(syncerCtx, synccontext.NewSyncEvent(nonMatchingHostObject.DeepCopy(), vObject.DeepCopy()))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                 "Preserve guest-only storage class when host resource is absent",
+			InitialPhysicalState: []runtime.Object{},
+			InitialVirtualState:  []runtime.Object{guestOnlyObject.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {guestOnlyObject},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncerCtx, syncer := newFakeSyncer(t, ctx)
+				_, err := syncer.SyncToHost(syncerCtx, synccontext.NewSyncToHostEvent(guestOnlyObject.DeepCopy()))
+				assert.NilError(t, err)
+			},
+		},
+		{
 			Name:                 "Delete virtual resources after host resource has been deleted",
-			InitialPhysicalState: []runtime.Object{},                             // host resource has been deleted
-			InitialVirtualState:  []runtime.Object{vObject.DeepCopy()},           // virtual resource exists, since it was previously synced
-			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{}, // virtual resource has been deleted after syncing
+			InitialPhysicalState: []runtime.Object{},                   // host resource has been deleted
+			InitialVirtualState:  []runtime.Object{vObject.DeepCopy()}, // virtual resource exists, since it was previously synced
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {},
+			}, // virtual resource has been deleted after syncing
 			Sync: func(ctx *synccontext.RegisterContext) {
 				syncerCtx, syncer := newFakeSyncer(t, ctx)
 				_, err := syncer.SyncToHost(syncerCtx, synccontext.NewSyncToHostEvent(vObject.DeepCopy()))
@@ -105,6 +168,121 @@ func TestFromHostSync(t *testing.T) {
 			},
 		},
 	})
+}
+
+func TestFromHostReconcileAdoptsThenDeletes(t *testing.T) {
+	translate.Default = translate.NewSingleNamespaceTranslator(testingutil.DefaultTestTargetNamespace)
+	const storageClassName = "legacy-unmarked-storageclass"
+	host := &storagev1.StorageClass{
+		ObjectMeta:  metav1.ObjectMeta{Name: storageClassName},
+		Provisioner: "host-provisioner",
+	}
+	legacyVirtual := host.DeepCopy()
+
+	syncertesting.RunTests(t, []*syncertesting.SyncTest{
+		{
+			Name:                 "Adopt unmarked host-backed virtual resource and preserve deletion propagation",
+			InitialPhysicalState: []runtime.Object{host.DeepCopy()},
+			InitialVirtualState:  []runtime.Object{legacyVirtual.DeepCopy()},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				_, object := newFakeSyncer(t, ctx)
+				controller, err := coresyncer.NewSyncController(ctx, object)
+				assert.NilError(t, err)
+				request := ctrl.Request{NamespacedName: types.NamespacedName{Name: storageClassName}}
+
+				_, err = controller.Reconcile(ctx, request)
+				assert.NilError(t, err)
+				adopted := &storagev1.StorageClass{}
+				err = ctx.VirtualManager.GetClient().Get(context.Background(), client.ObjectKey{Name: storageClassName}, adopted)
+				assert.NilError(t, err)
+				assert.Equal(t, adopted.Annotations[translate.ControllerLabel], object.Name())
+
+				err = ctx.HostManager.GetClient().Delete(context.Background(), host.DeepCopy())
+				assert.NilError(t, err)
+				_, err = controller.Reconcile(ctx, request)
+				assert.NilError(t, err)
+			},
+		},
+	})
+}
+
+func TestFromHostSyncReassertsOwnershipAfterPatches(t *testing.T) {
+	originalPatch := pro.ApplyPatchesVirtualObject
+	pro.ApplyPatchesVirtualObject = func(_ *synccontext.SyncContext, _, obj, _ client.Object, _ []vclusterconfig.TranslatePatch, _ bool) error {
+		storageClass := obj.(*storagev1.StorageClass)
+		delete(storageClass.Annotations, translate.ControllerLabel)
+		return nil
+	}
+	t.Cleanup(func() { pro.ApplyPatchesVirtualObject = originalPatch })
+
+	host := &storagev1.StorageClass{
+		ObjectMeta:  metav1.ObjectMeta{Name: "patch-order-storageclass"},
+		Provisioner: "host-provisioner",
+	}
+	virtual := host.DeepCopy()
+	virtual.Provisioner = "old-provisioner"
+	pClient := testingutil.NewFakeClient(scheme.Scheme, host.DeepCopy())
+	vClient := testingutil.NewFakeClient(scheme.Scheme, virtual.DeepCopy())
+	registerCtx := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), pClient, vClient)
+	syncCtx, syncer := newFakeSyncer(t, registerCtx)
+	current := &storagev1.StorageClass{}
+	assert.NilError(t, vClient.Get(context.Background(), client.ObjectKey{Name: virtual.Name}, current))
+
+	_, err := syncer.Sync(syncCtx, synccontext.NewSyncEvent(host, current))
+	assert.NilError(t, err)
+	got := &storagev1.StorageClass{}
+	assert.NilError(t, vClient.Get(context.Background(), client.ObjectKey{Name: virtual.Name}, got))
+	assert.Equal(t, got.Annotations[translate.ControllerLabel], syncer.Name())
+}
+
+func TestFromHostSyncPatchErrorDoesNotPersistPartialState(t *testing.T) {
+	injectedError := errors.New("injected patch failure")
+	originalPatch := pro.ApplyPatchesVirtualObject
+	pro.ApplyPatchesVirtualObject = func(_ *synccontext.SyncContext, _, obj, _ client.Object, _ []vclusterconfig.TranslatePatch, _ bool) error {
+		storageClass := obj.(*storagev1.StorageClass)
+		delete(storageClass.Annotations, translate.ControllerLabel)
+		return injectedError
+	}
+	t.Cleanup(func() { pro.ApplyPatchesVirtualObject = originalPatch })
+
+	host := &storagev1.StorageClass{
+		ObjectMeta:  metav1.ObjectMeta{Name: "patch-error-storageclass"},
+		Provisioner: "new-host-provisioner",
+	}
+	virtual := &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: host.Name,
+			Annotations: map[string]string{
+				translate.ControllerLabel: "host-storageclass",
+			},
+		},
+		Provisioner: "old-virtual-provisioner",
+	}
+	pClient := testingutil.NewFakeClient(scheme.Scheme, host.DeepCopy())
+	vClient := testingutil.NewFakeClient(scheme.Scheme, virtual.DeepCopy())
+	registerCtx := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), pClient, vClient)
+	syncCtx, syncer := newFakeSyncer(t, registerCtx)
+	current := &storagev1.StorageClass{}
+	assert.NilError(t, vClient.Get(context.Background(), client.ObjectKey{Name: virtual.Name}, current))
+
+	_, err := syncer.Sync(syncCtx, synccontext.NewSyncEvent(host, current))
+	assert.ErrorContains(t, err, injectedError.Error())
+	got := &storagev1.StorageClass{}
+	assert.NilError(t, vClient.Get(context.Background(), client.ObjectKey{Name: virtual.Name}, got))
+	assert.Equal(t, got.Annotations[translate.ControllerLabel], syncer.Name())
+	assert.Equal(t, got.Provisioner, virtual.Provisioner)
+}
+
+func requireSyncLabel(vConfig *config.VirtualClusterConfig) {
+	vConfig.Sync.FromHost.StorageClasses.Selector = vclusterconfig.StandardLabelSelector{
+		MatchLabels: map[string]string{"sync": "true"},
+	}
 }
 
 func newFakeSyncer(t *testing.T, ctx *synccontext.RegisterContext) (*synccontext.SyncContext, *hostStorageClassSyncer) {
