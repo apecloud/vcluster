@@ -34,6 +34,14 @@ type hostStorageClassSyncer struct {
 	syncertypes.GenericTranslator
 }
 
+var _ syncertypes.OptionsProvider = &hostStorageClassSyncer{}
+
+func (s *hostStorageClassSyncer) Options() *syncertypes.Options {
+	return &syncertypes.Options{
+		DisableUIDDeletion: true,
+	}
+}
+
 func (s *hostStorageClassSyncer) UseUncachedPhysicalClient() bool {
 	return false
 }
@@ -46,12 +54,12 @@ func (s *hostStorageClassSyncer) Resource() client.Object {
 	return &storagev1.StorageClass{}
 }
 
-func (s *hostStorageClassSyncer) IsManaged(ctx *synccontext.SyncContext, pObj client.Object) (bool, error) {
+func (s *hostStorageClassSyncer) HostToVirtual(ctx *synccontext.SyncContext, req types.NamespacedName, pObj client.Object) types.NamespacedName {
 	if isVClusterManagedHostStorageClass(pObj) {
-		return false, nil
+		return types.NamespacedName{}
 	}
 
-	return s.GenericTranslator.IsManaged(ctx, pObj)
+	return s.GenericTranslator.HostToVirtual(ctx, req, pObj)
 }
 
 var _ syncertypes.Syncer = &hostStorageClassSyncer{}
