@@ -48,7 +48,8 @@ const (
 	dataProtectionAPIGroup   = "dataprotection.kubeblocks.io"
 	dataProtectionBackupKind = "Backup"
 
-	externalPopulatorPopulateHelperPrefix = "kb-populate-"
+	externalPopulatorPopulateHelperPrefix            = "kb-populate-"
+	externalPopulatorHelperAbsenceObservedAnnotation = "vcluster.loft.sh/external-populator-helper-absence-observed"
 
 	externalPopulatorRestoreConditionType              = corev1.PersistentVolumeClaimConditionType("Restore")
 	externalPopulatorPopulateConditionType             = corev1.PersistentVolumeClaimConditionType("Populating")
@@ -68,7 +69,7 @@ func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
 		GenericTranslator: translator.NewGenericTranslator(ctx, "persistent-volume-claim", &corev1.PersistentVolumeClaim{}, mapper),
 		Importer:          pro.NewImporter(mapper),
 
-		excludedAnnotations: []string{bindCompletedAnnotation, boundByControllerAnnotation, storageProvisionerAnnotation},
+		excludedAnnotations: []string{bindCompletedAnnotation, boundByControllerAnnotation, storageProvisionerAnnotation, externalPopulatorHelperAbsenceObservedAnnotation},
 
 		storageClassesEnabled:    ctx.Config.Sync.ToHost.StorageClasses.Enabled,
 		schedulerEnabled:         ctx.Config.SchedulingInVirtualClusterEnabled(),
@@ -502,20 +503,6 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 	if err != nil {
 		return false, err
 	}
-	if !helperFound {
-		if ctx.VirtualAPIReader == nil {
-			return false, fmt.Errorf("virtual API reader is required to revalidate populate helper absence before patching host pv %s", hostPVName)
-		}
-		helperFound, err = externalPopulatorPopulateHelperExistsWithReader(ctx, ctx.VirtualAPIReader, vObj)
-		if err != nil {
-			return false, err
-		}
-		if helperFound {
-			ctx.Log.Infof("wait for newly observed virtual populate helper to disappear before patching host pv claimRef: hostPV=%s targetPVC=%s/%s", hostPVName, pObj.Namespace, pObj.Name)
-			return false, nil
-		}
-	}
-
 	targetRef := &corev1.ObjectReference{
 		APIVersion: corev1.SchemeGroupVersion.Version,
 		Kind:       "PersistentVolumeClaim",
@@ -524,6 +511,7 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 		UID:        pObj.UID,
 	}
 	if helperFound {
+		clearExternalPopulatorHelperAbsenceObservation(pObj)
 		if hostPV.Spec.ClaimRef == nil {
 			return false, fmt.Errorf("host pv %s has no claimRef while virtual populate helper pvc %s/%s exists", hostPVName, helperPVC.Namespace, helperPVC.Name)
 		}
@@ -545,6 +533,7 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 
 	if claimRefReferencesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) {
 		if hostPV.Spec.ClaimRef.UID == pObj.UID {
+			clearExternalPopulatorHelperAbsenceObservation(pObj)
 			return true, nil
 		}
 	} else if hostPV.Spec.ClaimRef != nil {
@@ -553,14 +542,65 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 		}
 	}
 
+	if ctx.VirtualAPIReader == nil {
+		return false, fmt.Errorf("virtual API reader is required to revalidate populate helper absence before patching host pv %s", hostPVName)
+	}
+	helperFound, err = externalPopulatorPopulateHelperExistsWithReader(ctx, ctx.VirtualAPIReader, vObj)
+	if err != nil {
+		return false, err
+	}
+	if helperFound {
+		clearExternalPopulatorHelperAbsenceObservation(pObj)
+		ctx.Log.Infof("wait for newly observed virtual populate helper to disappear before patching host pv claimRef: hostPV=%s targetPVC=%s/%s", hostPVName, pObj.Namespace, pObj.Name)
+		return false, nil
+	}
+	if !hasExternalPopulatorHelperAbsenceObservation(pObj, vObj) {
+		setExternalPopulatorHelperAbsenceObservation(pObj, vObj)
+		ctx.Log.Infof("record first helper-absence observation before a later reconcile may patch host pv claimRef: hostPV=%s targetPVC=%s/%s", hostPVName, pObj.Namespace, pObj.Name)
+		return false, nil
+	}
+
 	updated := hostPV.DeepCopy()
 	updated.Spec.ClaimRef = targetRef
 	err = ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(hostPV))
 	if err != nil {
 		return false, err
 	}
+	clearExternalPopulatorHelperAbsenceObservation(pObj)
 
 	return true, nil
+}
+
+func externalPopulatorHelperAbsenceObservationValue(vObj *corev1.PersistentVolumeClaim) string {
+	if vObj == nil {
+		return ""
+	}
+	return string(vObj.UID) + "/" + vObj.Spec.VolumeName
+}
+
+func hasExternalPopulatorHelperAbsenceObservation(pObj, vObj *corev1.PersistentVolumeClaim) bool {
+	if pObj == nil || pObj.Annotations == nil {
+		return false
+	}
+	value := externalPopulatorHelperAbsenceObservationValue(vObj)
+	return value != "" && pObj.Annotations[externalPopulatorHelperAbsenceObservedAnnotation] == value
+}
+
+func setExternalPopulatorHelperAbsenceObservation(pObj, vObj *corev1.PersistentVolumeClaim) {
+	if pObj == nil {
+		return
+	}
+	if pObj.Annotations == nil {
+		pObj.Annotations = map[string]string{}
+	}
+	pObj.Annotations[externalPopulatorHelperAbsenceObservedAnnotation] = externalPopulatorHelperAbsenceObservationValue(vObj)
+}
+
+func clearExternalPopulatorHelperAbsenceObservation(pObj *corev1.PersistentVolumeClaim) {
+	if pObj == nil || pObj.Annotations == nil {
+		return
+	}
+	delete(pObj.Annotations, externalPopulatorHelperAbsenceObservedAnnotation)
 }
 
 func shouldKeepExternalPopulatorHostPVCSpecImmutable(pObj, vObj *corev1.PersistentVolumeClaim) bool {

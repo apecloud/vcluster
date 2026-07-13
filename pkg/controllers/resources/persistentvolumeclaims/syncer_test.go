@@ -333,6 +333,8 @@ func TestSync(t *testing.T) {
 		},
 	}
 	dataProtectionNoDataHostPendingWithBackupSource.ResourceVersion = "1"
+	dataProtectionNoDataHostPendingWithBackupSourceAndAbsenceObservation := dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()
+	setExternalPopulatorHelperAbsenceObservation(dataProtectionNoDataHostPendingWithBackupSourceAndAbsenceObservation, dataProtectionNoDataRestorePvcWithVolumeName)
 	dataProtectionHostPendingWithBackupSource := dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()
 	dataProtectionHostPendingWithBackupSource.Spec.DataSource = nil
 	dataProtectionHostPendingWithBackupSource.ResourceVersion = ""
@@ -947,7 +949,23 @@ func TestSync(t *testing.T) {
 					dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
 				))
 				assert.NilError(t, err)
-				assert.Check(t, result.RequeueAfter == 0)
+				assert.Equal(t, result.RequeueAfter, 2*time.Second)
+
+				currentHost := &corev1.PersistentVolumeClaim{}
+				err = syncCtx.HostClient.Get(syncCtx, client.ObjectKeyFromObject(dataProtectionNoDataHostPendingWithBackupSource), currentHost)
+				assert.NilError(t, err)
+				currentVirtual := &corev1.PersistentVolumeClaim{}
+				err = syncCtx.VirtualClient.Get(syncCtx, client.ObjectKeyFromObject(dataProtectionNoDataRestorePvcWithVolumeName), currentVirtual)
+				assert.NilError(t, err)
+
+				result, err = syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					currentHost.DeepCopy(),
+					currentHost.DeepCopy(),
+					currentVirtual.DeepCopy(),
+					currentVirtual.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.IsZero())
 			},
 		},
 		{
@@ -1319,7 +1337,7 @@ func TestSync(t *testing.T) {
 				dataProtectionPopulatedPV.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
-				dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+				dataProtectionNoDataHostPendingWithBackupSourceAndAbsenceObservation.DeepCopy(),
 				dataProtectionHostPopulateHelperPvc.DeepCopy(),
 				dataProtectionHostPVBoundToHelper.DeepCopy(),
 			},
@@ -1350,8 +1368,8 @@ func TestSync(t *testing.T) {
 				syncCtx.HostClient = raceClient
 
 				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
-					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
-					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataHostPendingWithBackupSourceAndAbsenceObservation.DeepCopy(),
+					dataProtectionNoDataHostPendingWithBackupSourceAndAbsenceObservation.DeepCopy(),
 					dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
 					dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
 				))
@@ -1386,11 +1404,27 @@ func TestSync(t *testing.T) {
 				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
 				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
 
-				_, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
 					dataProtectionHostPendingPvcWithObjectUID.DeepCopy(),
 					dataProtectionHostPendingPvcWithObjectUID.DeepCopy(),
 					dataProtectionBackupPvc.DeepCopy(),
 					dataProtectionBackupPvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, 2*time.Second)
+
+				currentHost := &corev1.PersistentVolumeClaim{}
+				err = syncCtx.HostClient.Get(syncCtx, client.ObjectKeyFromObject(dataProtectionHostPendingPvcWithObjectUID), currentHost)
+				assert.NilError(t, err)
+				currentVirtual := &corev1.PersistentVolumeClaim{}
+				err = syncCtx.VirtualClient.Get(syncCtx, client.ObjectKeyFromObject(dataProtectionBackupPvc), currentVirtual)
+				assert.NilError(t, err)
+
+				_, err = syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					currentHost.DeepCopy(),
+					currentHost.DeepCopy(),
+					currentVirtual.DeepCopy(),
+					currentVirtual.DeepCopy(),
 				))
 				assert.NilError(t, err)
 			},
