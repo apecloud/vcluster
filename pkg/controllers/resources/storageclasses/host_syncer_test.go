@@ -639,6 +639,37 @@ func TestFromHostSyncToHostPreservesReplacedVirtualStorageClass(t *testing.T) {
 	}
 }
 
+func TestManagedHostSyncPreservesReplacedVirtualStorageClass(t *testing.T) {
+	managedHost := &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "managed-replaced-storageclass",
+			Labels: map[string]string{translate.MarkerLabel: "other-vcluster"},
+		},
+	}
+	staleOwned := &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        managedHost.Name,
+			UID:         types.UID("old-owned-uid"),
+			Annotations: map[string]string{translate.ControllerLabel: "host-storageclass"},
+		},
+	}
+	currentUnowned := staleOwned.DeepCopy()
+	currentUnowned.UID = types.UID("new-unowned-uid")
+	currentUnowned.Annotations = nil
+
+	pClient := testingutil.NewFakeClient(scheme.Scheme, managedHost.DeepCopy())
+	vClient := testingutil.NewFakeClient(scheme.Scheme, currentUnowned.DeepCopy())
+	registerCtx := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), pClient, vClient)
+	syncCtx, syncer := newFakeSyncer(t, registerCtx)
+
+	_, err := syncer.Sync(syncCtx, synccontext.NewSyncEvent(managedHost, staleOwned))
+	assert.NilError(t, err)
+	got := &storagev1.StorageClass{}
+	assert.NilError(t, vClient.Get(context.Background(), client.ObjectKey{Name: currentUnowned.Name}, got))
+	assert.Equal(t, got.UID, currentUnowned.UID)
+	assert.Equal(t, got.Annotations[translate.ControllerLabel], "")
+}
+
 func requireSyncLabel(vConfig *config.VirtualClusterConfig) {
 	vConfig.Sync.FromHost.StorageClasses.Selector = vclusterconfig.StandardLabelSelector{
 		MatchLabels: map[string]string{"sync": "true"},

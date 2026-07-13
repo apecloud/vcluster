@@ -105,7 +105,7 @@ func (s *hostStorageClassSyncer) Sync(ctx *synccontext.SyncContext, event *syncc
 				ctx.Log.Infof("preserve virtual storage class %q because managed host object has the same name but the virtual object is not owned by %s", event.Virtual.Name, s.Name())
 				return ctrl.Result{}, nil
 			}
-			return patcher.DeleteVirtualObject(ctx, event.Virtual, event.Host, fmt.Sprintf("storage class %q is managed by a vCluster and must not be mirrored from the host", event.Host.Name))
+			return s.deleteOwnedVirtual(ctx, event.Virtual, event.Host, fmt.Sprintf("storage class %q is managed by a vCluster and must not be mirrored from the host", event.Host.Name))
 		}
 
 		return ctrl.Result{}, nil
