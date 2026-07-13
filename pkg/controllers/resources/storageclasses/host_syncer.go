@@ -5,6 +5,8 @@ import (
 	"maps"
 
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -118,8 +120,26 @@ func (s *hostStorageClassSyncer) Sync(ctx *synccontext.SyncContext, event *syncc
 			ctx.Log.Infof("preserve virtual storage class %q because it is not owned by %s", event.Virtual.Name, s.Name())
 			return ctrl.Result{}, nil
 		}
-		return patcher.DeleteVirtualObject(ctx, event.Virtual, event.Host, fmt.Sprintf("did not sync storage class %q because it does not match the selector under 'sync.fromHost.storageClasses.selector'", event.Host.Name))
+		return s.deleteOwnedVirtual(ctx, event.Virtual, event.Host, fmt.Sprintf("did not sync storage class %q because it does not match the selector under 'sync.fromHost.storageClasses.selector'", event.Host.Name))
 	}
+
+	// Build the desired object on a copy so a transform error cannot be
+	// persisted by the patcher or leak into the host object through aliases.
+	hostDesired := event.Host.DeepCopy()
+	desired := event.Virtual.DeepCopy()
+	desired.Annotations = maps.Clone(hostDesired.Annotations)
+	desired.Labels = maps.Clone(hostDesired.Labels)
+	desired.Provisioner = hostDesired.Provisioner
+	desired.Parameters = maps.Clone(hostDesired.Parameters)
+	desired.ReclaimPolicy = hostDesired.ReclaimPolicy
+	desired.MountOptions = hostDesired.MountOptions
+	desired.AllowVolumeExpansion = hostDesired.AllowVolumeExpansion
+	desired.VolumeBindingMode = hostDesired.VolumeBindingMode
+	desired.AllowedTopologies = hostDesired.AllowedTopologies
+	if err := pro.ApplyPatchesVirtualObject(ctx, nil, desired, event.Host, ctx.Config.Sync.FromHost.StorageClasses.Patches, true); err != nil {
+		return ctrl.Result{}, fmt.Errorf("error applying patches: %w", err)
+	}
+	markOwnedVirtual(desired, s.Name())
 
 	patch, err := patcher.NewSyncerPatcher(ctx, event.Host, event.Virtual)
 	if err != nil {
@@ -131,22 +151,6 @@ func (s *hostStorageClassSyncer) Sync(ctx *synccontext.SyncContext, event *syncc
 		}
 	}()
 
-	// Build the desired object on a copy so a transform error cannot be
-	// persisted by the deferred patcher.
-	desired := event.Virtual.DeepCopy()
-	desired.Annotations = maps.Clone(event.Host.Annotations)
-	desired.Labels = maps.Clone(event.Host.Labels)
-	desired.Provisioner = event.Host.Provisioner
-	desired.Parameters = maps.Clone(event.Host.Parameters)
-	desired.ReclaimPolicy = event.Host.ReclaimPolicy
-	desired.MountOptions = event.Host.MountOptions
-	desired.AllowVolumeExpansion = event.Host.AllowVolumeExpansion
-	desired.VolumeBindingMode = event.Host.VolumeBindingMode
-	desired.AllowedTopologies = event.Host.AllowedTopologies
-	if err := pro.ApplyPatchesVirtualObject(ctx, nil, desired, event.Host, ctx.Config.Sync.FromHost.StorageClasses.Patches, true); err != nil {
-		return ctrl.Result{}, fmt.Errorf("error applying patches: %w", err)
-	}
-	markOwnedVirtual(desired, s.Name())
 	*event.Virtual = *desired
 	return ctrl.Result{}, nil
 }
@@ -156,8 +160,33 @@ func (s *hostStorageClassSyncer) SyncToHost(ctx *synccontext.SyncContext, event 
 		ctx.Log.Infof("preserve virtual storage class %q because physical object is missing and it is not owned by %s", event.Virtual.Name, s.Name())
 		return ctrl.Result{}, nil
 	}
-	ctx.Log.Infof("delete virtual storage class %s, because physical object is missing", event.Virtual)
-	return ctrl.Result{}, ctx.VirtualClient.Delete(ctx, event.Virtual)
+	return s.deleteOwnedVirtual(ctx, event.Virtual, nil, "physical object is missing")
+}
+
+func (s *hostStorageClassSyncer) deleteOwnedVirtual(ctx *synccontext.SyncContext, eventVirtual, eventHost *storagev1.StorageClass, reason string) (ctrl.Result, error) {
+	current := &storagev1.StorageClass{}
+	if err := ctx.VirtualClient.Get(ctx, client.ObjectKeyFromObject(eventVirtual), current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("get current virtual storage class %q before delete: %w", eventVirtual.Name, err)
+	}
+
+	if !isOwnedVirtual(current, s.Name()) {
+		ctx.Log.Infof("preserve current virtual storage class %q because it is not owned by %s", current.Name, s.Name())
+		return ctrl.Result{}, nil
+	}
+	if eventVirtual.UID != "" && current.UID != eventVirtual.UID {
+		ctx.Log.Infof("preserve current virtual storage class %q because UID changed from %q to %q", current.Name, eventVirtual.UID, current.UID)
+		return ctrl.Result{}, nil
+	}
+
+	deleteOptions := &client.DeleteOptions{}
+	if current.UID != "" {
+		deleteOptions.Preconditions = metav1.NewUIDPreconditions(string(current.UID))
+	}
+	ctx.Log.Infof("delete owned virtual storage class %q, because %s", current.Name, reason)
+	return patcher.DeleteVirtualObjectWithOptions(ctx, current, eventHost, reason, deleteOptions)
 }
 
 func isVClusterManagedHostStorageClass(obj client.Object) bool {
