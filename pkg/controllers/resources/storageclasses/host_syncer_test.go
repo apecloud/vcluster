@@ -15,6 +15,7 @@ import (
 	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"gotest.tools/assert"
+	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -277,6 +278,113 @@ func TestFromHostSyncPatchErrorDoesNotPersistPartialState(t *testing.T) {
 	assert.NilError(t, vClient.Get(context.Background(), client.ObjectKey{Name: virtual.Name}, got))
 	assert.Equal(t, got.Annotations[translate.ControllerLabel], syncer.Name())
 	assert.Equal(t, got.Provisioner, virtual.Provisioner)
+}
+
+func TestFromHostSyncPatchErrorDoesNotMutateAliasedHostFields(t *testing.T) {
+	injectedError := errors.New("injected alias patch failure")
+	originalPatch := pro.ApplyPatchesVirtualObject
+	pro.ApplyPatchesVirtualObject = func(_ *synccontext.SyncContext, _, obj, _ client.Object, _ []vclusterconfig.TranslatePatch, _ bool) error {
+		storageClass := obj.(*storagev1.StorageClass)
+		storageClass.MountOptions[0] = "mutated-mount-option"
+		*storageClass.ReclaimPolicy = corev1.PersistentVolumeReclaimRetain
+		storageClass.AllowedTopologies[0].MatchLabelExpressions[0].Values[0] = "mutated-zone"
+		return injectedError
+	}
+	t.Cleanup(func() { pro.ApplyPatchesVirtualObject = originalPatch })
+
+	reclaimPolicy := corev1.PersistentVolumeReclaimDelete
+	host := &storagev1.StorageClass{
+		ObjectMeta:    metav1.ObjectMeta{Name: "patch-error-alias-storageclass"},
+		Provisioner:   "host-provisioner",
+		ReclaimPolicy: &reclaimPolicy,
+		MountOptions:  []string{"original-mount-option"},
+		AllowedTopologies: []corev1.TopologySelectorTerm{{
+			MatchLabelExpressions: []corev1.TopologySelectorLabelRequirement{{
+				Key:    "topology.kubernetes.io/zone",
+				Values: []string{"original-zone"},
+			}},
+		}},
+	}
+	virtual := &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        host.Name,
+			Annotations: map[string]string{translate.ControllerLabel: "host-storageclass"},
+		},
+		Provisioner: "old-virtual-provisioner",
+	}
+	pClient := testingutil.NewFakeClient(scheme.Scheme, host.DeepCopy())
+	vClient := testingutil.NewFakeClient(scheme.Scheme, virtual.DeepCopy())
+	registerCtx := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), pClient, vClient)
+	syncCtx, syncer := newFakeSyncer(t, registerCtx)
+	currentHost := &storagev1.StorageClass{}
+	assert.NilError(t, pClient.Get(context.Background(), client.ObjectKey{Name: host.Name}, currentHost))
+	currentVirtual := &storagev1.StorageClass{}
+	assert.NilError(t, vClient.Get(context.Background(), client.ObjectKey{Name: virtual.Name}, currentVirtual))
+
+	_, err := syncer.Sync(syncCtx, synccontext.NewSyncEvent(currentHost, currentVirtual))
+	assert.ErrorContains(t, err, injectedError.Error())
+	assert.Equal(t, currentHost.MountOptions[0], "original-mount-option")
+	assert.Equal(t, *currentHost.ReclaimPolicy, corev1.PersistentVolumeReclaimDelete)
+	assert.Equal(t, currentHost.AllowedTopologies[0].MatchLabelExpressions[0].Values[0], "original-zone")
+
+	gotHost := &storagev1.StorageClass{}
+	assert.NilError(t, pClient.Get(context.Background(), client.ObjectKey{Name: host.Name}, gotHost))
+	assert.Equal(t, gotHost.MountOptions[0], "original-mount-option")
+	assert.Equal(t, *gotHost.ReclaimPolicy, corev1.PersistentVolumeReclaimDelete)
+	assert.Equal(t, gotHost.AllowedTopologies[0].MatchLabelExpressions[0].Values[0], "original-zone")
+	gotVirtual := &storagev1.StorageClass{}
+	assert.NilError(t, vClient.Get(context.Background(), client.ObjectKey{Name: virtual.Name}, gotVirtual))
+	assert.Equal(t, gotVirtual.Provisioner, virtual.Provisioner)
+}
+
+func TestFromHostSyncToHostPreservesReplacedVirtualStorageClass(t *testing.T) {
+	tests := []struct {
+		name         string
+		currentUID   types.UID
+		currentOwner string
+	}{
+		{
+			name:         "owner removed from current object",
+			currentUID:   types.UID("old-owned-uid"),
+			currentOwner: "",
+		},
+		{
+			name:         "same-name owned object was recreated with a new UID",
+			currentUID:   types.UID("new-owned-uid"),
+			currentOwner: "host-storageclass",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stale := &storagev1.StorageClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "replaced-storageclass",
+					UID:         types.UID("old-owned-uid"),
+					Annotations: map[string]string{translate.ControllerLabel: "host-storageclass"},
+				},
+			}
+			current := stale.DeepCopy()
+			current.UID = tt.currentUID
+			if tt.currentOwner == "" {
+				current.Annotations = nil
+			} else {
+				current.Annotations[translate.ControllerLabel] = tt.currentOwner
+			}
+
+			pClient := testingutil.NewFakeClient(scheme.Scheme)
+			vClient := testingutil.NewFakeClient(scheme.Scheme, current.DeepCopy())
+			registerCtx := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), pClient, vClient)
+			syncCtx, syncer := newFakeSyncer(t, registerCtx)
+
+			_, err := syncer.SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(stale))
+			assert.NilError(t, err)
+			got := &storagev1.StorageClass{}
+			assert.NilError(t, vClient.Get(context.Background(), client.ObjectKey{Name: current.Name}, got))
+			assert.Equal(t, got.UID, current.UID)
+			assert.Equal(t, got.Annotations[translate.ControllerLabel], tt.currentOwner)
+		})
+	}
 }
 
 func requireSyncLabel(vConfig *config.VirtualClusterConfig) {
