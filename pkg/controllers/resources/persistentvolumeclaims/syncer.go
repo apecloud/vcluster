@@ -530,11 +530,8 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 		return false, nil
 	}
 
-	if claimRefReferencesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) {
-		if hostPV.Spec.ClaimRef.UID == pObj.UID {
-			return true, nil
-		}
-	} else if hostPV.Spec.ClaimRef != nil {
+	exactTargetClaimRef := claimRefReferencesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) && hostPV.Spec.ClaimRef.UID == pObj.UID
+	if !claimRefReferencesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) && hostPV.Spec.ClaimRef != nil {
 		if !s.hostPVClaimRefMatchesExpectedPopulateHelper(ctx, hostPV.Spec.ClaimRef, vObj) {
 			return false, fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
 		}
@@ -558,6 +555,9 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 	if helperFound {
 		ctx.Log.Infof("wait for newly observed virtual populate helper to disappear before patching host pv claimRef: hostPV=%s targetPVC=%s/%s", hostPVName, pObj.Namespace, pObj.Name)
 		return false, nil
+	}
+	if exactTargetClaimRef {
+		return true, nil
 	}
 
 	updated := hostPV.DeepCopy()
@@ -583,7 +583,7 @@ func externalPopulatorHelperCreationClosed(ctx *synccontext.SyncContext, reader 
 		}
 		return false, err
 	}
-	if latest.UID != targetPVC.UID || latest.Spec.VolumeName != targetPVC.Spec.VolumeName {
+	if latest.UID != targetPVC.UID || latest.Spec.VolumeName != targetPVC.Spec.VolumeName || !latest.DeletionTimestamp.IsZero() {
 		return false, nil
 	}
 
