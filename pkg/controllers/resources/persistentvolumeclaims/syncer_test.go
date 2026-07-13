@@ -57,6 +57,99 @@ func (c *injectHelperAfterHostPVGetClient) Patch(ctx context.Context, obj client
 	return c.Client.Patch(ctx, obj, patch, opts...)
 }
 
+type hostPVAccessRecordingClient struct {
+	client.Client
+	pvGets    int
+	pvPatches int
+}
+
+func (c *hostPVAccessRecordingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.PersistentVolume); ok {
+		c.pvGets++
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func (c *hostPVAccessRecordingClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if _, ok := obj.(*corev1.PersistentVolume); ok {
+		c.pvPatches++
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestExternalPopulatorHostPVAccessContract(t *testing.T) {
+	virtualTarget := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target",
+			Namespace: "virtual-ns",
+			UID:       types.UID("virtual-target-uid"),
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "host-pv"},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Conditions: []corev1.PersistentVolumeClaimCondition{
+				{
+					Type:   externalPopulatorPopulateConditionType,
+					Status: corev1.ConditionTrue,
+					Reason: externalPopulatorRestoreConditionReasonSucceeded,
+				},
+			},
+		},
+	}
+	hostTarget := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "host-target",
+			Namespace: "host-ns",
+			UID:       types.UID("host-target-uid"),
+		},
+	}
+	hostPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "host-pv"},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{
+				APIVersion: corev1.SchemeGroupVersion.Version,
+				Kind:       "PersistentVolumeClaim",
+				Name:       hostTarget.Name,
+				Namespace:  hostTarget.Namespace,
+				UID:        types.UID("stale-host-target-uid"),
+			},
+		},
+	}
+	expectedHostPV := hostPV.DeepCopy()
+	expectedHostPV.Spec.ClaimRef.UID = hostTarget.UID
+
+	syncertesting.RunTests(t, []*syncertesting.SyncTest{
+		{
+			Name:                 "fake PV handoff gets and patches the host PV claimRef",
+			InitialPhysicalState: []runtime.Object{hostPV},
+			InitialVirtualState:  []runtime.Object{virtualTarget},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {expectedHostPV},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {virtualTarget},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, rawSyncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				recorder := &hostPVAccessRecordingClient{Client: syncCtx.HostClient}
+				syncCtx.HostClient = recorder
+
+				ready, err := rawSyncer.(*persistentVolumeClaimSyncer).ensureExternalPopulatorHostPVClaimRef(
+					syncCtx,
+					hostPV.Name,
+					hostTarget,
+					virtualTarget,
+					nil,
+					false,
+				)
+				assert.NilError(t, err)
+				assert.Check(t, ready)
+				assert.Equal(t, recorder.pvGets, 1)
+				assert.Equal(t, recorder.pvPatches, 1)
+			},
+		},
+	})
+}
+
 func TestSync(t *testing.T) {
 	vObjectMeta := metav1.ObjectMeta{
 		Name:      "testpvc",
