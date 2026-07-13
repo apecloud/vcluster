@@ -28,7 +28,8 @@ func RegisterFakeSyncer(ctx *synccontext.RegisterContext, syncer syncertypes.Fak
 
 		config: ctx.Config,
 
-		virtualClient: ctx.VirtualManager.GetClient(),
+		virtualClient:    ctx.VirtualManager.GetClient(),
+		virtualAPIReader: ctx.VirtualManager.GetAPIReader(),
 	}
 
 	return controller.Register(ctx)
@@ -47,7 +48,8 @@ type fakeSyncer struct {
 
 	config *config.VirtualClusterConfig
 
-	virtualClient client.Client
+	virtualClient    client.Client
+	virtualAPIReader client.Reader
 }
 
 func (r *fakeSyncer) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -60,6 +62,7 @@ func (r *fakeSyncer) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		CurrentNamespace:       r.currentNamespace,
 		CurrentNamespaceClient: r.currentNamespaceClient,
 		VirtualClient:          r.virtualClient,
+		VirtualAPIReader:       r.virtualAPIReader,
 		Mappings:               r.mappings,
 	}
 

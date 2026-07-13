@@ -1,6 +1,7 @@
 package persistentvolumeclaims
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -19,7 +20,42 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+type injectHelperAfterHostPVGetClient struct {
+	client.Client
+	virtualClient client.Client
+	helper        *corev1.PersistentVolumeClaim
+	hostPVName    string
+	hostPVGets    int
+	patchCalls    int
+	injected      bool
+}
+
+func (c *injectHelperAfterHostPVGetClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	err := c.Client.Get(ctx, key, obj, opts...)
+	if err != nil {
+		return err
+	}
+
+	if _, ok := obj.(*corev1.PersistentVolume); ok && key.Name == c.hostPVName {
+		c.hostPVGets++
+		if c.hostPVGets == 2 && !c.injected {
+			c.injected = true
+			return c.virtualClient.Create(ctx, c.helper.DeepCopy())
+		}
+	}
+
+	return nil
+}
+
+func (c *injectHelperAfterHostPVGetClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if _, ok := obj.(*corev1.PersistentVolume); ok {
+		c.patchCalls++
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
 
 func TestSync(t *testing.T) {
 	vObjectMeta := metav1.ObjectMeta{
@@ -1273,6 +1309,56 @@ func TestSync(t *testing.T) {
 					dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
 				))
 				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, 2*time.Second)
+			},
+		},
+		{
+			Name: "Revalidate populate helper absence before final host pv claim ref patch",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
+				dataProtectionPopulatedPV.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+				dataProtectionHostPopulateHelperPvc.DeepCopy(),
+				dataProtectionHostPVBoundToHelper.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
+					dataProtectionPopulateHelperPvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionPopulatedPV.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionNoDataHostPendingAfterGuestMaterialized.DeepCopy(),
+					dataProtectionHostPopulateHelperPvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionHostPVBoundToHelper.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				raceClient := &injectHelperAfterHostPVGetClient{
+					Client:        syncCtx.HostClient,
+					virtualClient: syncCtx.VirtualClient,
+					helper:        dataProtectionPopulateHelperPvc,
+					hostPVName:    dataProtectionHostPVBoundToHelper.Name,
+				}
+				syncCtx.HostClient = raceClient
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
+					dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Equal(t, raceClient.hostPVGets, 2)
+				assert.Check(t, raceClient.injected)
+				assert.Equal(t, raceClient.patchCalls, 0)
 				assert.Equal(t, result.RequeueAfter, 2*time.Second)
 			},
 		},

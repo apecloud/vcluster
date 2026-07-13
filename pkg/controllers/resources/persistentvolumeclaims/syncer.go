@@ -502,6 +502,19 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 	if err != nil {
 		return false, err
 	}
+	if !helperFound {
+		if ctx.VirtualAPIReader == nil {
+			return false, fmt.Errorf("virtual API reader is required to revalidate populate helper absence before patching host pv %s", hostPVName)
+		}
+		helperFound, err = externalPopulatorPopulateHelperExistsWithReader(ctx, ctx.VirtualAPIReader, vObj)
+		if err != nil {
+			return false, err
+		}
+		if helperFound {
+			ctx.Log.Infof("wait for newly observed virtual populate helper to disappear before patching host pv claimRef: hostPV=%s targetPVC=%s/%s", hostPVName, pObj.Namespace, pObj.Name)
+			return false, nil
+		}
+	}
 
 	targetRef := &corev1.ObjectReference{
 		APIVersion: corev1.SchemeGroupVersion.Version,
@@ -864,12 +877,19 @@ func (s *persistentVolumeClaimSyncer) shouldBlockExternalPopulatorHostPVCUntilGu
 }
 
 func (s *persistentVolumeClaimSyncer) externalPopulatorPopulateHelperExists(ctx *synccontext.SyncContext, targetPVC *corev1.PersistentVolumeClaim) (bool, error) {
+	return externalPopulatorPopulateHelperExistsWithReader(ctx, ctx.VirtualClient, targetPVC)
+}
+
+func externalPopulatorPopulateHelperExistsWithReader(ctx *synccontext.SyncContext, reader client.Reader, targetPVC *corev1.PersistentVolumeClaim) (bool, error) {
 	if targetPVC.UID == "" {
 		return false, nil
 	}
+	if reader == nil {
+		return false, fmt.Errorf("virtual reader is required to check external populator helper for pvc %s/%s", targetPVC.Namespace, targetPVC.Name)
+	}
 
 	helperPVC := &corev1.PersistentVolumeClaim{}
-	err := ctx.VirtualClient.Get(ctx.Context, types.NamespacedName{
+	err := reader.Get(ctx.Context, types.NamespacedName{
 		Namespace: targetPVC.Namespace,
 		Name:      externalPopulatorPopulateHelperPrefix + string(targetPVC.UID),
 	}, helperPVC)
