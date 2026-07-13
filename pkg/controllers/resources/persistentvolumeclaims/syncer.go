@@ -241,6 +241,14 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		logExternalPopulatorNoDataRestoreBackoff(ctx.Log, event.Host, event.Virtual)
 		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
 	}
+	waitForPopulateHelper, err := s.shouldWaitForExternalPopulatorHelperAbsence(ctx, event.Virtual)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if waitForPopulateHelper {
+		ctx.Log.Infof("wait for virtual populate helper to be absent before reconciling host target pvc: guestPVC=%s/%s guestUID=%s hostPVC=%s/%s", event.Virtual.Namespace, event.Virtual.Name, event.Virtual.UID, event.Host.Namespace, event.Host.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 
 	// make sure the persistent volume is synced / faked
 	if event.Host.Spec.VolumeName != "" {
@@ -502,22 +510,33 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 		Name:       pObj.Name,
 		UID:        pObj.UID,
 	}
+	if helperFound {
+		if hostPV.Spec.ClaimRef == nil {
+			return false, fmt.Errorf("host pv %s has no claimRef while virtual populate helper pvc %s/%s exists", hostPVName, helperPVC.Namespace, helperPVC.Name)
+		}
+		if claimRefReferencesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) && hostPV.Spec.ClaimRef.UID == pObj.UID {
+			ctx.Log.Infof("wait for virtual populate helper to disappear before accepting host pv target handoff: hostPV=%s targetPVC=%s/%s helperPVC=%s/%s", hostPVName, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
+			return false, nil
+		}
+
+		ok, err := s.hostPVClaimRefMatchesVirtualPVC(ctx, hostPV.Spec.ClaimRef, helperPVC)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
+		}
+
+		return false, nil
+	}
+
 	if claimRefReferencesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) {
 		if hostPV.Spec.ClaimRef.UID == pObj.UID {
 			return true, nil
 		}
 	} else if hostPV.Spec.ClaimRef != nil {
-		if !helperFound {
-			if !s.hostPVClaimRefMatchesExpectedPopulateHelper(ctx, hostPV.Spec.ClaimRef, vObj) {
-				return false, fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
-			}
-		} else {
-			ok, err := s.hostPVClaimRefMatchesVirtualPVC(ctx, hostPV.Spec.ClaimRef, helperPVC)
-			if err != nil {
-				return false, err
-			} else if !ok {
-				return false, fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
-			}
+		if !s.hostPVClaimRefMatchesExpectedPopulateHelper(ctx, hostPV.Spec.ClaimRef, vObj) {
+			return false, fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name)
 		}
 	}
 
@@ -809,7 +828,26 @@ func (s *persistentVolumeClaimSyncer) shouldBlockExternalPopulatorHostPVCUntilGu
 		return true, nil
 	}
 
-	if pObj.Spec.VolumeName != "" || vObj.Spec.VolumeName != "" {
+	if vObj.Spec.VolumeName != "" {
+		helperExists, err := s.externalPopulatorPopulateHelperExists(ctx, vObj)
+		if err != nil {
+			return false, err
+		}
+		if helperExists {
+			ctx.Log.Infof("block host external populator target pvc while virtual populate helper exists: guestPVC=%s/%s guestUID=%s hostPVC=%s/%s",
+				vObj.Namespace,
+				vObj.Name,
+				vObj.UID,
+				pObj.Namespace,
+				pObj.Name,
+			)
+			return true, nil
+		}
+
+		clearExternalPopulatorHostDataSource(pObj)
+		return false, nil
+	}
+	if pObj.Spec.VolumeName != "" {
 		clearExternalPopulatorHostDataSource(pObj)
 		return false, nil
 	}
@@ -823,6 +861,34 @@ func (s *persistentVolumeClaimSyncer) shouldBlockExternalPopulatorHostPVCUntilGu
 		externalPopulatorDataSourceRefDescription(ref),
 	)
 	return false, nil
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorPopulateHelperExists(ctx *synccontext.SyncContext, targetPVC *corev1.PersistentVolumeClaim) (bool, error) {
+	if targetPVC.UID == "" {
+		return false, nil
+	}
+
+	helperPVC := &corev1.PersistentVolumeClaim{}
+	err := ctx.VirtualClient.Get(ctx.Context, types.NamespacedName{
+		Namespace: targetPVC.Namespace,
+		Name:      externalPopulatorPopulateHelperPrefix + string(targetPVC.UID),
+	}, helperPVC)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (s *persistentVolumeClaimSyncer) shouldWaitForExternalPopulatorHelperAbsence(ctx *synccontext.SyncContext, targetPVC *corev1.PersistentVolumeClaim) (bool, error) {
+	if targetPVC.Spec.VolumeName == "" || !isDataProtectionBackupDataSourceRef(targetPVC.Spec.DataSourceRef) {
+		return false, nil
+	}
+
+	return s.externalPopulatorPopulateHelperExists(ctx, targetPVC)
 }
 
 func isDataProtectionBackupDataSourceRef(ref *corev1.TypedObjectReference) bool {
