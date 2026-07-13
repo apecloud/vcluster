@@ -199,6 +199,13 @@ func TestSync(t *testing.T) {
 			Capacity: corev1.ResourceList{
 				corev1.ResourceStorage: resource.MustParse("1Gi"),
 			},
+			Conditions: []corev1.PersistentVolumeClaimCondition{
+				{
+					Type:   externalPopulatorPopulateConditionType,
+					Status: corev1.ConditionTrue,
+					Reason: externalPopulatorRestoreConditionReasonSucceeded,
+				},
+			},
 		},
 	}
 	dataProtectionBackupPendingPvc := dataProtectionBackupPvc.DeepCopy()
@@ -282,6 +289,11 @@ func TestSync(t *testing.T) {
 	dataProtectionNoDataRestorePvc := dataProtectionBackupPvc.DeepCopy()
 	dataProtectionNoDataRestorePvc.Status.Conditions = []corev1.PersistentVolumeClaimCondition{
 		{
+			Type:   externalPopulatorPopulateConditionType,
+			Status: corev1.ConditionTrue,
+			Reason: externalPopulatorRestoreConditionReasonProvisioned,
+		},
+		{
 			Type:   externalPopulatorRestoreConditionType,
 			Status: corev1.ConditionTrue,
 			Reason: externalPopulatorRestoreConditionReasonProvisioned,
@@ -291,6 +303,14 @@ func TestSync(t *testing.T) {
 	dataProtectionNoDataRestorePendingPvc.Status = dataProtectionNoDataRestorePvc.Status
 	dataProtectionNoDataRestorePvcWithVolumeName := dataProtectionNoDataRestorePvc.DeepCopy()
 	dataProtectionNoDataRestorePvcWithVolumeName.Spec.VolumeName = dataProtectionPopulatedPV.Name
+	dataProtectionNoDataRestorePvcWithVolumeNameWithoutCreatorClosed := dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy()
+	dataProtectionNoDataRestorePvcWithVolumeNameWithoutCreatorClosed.Status.Conditions = []corev1.PersistentVolumeClaimCondition{
+		{
+			Type:   externalPopulatorRestoreConditionType,
+			Status: corev1.ConditionTrue,
+			Reason: externalPopulatorRestoreConditionReasonProvisioned,
+		},
+	}
 	dataProtectionNoDataRestorePvcWithVolumeNameBoundStatus := dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy()
 	dataProtectionNoDataRestorePvcWithVolumeNameBoundStatus.Status.Phase = corev1.ClaimBound
 	dataProtectionNoDataRestorePvcWithVolumeNameBoundStatus.Status.Capacity = dataProtectionPopulatedPV.Spec.Capacity.DeepCopy()
@@ -333,8 +353,6 @@ func TestSync(t *testing.T) {
 		},
 	}
 	dataProtectionNoDataHostPendingWithBackupSource.ResourceVersion = "1"
-	dataProtectionNoDataHostPendingWithBackupSourceAndAbsenceObservation := dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()
-	setExternalPopulatorHelperAbsenceObservation(dataProtectionNoDataHostPendingWithBackupSourceAndAbsenceObservation, dataProtectionNoDataRestorePvcWithVolumeName)
 	dataProtectionHostPendingWithBackupSource := dataProtectionNoDataHostPendingWithBackupSource.DeepCopy()
 	dataProtectionHostPendingWithBackupSource.Spec.DataSource = nil
 	dataProtectionHostPendingWithBackupSource.ResourceVersion = ""
@@ -949,22 +967,6 @@ func TestSync(t *testing.T) {
 					dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
 				))
 				assert.NilError(t, err)
-				assert.Equal(t, result.RequeueAfter, 2*time.Second)
-
-				currentHost := &corev1.PersistentVolumeClaim{}
-				err = syncCtx.HostClient.Get(syncCtx, client.ObjectKeyFromObject(dataProtectionNoDataHostPendingWithBackupSource), currentHost)
-				assert.NilError(t, err)
-				currentVirtual := &corev1.PersistentVolumeClaim{}
-				err = syncCtx.VirtualClient.Get(syncCtx, client.ObjectKeyFromObject(dataProtectionNoDataRestorePvcWithVolumeName), currentVirtual)
-				assert.NilError(t, err)
-
-				result, err = syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
-					currentHost.DeepCopy(),
-					currentHost.DeepCopy(),
-					currentVirtual.DeepCopy(),
-					currentVirtual.DeepCopy(),
-				))
-				assert.NilError(t, err)
 				assert.Check(t, result.IsZero())
 			},
 		},
@@ -1331,13 +1333,49 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
+			Name: "Do not patch host pv before populator helper creation is terminally closed",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionNoDataRestorePvcWithVolumeNameWithoutCreatorClosed.DeepCopy(),
+				dataProtectionPopulatedPV.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+				dataProtectionHostPopulateHelperPvc.DeepCopy(),
+				dataProtectionHostPVBoundToHelper.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestorePvcWithVolumeNameWithoutCreatorClosed.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {dataProtectionPopulatedPV.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionNoDataHostPendingAfterGuestMaterialized.DeepCopy(),
+					dataProtectionHostPopulateHelperPvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionHostPVBoundToHelper.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataRestorePvcWithVolumeNameWithoutCreatorClosed.DeepCopy(),
+					dataProtectionNoDataRestorePvcWithVolumeNameWithoutCreatorClosed.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, 2*time.Second)
+			},
+		},
+		{
 			Name: "Revalidate populate helper absence before final host pv claim ref patch",
 			InitialVirtualState: []runtime.Object{
 				dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
 				dataProtectionPopulatedPV.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
-				dataProtectionNoDataHostPendingWithBackupSourceAndAbsenceObservation.DeepCopy(),
+				dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
 				dataProtectionHostPopulateHelperPvc.DeepCopy(),
 				dataProtectionHostPVBoundToHelper.DeepCopy(),
 			},
@@ -1368,8 +1406,8 @@ func TestSync(t *testing.T) {
 				syncCtx.HostClient = raceClient
 
 				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
-					dataProtectionNoDataHostPendingWithBackupSourceAndAbsenceObservation.DeepCopy(),
-					dataProtectionNoDataHostPendingWithBackupSourceAndAbsenceObservation.DeepCopy(),
+					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
+					dataProtectionNoDataHostPendingWithBackupSource.DeepCopy(),
 					dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
 					dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
 				))
@@ -1411,22 +1449,7 @@ func TestSync(t *testing.T) {
 					dataProtectionBackupPvc.DeepCopy(),
 				))
 				assert.NilError(t, err)
-				assert.Equal(t, result.RequeueAfter, 2*time.Second)
-
-				currentHost := &corev1.PersistentVolumeClaim{}
-				err = syncCtx.HostClient.Get(syncCtx, client.ObjectKeyFromObject(dataProtectionHostPendingPvcWithObjectUID), currentHost)
-				assert.NilError(t, err)
-				currentVirtual := &corev1.PersistentVolumeClaim{}
-				err = syncCtx.VirtualClient.Get(syncCtx, client.ObjectKeyFromObject(dataProtectionBackupPvc), currentVirtual)
-				assert.NilError(t, err)
-
-				_, err = syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
-					currentHost.DeepCopy(),
-					currentHost.DeepCopy(),
-					currentVirtual.DeepCopy(),
-					currentVirtual.DeepCopy(),
-				))
-				assert.NilError(t, err)
+				assert.Check(t, result.IsZero())
 			},
 		},
 		{
