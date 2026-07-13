@@ -335,6 +335,9 @@ func TestFromHostSyncPatchErrorDoesNotMutateAliasedHostFields(t *testing.T) {
 	gotVirtual := &storagev1.StorageClass{}
 	assert.NilError(t, vClient.Get(context.Background(), client.ObjectKey{Name: virtual.Name}, gotVirtual))
 	assert.Equal(t, gotVirtual.Provisioner, virtual.Provisioner)
+	assert.DeepEqual(t, gotVirtual.MountOptions, virtual.MountOptions)
+	assert.DeepEqual(t, gotVirtual.ReclaimPolicy, virtual.ReclaimPolicy)
+	assert.DeepEqual(t, gotVirtual.AllowedTopologies, virtual.AllowedTopologies)
 }
 
 func TestFromHostSyncToHostPreservesReplacedVirtualStorageClass(t *testing.T) {
