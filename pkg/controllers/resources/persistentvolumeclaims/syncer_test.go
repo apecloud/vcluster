@@ -2177,7 +2177,7 @@ func TestCopyHostStatusPreservingExternalPopulatorConditions(t *testing.T) {
 			},
 		}
 
-		copyHostStatusPreservingExternalPopulatorConditions(host, virtual)
+		copyHostStatusPreservingExternalPopulatorConditions(host, virtual, true)
 
 		expected := *host.Status.DeepCopy()
 		expected.Conditions = append(expected.Conditions, externalConditions...)
@@ -2192,7 +2192,27 @@ func TestCopyHostStatusPreservingExternalPopulatorConditions(t *testing.T) {
 			},
 		}
 
-		copyHostStatusPreservingExternalPopulatorConditions(host, virtual)
+		copyHostStatusPreservingExternalPopulatorConditions(host, virtual, false)
+
+		assert.DeepEqual(t, virtual.Status, host.Status)
+	})
+
+	t.Run("stale external populator identity drops guest conditions", func(t *testing.T) {
+		virtual := &corev1.PersistentVolumeClaim{
+			Spec: corev1.PersistentVolumeClaimSpec{
+				DataSourceRef: &corev1.TypedObjectReference{
+					APIGroup: &apiGroup,
+					Kind:     dataProtectionBackupKind,
+					Name:     "backup-1",
+				},
+			},
+			Status: corev1.PersistentVolumeClaimStatus{
+				Phase:      corev1.ClaimPending,
+				Conditions: append([]corev1.PersistentVolumeClaimCondition(nil), externalConditions...),
+			},
+		}
+
+		copyHostStatusPreservingExternalPopulatorConditions(host, virtual, false)
 
 		assert.DeepEqual(t, virtual.Status, host.Status)
 	})

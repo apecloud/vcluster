@@ -316,7 +316,11 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 			return ctrl.Result{}, err
 		}
 		if !preserveExternalPopulatorStatus {
-			copyHostStatusPreservingExternalPopulatorConditions(event.Host, event.Virtual)
+			preserveExternalPopulatorConditions, err := s.shouldPreserveExternalPopulatorConditions(ctx, event.Virtual)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			copyHostStatusPreservingExternalPopulatorConditions(event.Host, event.Virtual, preserveExternalPopulatorConditions)
 		}
 	}
 
@@ -719,6 +723,32 @@ func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorVirtualStat
 	return isExternalPopulatorPersistentVolumeForPVC(vPV, vObj, false), nil
 }
 
+func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorConditions(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (bool, error) {
+	if !hasExternalPopulatorDataSource(vObj) {
+		return false, nil
+	}
+	if vObj.Spec.VolumeName == "" {
+		return true, nil
+	}
+
+	vPV := &corev1.PersistentVolume{}
+	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: vObj.Spec.VolumeName}, vPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+
+	ref := vPV.Spec.ClaimRef
+	// A same-name claimRef with another UID belongs to an earlier PVC instance;
+	// its populator conditions must not leak into the replacement claim.
+	if claimRefReferencesPersistentVolumeClaim(ref, vObj) && ref.UID != "" && ref.UID != vObj.UID {
+		return false, nil
+	}
+	return true, nil
+}
+
 func ensureExternalPopulatorVirtualPopulateStatus(vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) {
 	if isVirtualPVCBound(vObj) {
 		return
@@ -738,9 +768,9 @@ func ensureExternalPopulatorVirtualPopulateStatus(vObj *corev1.PersistentVolumeC
 	}
 }
 
-func copyHostStatusPreservingExternalPopulatorConditions(pObj, vObj *corev1.PersistentVolumeClaim) {
+func copyHostStatusPreservingExternalPopulatorConditions(pObj, vObj *corev1.PersistentVolumeClaim, preserveExternalPopulatorConditions bool) {
 	preserved := make([]corev1.PersistentVolumeClaimCondition, 0, len(vObj.Status.Conditions))
-	if hasExternalPopulatorDataSource(vObj) {
+	if preserveExternalPopulatorConditions {
 		for _, condition := range vObj.Status.Conditions {
 			if isExternalPopulatorStatusCondition(condition.Type) {
 				preserved = append(preserved, condition)
