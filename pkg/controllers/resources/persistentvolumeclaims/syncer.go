@@ -307,7 +307,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 			return ctrl.Result{}, err
 		}
 		if !preserveExternalPopulatorStatus {
-			event.Virtual.Status = *event.Host.Status.DeepCopy()
+			copyHostStatusPreservingExternalPopulatorConditions(event.Host, event.Virtual)
 		}
 	}
 
@@ -669,6 +669,35 @@ func ensureExternalPopulatorVirtualPopulateStatus(vObj *corev1.PersistentVolumeC
 	if vObj.Status.Capacity == nil || !ok || storage.IsZero() {
 		vObj.Status.Capacity = vPV.Spec.Capacity.DeepCopy()
 	}
+}
+
+func copyHostStatusPreservingExternalPopulatorConditions(pObj, vObj *corev1.PersistentVolumeClaim) {
+	preserved := make([]corev1.PersistentVolumeClaimCondition, 0, len(vObj.Status.Conditions))
+	if hasExternalPopulatorDataSource(vObj) {
+		for _, condition := range vObj.Status.Conditions {
+			if isExternalPopulatorStatusCondition(condition.Type) {
+				preserved = append(preserved, condition)
+			}
+		}
+	}
+
+	vObj.Status = *pObj.Status.DeepCopy()
+	if len(preserved) == 0 {
+		return
+	}
+
+	conditions := make([]corev1.PersistentVolumeClaimCondition, 0, len(vObj.Status.Conditions)+len(preserved))
+	for _, condition := range vObj.Status.Conditions {
+		if !isExternalPopulatorStatusCondition(condition.Type) {
+			conditions = append(conditions, condition)
+		}
+	}
+	vObj.Status.Conditions = append(conditions, preserved...)
+}
+
+func isExternalPopulatorStatusCondition(conditionType corev1.PersistentVolumeClaimConditionType) bool {
+	return conditionType == externalPopulatorRestoreConditionType ||
+		conditionType == externalPopulatorPopulateConditionType
 }
 
 func isExternalPopulatorPersistentVolumeForPVC(vPV *corev1.PersistentVolume, vObj *corev1.PersistentVolumeClaim, requireBoundPV bool) bool {

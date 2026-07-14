@@ -330,6 +330,10 @@ func TestSync(t *testing.T) {
 	}
 	dataProtectionNoDataRestorePvcWithHostBoundStatus := dataProtectionNoDataRestorePvc.DeepCopy()
 	dataProtectionNoDataRestorePvcWithHostBoundStatus.Status = *dataProtectionNoDataHostBoundWithBackupSource.Status.DeepCopy()
+	dataProtectionNoDataRestorePvcWithHostBoundStatus.Status.Conditions = append(
+		[]corev1.PersistentVolumeClaimCondition(nil),
+		dataProtectionNoDataRestorePvc.Status.Conditions...,
+	)
 	dataProtectionNoDataHostPendingWithoutBackupSource := dataProtectionHostPendingPvcWithUID.DeepCopy()
 	dataProtectionNoDataHostPendingWithoutBackupSource.Spec = corev1.PersistentVolumeClaimSpec{}
 	dataProtectionNoDataHostDeletingWithoutBackupSource := dataProtectionNoDataHostPendingWithoutBackupSource.DeepCopy()
@@ -913,7 +917,7 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
-			Name:                 "Do not delete current bound host backup data source pvc",
+			Name:                 "Preserve external populator restore condition after host pvc binds",
 			InitialVirtualState:  []runtime.Object{dataProtectionNoDataRestorePvc.DeepCopy()},
 			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostBoundWithBackupSource.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
@@ -1854,4 +1858,69 @@ func TestHasExternalPopulatorDataSource(t *testing.T) {
 			assert.Equal(t, hasExternalPopulatorDataSource(tt.pvc), tt.expected)
 		})
 	}
+}
+
+func TestCopyHostStatusPreservingExternalPopulatorConditions(t *testing.T) {
+	apiGroup := dataProtectionAPIGroup
+	externalConditions := []corev1.PersistentVolumeClaimCondition{
+		{
+			Type:    externalPopulatorPopulateConditionType,
+			Status:  corev1.ConditionTrue,
+			Reason:  externalPopulatorRestoreConditionReasonProcessing,
+			Message: externalPopulatorNoDataRestoreMessage,
+		},
+		{
+			Type:   externalPopulatorRestoreConditionType,
+			Status: corev1.ConditionTrue,
+			Reason: externalPopulatorRestoreConditionReasonProvisioned,
+		},
+	}
+	hostCondition := corev1.PersistentVolumeClaimCondition{
+		Type:   corev1.PersistentVolumeClaimFileSystemResizePending,
+		Status: corev1.ConditionTrue,
+	}
+	host := &corev1.PersistentVolumeClaim{
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase: corev1.ClaimBound,
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+			Conditions: []corev1.PersistentVolumeClaimCondition{hostCondition},
+		},
+	}
+
+	t.Run("external populator keeps guest conditions and host bound fields", func(t *testing.T) {
+		virtual := &corev1.PersistentVolumeClaim{
+			Spec: corev1.PersistentVolumeClaimSpec{
+				DataSourceRef: &corev1.TypedObjectReference{
+					APIGroup: &apiGroup,
+					Kind:     dataProtectionBackupKind,
+					Name:     "backup-1",
+				},
+			},
+			Status: corev1.PersistentVolumeClaimStatus{
+				Phase:      corev1.ClaimPending,
+				Conditions: append([]corev1.PersistentVolumeClaimCondition(nil), externalConditions...),
+			},
+		}
+
+		copyHostStatusPreservingExternalPopulatorConditions(host, virtual)
+
+		expected := *host.Status.DeepCopy()
+		expected.Conditions = append(expected.Conditions, externalConditions...)
+		assert.DeepEqual(t, virtual.Status, expected)
+	})
+
+	t.Run("ordinary pvc gets unmodified host status", func(t *testing.T) {
+		virtual := &corev1.PersistentVolumeClaim{
+			Status: corev1.PersistentVolumeClaimStatus{
+				Phase:      corev1.ClaimPending,
+				Conditions: append([]corev1.PersistentVolumeClaimCondition(nil), externalConditions...),
+			},
+		}
+
+		copyHostStatusPreservingExternalPopulatorConditions(host, virtual)
+
+		assert.DeepEqual(t, virtual.Status, host.Status)
+	})
 }
