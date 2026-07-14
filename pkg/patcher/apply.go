@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -224,12 +225,14 @@ func applyObjectWithPatch(ctx *synccontext.SyncContext, objPatch patch.Patch, ob
 		kubeClient = ctx.VirtualClient
 	}
 
-	// check if we should create or update the object
-	isUpdate := false
-	err := kubeClient.Get(ctx, types.NamespacedName{
+	key := types.NamespacedName{
 		Namespace: obj.GetNamespace(),
 		Name:      obj.GetName(),
-	}, obj.DeepCopyObject().(client.Object))
+	}
+
+	// check if we should create or update the object
+	isUpdate := false
+	err := kubeClient.Get(ctx, key, obj.DeepCopyObject().(client.Object))
 	if err != nil && !kerrors.IsNotFound(err) {
 		return fmt.Errorf("get object: %w", err)
 	} else if err == nil {
@@ -239,6 +242,61 @@ func applyObjectWithPatch(ctx *synccontext.SyncContext, objPatch patch.Patch, ob
 	// we cannot create a status only object
 	if !isUpdate && isStatus {
 		return fmt.Errorf("cannot create status only object")
+	}
+
+	// Status updates should be based on the latest object because binders,
+	// populators, and other controllers commonly update status concurrently.
+	// Full-object updates keep the original event object semantics because some
+	// syncers intentionally overwrite fields rather than merge with newer state.
+	if isUpdate && isStatus {
+		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			latestObj := obj.DeepCopyObject().(client.Object)
+			err := kubeClient.Get(ctx, key, latestObj)
+			if err != nil {
+				return fmt.Errorf("get object: %w", err)
+			}
+
+			beforeObject := latestObj.DeepCopyObject().(client.Object)
+			err = objPatch.Apply(latestObj)
+			if err != nil {
+				return fmt.Errorf("apply patch: %w", err)
+			} else if apiequality.Semantic.DeepEqual(beforeObject, latestObj) {
+				// nothing to patch
+				return nil
+			}
+
+			logUpdate(ctx, isStatus, direction, beforeObject, latestObj)
+
+			// update
+			afterObj := latestObj.DeepCopyObject().(client.Object)
+			err = kubeClient.Status().Update(ctx, latestObj)
+			if err != nil {
+				return err
+			}
+
+			// set the fields correctly, but only if the update succeeds
+			afterObj.SetUID(latestObj.GetUID())
+			afterObj.SetGeneration(latestObj.GetGeneration())
+			afterObj.SetResourceVersion(latestObj.GetResourceVersion())
+			afterObj.SetCreationTimestamp(latestObj.GetCreationTimestamp())
+			afterObj.SetDeletionTimestamp(latestObj.GetDeletionTimestamp())
+			afterObj.SetManagedFields(latestObj.GetManagedFields())
+			afterObj.SetDeletionGracePeriodSeconds(latestObj.GetDeletionGracePeriodSeconds())
+			afterObj.SetGenerateName(latestObj.GetGenerateName())
+			afterObj.SetOwnerReferences(latestObj.GetOwnerReferences())
+			if ctx.ObjectCache != nil {
+				if direction == synccontext.SyncHostToVirtual {
+					ctx.ObjectCache.Virtual().Put(afterObj)
+				} else if direction == synccontext.SyncVirtualToHost {
+					ctx.ObjectCache.Host().Put(afterObj)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("update object status: %w", err)
+		}
+		return nil
 	}
 
 	// apply the patch when it's an update, otherwise the patch is the create

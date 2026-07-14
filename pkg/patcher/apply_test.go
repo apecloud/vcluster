@@ -1,13 +1,167 @@
 package patcher
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
+	"github.com/loft-sh/vcluster/pkg/scheme"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
 	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+type statusInterceptClient struct {
+	client.Client
+	status client.SubResourceWriter
+}
+
+func (c *statusInterceptClient) Status() client.SubResourceWriter {
+	return c.status
+}
+
+type countingStatusWriter struct {
+	client.SubResourceWriter
+	attempts      int
+	conflictFirst bool
+}
+
+func (w *countingStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	w.attempts++
+	if w.conflictFirst && w.attempts == 1 {
+		return kerrors.NewConflict(
+			schema.GroupResource{Resource: "persistentvolumeclaims"},
+			obj.GetName(),
+			errors.New("injected status conflict"),
+		)
+	}
+	return w.SubResourceWriter.Update(ctx, obj, opts...)
+}
+
+func statusTestPVC(phase corev1.PersistentVolumeClaimPhase) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc", Namespace: "ns"},
+		Status:     corev1.PersistentVolumeClaimStatus{Phase: phase},
+	}
+}
+
+func TestApplyObjectStatusPatchRetriesConflictOnLatestObject(t *testing.T) {
+	live := statusTestPVC(corev1.ClaimPending)
+	base := testingutil.NewFakeClient(scheme.Scheme, live)
+	writer := &countingStatusWriter{SubResourceWriter: base.Status(), conflictFirst: true}
+	vClient := &statusInterceptClient{Client: base, status: writer}
+	ctx := &synccontext.SyncContext{
+		Context:       context.Background(),
+		HostClient:    testingutil.NewFakeClient(scheme.Scheme),
+		VirtualClient: vClient,
+	}
+
+	before := live.DeepCopy()
+	after := live.DeepCopy()
+	after.Status.Phase = corev1.ClaimBound
+	if err := ApplyObject(ctx, before, after, synccontext.SyncHostToVirtual, true); err != nil {
+		t.Fatalf("ApplyObject() error = %v", err)
+	}
+	if writer.attempts != 2 {
+		t.Fatalf("status update attempts = %d, want 2", writer.attempts)
+	}
+
+	got := &corev1.PersistentVolumeClaim{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(live), got); err != nil {
+		t.Fatalf("get live object: %v", err)
+	}
+	if got.Status.Phase != corev1.ClaimBound {
+		t.Fatalf("status phase = %s, want %s", got.Status.Phase, corev1.ClaimBound)
+	}
+}
+
+func TestApplyObjectStatusPatchSkipsWriteWhenLatestObjectAlreadyMatches(t *testing.T) {
+	live := statusTestPVC(corev1.ClaimBound)
+	base := testingutil.NewFakeClient(scheme.Scheme, live)
+	writer := &countingStatusWriter{SubResourceWriter: base.Status()}
+	vClient := &statusInterceptClient{Client: base, status: writer}
+	ctx := &synccontext.SyncContext{
+		Context:       context.Background(),
+		HostClient:    testingutil.NewFakeClient(scheme.Scheme),
+		VirtualClient: vClient,
+	}
+
+	before := statusTestPVC(corev1.ClaimPending)
+	after := statusTestPVC(corev1.ClaimBound)
+	if err := ApplyObject(ctx, before, after, synccontext.SyncHostToVirtual, true); err != nil {
+		t.Fatalf("ApplyObject() error = %v", err)
+	}
+	if writer.attempts != 0 {
+		t.Fatalf("status update attempts = %d, want 0", writer.attempts)
+	}
+}
+
+func TestApplyObjectStatusPatchUsesLatestObjectOnUpdate(t *testing.T) {
+	live := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pvc",
+			Namespace: "ns",
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase: corev1.ClaimPending,
+			Conditions: []corev1.PersistentVolumeClaimCondition{
+				{
+					Type:   corev1.PersistentVolumeClaimFileSystemResizePending,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+	before := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      live.Name,
+			Namespace: live.Namespace,
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase: corev1.ClaimPending,
+		},
+	}
+	after := before.DeepCopy()
+	after.Status = corev1.PersistentVolumeClaimStatus{
+		Phase:       corev1.ClaimBound,
+		AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		Capacity: corev1.ResourceList{
+			corev1.ResourceStorage: resource.MustParse("1Gi"),
+		},
+	}
+
+	vClient := testingutil.NewFakeClient(scheme.Scheme, live)
+	ctx := &synccontext.SyncContext{
+		Context:       context.Background(),
+		HostClient:    testingutil.NewFakeClient(scheme.Scheme),
+		VirtualClient: vClient,
+	}
+
+	if err := ApplyObject(ctx, before, after, synccontext.SyncHostToVirtual, true); err != nil {
+		t.Fatalf("ApplyObject() error = %v", err)
+	}
+
+	got := &corev1.PersistentVolumeClaim{}
+	if err := vClient.Get(ctx, client.ObjectKeyFromObject(live), got); err != nil {
+		t.Fatalf("get live object: %v", err)
+	}
+	if got.Status.Phase != corev1.ClaimBound {
+		t.Fatalf("status phase = %s, want %s", got.Status.Phase, corev1.ClaimBound)
+	}
+	storage := got.Status.Capacity[corev1.ResourceStorage]
+	if storage.IsZero() {
+		t.Fatalf("status capacity missing after patch: %#v", got.Status.Capacity)
+	}
+	if len(got.Status.Conditions) != 1 || got.Status.Conditions[0].Type != corev1.PersistentVolumeClaimFileSystemResizePending {
+		t.Fatalf("live status condition was lost by stale status patch: %#v", got.Status.Conditions)
+	}
+}
 
 func TestSanitizePatchForLog(t *testing.T) {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "ns"}}
