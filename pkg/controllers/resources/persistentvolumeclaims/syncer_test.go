@@ -1,15 +1,21 @@
 package persistentvolumeclaims
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/loft-sh/vcluster/pkg/config"
+	"github.com/loft-sh/vcluster/pkg/patcher"
+	"github.com/loft-sh/vcluster/pkg/scheme"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	syncertesting "github.com/loft-sh/vcluster/pkg/syncer/testing"
 	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
 	"gotest.tools/assert"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 
@@ -20,6 +26,32 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+type conflictOnceStatusClient struct {
+	client.Client
+	status client.SubResourceWriter
+}
+
+func (c *conflictOnceStatusClient) Status() client.SubResourceWriter {
+	return c.status
+}
+
+type conflictOnceStatusWriter struct {
+	client.SubResourceWriter
+	attempts int
+}
+
+func (w *conflictOnceStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	w.attempts++
+	if w.attempts == 1 {
+		return kerrors.NewConflict(
+			schema.GroupResource{Resource: "persistentvolumeclaims"},
+			obj.GetName(),
+			errors.New("injected status conflict"),
+		)
+	}
+	return w.SubResourceWriter.Update(ctx, obj, opts...)
+}
 
 func TestSync(t *testing.T) {
 	vObjectMeta := metav1.ObjectMeta{
@@ -1923,4 +1955,66 @@ func TestCopyHostStatusPreservingExternalPopulatorConditions(t *testing.T) {
 
 		assert.DeepEqual(t, virtual.Status, host.Status)
 	})
+}
+
+func TestExternalPopulatorStatusConflictRetryPreservesConditionsAndHostBoundFields(t *testing.T) {
+	apiGroup := dataProtectionAPIGroup
+	externalConditions := []corev1.PersistentVolumeClaimCondition{
+		{
+			Type:    externalPopulatorPopulateConditionType,
+			Status:  corev1.ConditionTrue,
+			Reason:  externalPopulatorRestoreConditionReasonProcessing,
+			Message: externalPopulatorNoDataRestoreMessage,
+		},
+		{
+			Type:   externalPopulatorRestoreConditionType,
+			Status: corev1.ConditionTrue,
+			Reason: externalPopulatorRestoreConditionReasonProvisioned,
+		},
+	}
+	before := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "restore-pvc", Namespace: "ns"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			DataSourceRef: &corev1.TypedObjectReference{
+				APIGroup: &apiGroup,
+				Kind:     dataProtectionBackupKind,
+				Name:     "backup-1",
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase:      corev1.ClaimPending,
+			Conditions: externalConditions,
+		},
+	}
+	host := &corev1.PersistentVolumeClaim{
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase: corev1.ClaimBound,
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		},
+	}
+	after := before.DeepCopy()
+	copyHostStatusPreservingExternalPopulatorConditions(host, after)
+	expectedStatus := *host.Status.DeepCopy()
+	expectedStatus.Conditions = append(expectedStatus.Conditions, externalConditions...)
+	assert.DeepEqual(t, after.Status, expectedStatus)
+
+	base := testingutil.NewFakeClient(scheme.Scheme, before.DeepCopy())
+	writer := &conflictOnceStatusWriter{SubResourceWriter: base.Status()}
+	ctx := &synccontext.SyncContext{
+		Context:       context.Background(),
+		HostClient:    testingutil.NewFakeClient(scheme.Scheme),
+		VirtualClient: &conflictOnceStatusClient{Client: base, status: writer},
+	}
+
+	err := patcher.ApplyObject(ctx, before.DeepCopy(), after, synccontext.SyncHostToVirtual, true)
+	assert.NilError(t, err)
+	assert.Equal(t, writer.attempts, 2)
+
+	got := &corev1.PersistentVolumeClaim{}
+	err = base.Get(ctx, client.ObjectKeyFromObject(before), got)
+	assert.NilError(t, err)
+	assert.DeepEqual(t, got.Status, expectedStatus)
 }
