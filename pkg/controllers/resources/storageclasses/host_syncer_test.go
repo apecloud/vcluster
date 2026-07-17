@@ -230,6 +230,40 @@ func TestFromHostSync(t *testing.T) {
 			},
 		},
 		{
+			Name:                 "Preserve unowned same-name virtual when managed host also fails selector",
+			InitialPhysicalState: []runtime.Object{managedHostObject.DeepCopy()},
+			InitialVirtualState:  []runtime.Object{staleVirtualObject.DeepCopy()},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {managedHostObject},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {staleVirtualObject},
+			},
+			AdjustConfig: requireSyncLabel,
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncerCtx, syncer := newFakeSyncer(t, ctx)
+				_, err := syncer.Sync(syncerCtx, synccontext.NewSyncEvent(managedHostObject.DeepCopy(), staleVirtualObject.DeepCopy()))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                 "Delete owned same-name virtual mirror when managed host also fails selector",
+			InitialPhysicalState: []runtime.Object{managedHostObject.DeepCopy()},
+			InitialVirtualState:  []runtime.Object{ownedStaleVirtualObject.DeepCopy()},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {managedHostObject},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {},
+			},
+			AdjustConfig: requireSyncLabel,
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncerCtx, syncer := newFakeSyncer(t, ctx)
+				_, err := syncer.Sync(syncerCtx, synccontext.NewSyncEvent(managedHostObject.DeepCopy(), ownedStaleVirtualObject.DeepCopy()))
+				assert.NilError(t, err)
+			},
+		},
+		{
 			Name:                 "Preserve guest-only storage class when host resource is absent",
 			InitialPhysicalState: []runtime.Object{},
 			InitialVirtualState:  []runtime.Object{guestOnlyObject.DeepCopy()},
