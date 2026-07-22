@@ -461,6 +461,9 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization
 		}
 		return false, err
 	}
+	if !s.externalPopulatorHostPVReady(vObj, hostPV) {
+		return false, nil
+	}
 	currentTarget, targetReady, err := s.externalPopulatorCurrentHostTarget(ctx, pObj, vObj, hostPVName)
 	if err != nil || !targetReady {
 		return false, err
@@ -506,6 +509,9 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization
 			return false, nil
 		}
 		return false, err
+	}
+	if !s.externalPopulatorHostPVReady(vObj, currentHostPV) {
+		return false, nil
 	}
 	if !claimRefMatchesPersistentVolumeClaim(currentHostPV.Spec.ClaimRef, pObj) {
 		s.recordExternalPopulatorTopologyEvent(
@@ -613,6 +619,17 @@ func (s *persistentVolumeClaimSyncer) externalPopulatorHandoffTopologyReady(
 		)
 		return false, nil
 	}
+	if hostHelperPVC.DeletionTimestamp != nil {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyNotReadyEventReason,
+			"External-populator handoff is waiting because host helper PVC %s/%s is terminating since %s",
+			hostHelperPVC.Namespace,
+			hostHelperPVC.Name,
+			hostHelperPVC.DeletionTimestamp.Time.UTC().Format(time.RFC3339Nano),
+		)
+		return false, nil
+	}
 
 	helperSelectedNode := hostHelperPVC.Annotations[selectedNodeAnnotation]
 	if helperSelectedNode == "" {
@@ -640,10 +657,6 @@ func (s *persistentVolumeClaimSyncer) externalPopulatorHandoffTopologyReady(
 		return false, nil
 	}
 
-	if hostPV.Spec.NodeAffinity == nil || hostPV.Spec.NodeAffinity.Required == nil {
-		return true, nil
-	}
-
 	hostNode := &corev1.Node{}
 	err = ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: targetSelectedNode}, hostNode)
 	if err != nil {
@@ -657,6 +670,19 @@ func (s *persistentVolumeClaimSyncer) externalPopulatorHandoffTopologyReady(
 			return false, nil
 		}
 		return false, fmt.Errorf("get host target Node %q for external-populator handoff: %w", targetSelectedNode, err)
+	}
+	if hostNode.DeletionTimestamp != nil {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyNotReadyEventReason,
+			"External-populator handoff is waiting because selected host Node %q is terminating since %s",
+			targetSelectedNode,
+			hostNode.DeletionTimestamp.Time.UTC().Format(time.RFC3339Nano),
+		)
+		return false, nil
+	}
+	if hostPV.Spec.NodeAffinity == nil || hostPV.Spec.NodeAffinity.Required == nil {
+		return true, nil
 	}
 
 	matches, err := nodeaffinity.NewLazyErrorNodeSelector(hostPV.Spec.NodeAffinity.Required).Match(hostNode)
@@ -767,6 +793,21 @@ func (s *persistentVolumeClaimSyncer) recordExternalPopulatorTopologyEvent(vObj 
 		note,
 		args...,
 	)
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorHostPVReady(vObj *corev1.PersistentVolumeClaim, hostPV *corev1.PersistentVolume) bool {
+	if hostPV.DeletionTimestamp == nil {
+		return true
+	}
+
+	s.recordExternalPopulatorTopologyEvent(
+		vObj,
+		externalPopulatorTopologyNotReadyEventReason,
+		"External-populator handoff is waiting because populated host PV %q is terminating since %s",
+		hostPV.Name,
+		hostPV.DeletionTimestamp.Time.UTC().Format(time.RFC3339Nano),
+	)
+	return false
 }
 
 func (s *persistentVolumeClaimSyncer) externalPopulatorCurrentHostTarget(
