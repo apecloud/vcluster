@@ -8,6 +8,10 @@ tests:
       rbac:
         enableVolumeSnapshotRules:
           enabled: false
+      sync:
+        toHost:
+          persistentVolumeClaims:
+            enabled: false
     asserts:
       - hasDocuments:
           count: 0
@@ -37,6 +41,36 @@ tests:
             resources: [ "volumesnapshotcontents" ]
             verbs:
               [ "create", "delete", "patch", "update", "get", "list" ]
+
+  - it: fake PV PVC sync can read target node topology
+    set:
+      rbac:
+        enableVolumeSnapshotRules:
+          enabled: false
+      sync:
+        toHost:
+          persistentVolumeClaims:
+            enabled: true
+          persistentVolumes:
+            enabled: false
+    asserts:
+      - hasDocuments:
+          count: 1
+      - lengthEqual:
+          path: rules
+          count: 2
+      - contains:
+          path: rules
+          content:
+            apiGroups: [ "" ]
+            resources: [ "persistentvolumes" ]
+            verbs: [ "get", "list", "watch", "patch" ]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [ "" ]
+            resources: [ "nodes" ]
+            verbs: [ "get" ]
 
   - it: force enable
     set:
@@ -162,7 +196,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 6
       - contains:
           path: rules
           content:
@@ -212,7 +246,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 7
       - contains:
           path: rules
           content:
@@ -243,7 +277,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 7
       - contains:
           path: rules
           content:
@@ -269,7 +303,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 6
       - contains:
           path: rules
           content:
@@ -288,7 +322,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 6
       - contains:
           path: rules
           content:
@@ -318,7 +352,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 5
       - contains:
           path: rules
           content:
@@ -343,7 +377,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 6
       - contains:
           path: rules
           content:
@@ -359,7 +393,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -419,7 +453,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 6
       - contains:
           path: rules
           content:
@@ -439,7 +473,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 7
       - contains:
           path: rules
           content:
@@ -465,7 +499,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 7
       - contains:
           path: rules
           content:
@@ -487,7 +521,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 6
       - contains:
           path: rules
           content:
@@ -514,7 +548,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 8
       - contains:
           path: rules
           content:
@@ -588,7 +622,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 8
       - contains:
           path: rules
           content:
@@ -624,7 +658,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 8
       - contains:
           path: rules
           content:
@@ -660,7 +694,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 8
       - contains:
           path: rules
           content:
@@ -707,7 +741,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 8
       - contains:
           path: rules
           content:
@@ -743,7 +777,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 8
       - contains:
           path: rules
           content:
@@ -779,7 +813,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 8
       - contains:
           path: rules
           content:
@@ -813,7 +847,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 6
       - contains:
           path: rules
           content:
