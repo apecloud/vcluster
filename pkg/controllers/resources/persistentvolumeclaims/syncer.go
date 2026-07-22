@@ -27,6 +27,7 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -56,6 +57,10 @@ const (
 	externalPopulatorRestoreConditionReasonProcessing  = "Processing"
 	externalPopulatorNoDataRestoreMessage              = "Provisioning PVC without data restore"
 	externalPopulatorNoDataRestoreBackoff              = 15 * time.Second
+
+	externalPopulatorTopologyMismatchEventReason = "ExternalPopulatorTopologyMismatch"
+	externalPopulatorTopologyNotReadyEventReason = "ExternalPopulatorTopologyNotReady"
+	externalPopulatorTopologyEventAction         = "SyncPersistentVolumeClaim"
 )
 
 func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
@@ -437,20 +442,80 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization
 	if err != nil {
 		if kerrors.IsNotFound(err) {
 			ctx.Log.Infof("populated host pv %s for external populator pvc %s/%s not found, keeping virtual pvc pending", hostPVName, vObj.Namespace, vObj.Name)
+			s.recordExternalPopulatorTopologyEvent(
+				vObj,
+				externalPopulatorTopologyNotReadyEventReason,
+				"External-populator handoff is waiting because populated host PV %q is not available",
+				hostPVName,
+			)
 			return false, nil
 		}
 		return false, err
+	}
+	currentTarget, targetReady, err := s.externalPopulatorCurrentHostTarget(ctx, pObj, vObj, hostPVName)
+	if err != nil || !targetReady {
+		return false, err
+	}
+	*pObj = *currentTarget
+	if pObj.Spec.VolumeName == hostPVName && claimRefMatchesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) {
+		return true, nil
 	}
 
 	helperPVC, helperFound, err := s.findExternalPopulatorHelperPVC(ctx, vObj, vPV)
 	if err != nil {
 		return false, err
 	}
-
-	if !shouldKeepExternalPopulatorHostPVCSpecImmutable(pObj, vObj) {
-		pObj.Spec.VolumeName = hostPVName
+	topologyReady, err := s.externalPopulatorHandoffTopologyReady(ctx, hostPV, pObj, vObj, helperPVC, helperFound)
+	if err != nil || !topologyReady {
+		return false, err
 	}
-	return s.ensureExternalPopulatorHostPVClaimRef(ctx, hostPVName, pObj, vObj, helperPVC, helperFound)
+	currentTarget, targetReady, err = s.externalPopulatorCurrentHostTarget(ctx, pObj, vObj, hostPVName)
+	if err != nil || !targetReady {
+		return false, err
+	}
+	*pObj = *currentTarget
+
+	claimRefReady, err := s.ensureExternalPopulatorHostPVClaimRef(ctx, hostPV, pObj, vObj, helperPVC, helperFound)
+	if err != nil || !claimRefReady {
+		return false, err
+	}
+
+	// A helper-to-target claimRef patch and a target PVC patch cannot be one
+	// Kubernetes transaction. Re-read and re-run the full topology gate after
+	// the claimRef commit so a stale/changed PV, helper, or Node snapshot cannot
+	// be carried into the target volumeName commit.
+	currentHostPV := &corev1.PersistentVolume{}
+	err = ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, currentHostPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			s.recordExternalPopulatorTopologyEvent(
+				vObj,
+				externalPopulatorTopologyNotReadyEventReason,
+				"External-populator handoff is waiting because populated host PV %q disappeared before target materialization",
+				hostPVName,
+			)
+			return false, nil
+		}
+		return false, err
+	}
+	if !claimRefMatchesPersistentVolumeClaim(currentHostPV.Spec.ClaimRef, pObj) {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyNotReadyEventReason,
+			"External-populator handoff is waiting because host PV %q claimRef changed before target materialization",
+			hostPVName,
+		)
+		return false, nil
+	}
+	topologyReady, err = s.externalPopulatorHandoffTopologyReady(ctx, currentHostPV, pObj, vObj, helperPVC, helperFound)
+	if err != nil || !topologyReady {
+		return false, err
+	}
+
+	if shouldKeepExternalPopulatorHostPVCSpecImmutable(pObj, vObj) {
+		return true, nil
+	}
+	return s.ensureExternalPopulatorHostTargetVolumeName(ctx, pObj, vObj, hostPVName)
 }
 
 func (s *persistentVolumeClaimSyncer) externalPopulatorHostPersistentVolumeName(ctx *synccontext.SyncContext, vPV *corev1.PersistentVolume) string {
@@ -486,15 +551,318 @@ func (s *persistentVolumeClaimSyncer) findExternalPopulatorHelperPVC(ctx *syncco
 	return match, true, nil
 }
 
-// ensureExternalPopulatorHostPVClaimRef returns true when the host PV claimRef
-// references the host target PVC, either already or after a successful handoff patch.
-func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx *synccontext.SyncContext, hostPVName string, pObj, vObj *corev1.PersistentVolumeClaim, helperPVC *corev1.PersistentVolumeClaim, helperFound bool) (bool, error) {
-	hostPV := &corev1.PersistentVolume{}
-	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, hostPV)
+func (s *persistentVolumeClaimSyncer) externalPopulatorHandoffTopologyReady(
+	ctx *synccontext.SyncContext,
+	hostPV *corev1.PersistentVolume,
+	pObj, vObj, helperPVC *corev1.PersistentVolumeClaim,
+	helperFound bool,
+) (bool, error) {
+	targetSelectedNode := pObj.Annotations[selectedNodeAnnotation]
+	if targetSelectedNode == "" {
+		waitForFirstConsumer, storageClassName, storageClassFound, err := s.externalPopulatorTargetWaitForFirstConsumer(ctx, vObj)
+		if err != nil {
+			return false, err
+		}
+		if !storageClassFound {
+			s.recordExternalPopulatorTopologyEvent(
+				vObj,
+				externalPopulatorTopologyNotReadyEventReason,
+				"External-populator handoff is waiting because guest StorageClass %q is not available to classify an empty %s annotation",
+				storageClassName,
+				selectedNodeAnnotation,
+			)
+			return false, nil
+		}
+		if waitForFirstConsumer {
+			s.recordExternalPopulatorTopologyEvent(
+				vObj,
+				externalPopulatorTopologyNotReadyEventReason,
+				"External-populator handoff is waiting because guest StorageClass %q uses WaitForFirstConsumer and host target PVC %s/%s has no %s annotation",
+				storageClassName,
+				pObj.Namespace,
+				pObj.Name,
+				selectedNodeAnnotation,
+			)
+			return false, nil
+		}
+
+		// An empty selected-node is legal for Immediate/static and unconstrained
+		// shared volumes. Do not reinterpret this sentinel as WFFC-not-ready.
+		return true, nil
+	}
+
+	hostHelperPVC, hostHelperFound, err := s.externalPopulatorHostHelperPVC(ctx, hostPV, pObj, vObj, helperPVC, helperFound)
 	if err != nil {
 		return false, err
 	}
+	if !hostHelperFound {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyNotReadyEventReason,
+			"External-populator handoff to target selected-node %q is waiting because the host populate helper PVC is not available",
+			targetSelectedNode,
+		)
+		return false, nil
+	}
 
+	helperSelectedNode := hostHelperPVC.Annotations[selectedNodeAnnotation]
+	if helperSelectedNode == "" {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyNotReadyEventReason,
+			"External-populator handoff to target selected-node %q is waiting because host helper PVC %s/%s has no %s annotation",
+			targetSelectedNode,
+			hostHelperPVC.Namespace,
+			hostHelperPVC.Name,
+			selectedNodeAnnotation,
+		)
+		return false, nil
+	}
+	if helperSelectedNode != targetSelectedNode {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyMismatchEventReason,
+			"External-populator handoff rejected: host target selected-node %q does not match host helper PVC %s/%s selected-node %q",
+			targetSelectedNode,
+			hostHelperPVC.Namespace,
+			hostHelperPVC.Name,
+			helperSelectedNode,
+		)
+		return false, nil
+	}
+
+	if hostPV.Spec.NodeAffinity == nil || hostPV.Spec.NodeAffinity.Required == nil {
+		return true, nil
+	}
+
+	hostNode := &corev1.Node{}
+	err = ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: targetSelectedNode}, hostNode)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			s.recordExternalPopulatorTopologyEvent(
+				vObj,
+				externalPopulatorTopologyNotReadyEventReason,
+				"External-populator handoff to target selected-node %q is waiting because that host Node is not available",
+				targetSelectedNode,
+			)
+			return false, nil
+		}
+		return false, fmt.Errorf("get host target Node %q for external-populator handoff: %w", targetSelectedNode, err)
+	}
+
+	matches, err := nodeaffinity.NewLazyErrorNodeSelector(hostPV.Spec.NodeAffinity.Required).Match(hostNode)
+	if err != nil {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyMismatchEventReason,
+			"External-populator handoff rejected because host PV %s has invalid required node affinity: %v",
+			hostPV.Name,
+			err,
+		)
+		return false, nil
+	}
+	if !matches {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyMismatchEventReason,
+			"External-populator handoff rejected: host PV %s required node affinity %v does not accept target selected-node %q",
+			hostPV.Name,
+			hostPV.Spec.NodeAffinity.Required,
+			targetSelectedNode,
+		)
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorTargetWaitForFirstConsumer(ctx *synccontext.SyncContext, vObj *corev1.PersistentVolumeClaim) (bool, string, bool, error) {
+	storageClassName := ""
+	if vObj.Spec.StorageClassName != nil {
+		storageClassName = *vObj.Spec.StorageClassName
+	}
+	if storageClassName == "" {
+		storageClassName = vObj.Annotations[deprecatedStorageClassAnnotation]
+	}
+	if storageClassName == "" {
+		return false, "", true, nil
+	}
+
+	storageClass := &storagev1.StorageClass{}
+	err := ctx.VirtualClient.Get(ctx.Context, types.NamespacedName{Name: storageClassName}, storageClass)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, storageClassName, false, nil
+		}
+		return false, storageClassName, false, fmt.Errorf("get guest StorageClass %q for external-populator handoff: %w", storageClassName, err)
+	}
+	if storageClass.DeletionTimestamp != nil {
+		return false, storageClassName, false, nil
+	}
+	if storageClass.VolumeBindingMode == nil || *storageClass.VolumeBindingMode == storagev1.VolumeBindingImmediate {
+		return false, storageClassName, true, nil
+	}
+	if *storageClass.VolumeBindingMode == storagev1.VolumeBindingWaitForFirstConsumer {
+		return true, storageClassName, true, nil
+	}
+
+	return false, storageClassName, true, fmt.Errorf("guest StorageClass %q has unsupported volumeBindingMode %q", storageClassName, *storageClass.VolumeBindingMode)
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorHostHelperPVC(
+	ctx *synccontext.SyncContext,
+	hostPV *corev1.PersistentVolume,
+	pObj, vObj, helperPVC *corev1.PersistentVolumeClaim,
+	helperFound bool,
+) (*corev1.PersistentVolumeClaim, bool, error) {
+	ref := hostPV.Spec.ClaimRef
+	hostHelperName := types.NamespacedName{}
+	if helperFound {
+		hostHelperName = s.VirtualToHost(ctx, types.NamespacedName{Name: helperPVC.Name, Namespace: helperPVC.Namespace}, helperPVC)
+		if ref != nil && !claimRefReferencesPersistentVolumeClaim(ref, pObj) && (ref.Namespace != hostHelperName.Namespace || ref.Name != hostHelperName.Name) {
+			return nil, false, fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPV.Name, ref.Namespace, ref.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
+		}
+	} else {
+		expectedHostHelperName, expectedHelperFound := s.externalPopulatorExpectedHostHelperName(ctx, vObj)
+		if !expectedHelperFound {
+			return nil, false, nil
+		}
+		if ref != nil && !claimRefReferencesPersistentVolumeClaim(ref, pObj) && (ref.Namespace != expectedHostHelperName.Namespace || ref.Name != expectedHostHelperName.Name) {
+			return nil, false, fmt.Errorf("host pv %s is bound to %s/%s, but no virtual populate helper pvc was found for target pvc %s/%s", hostPV.Name, ref.Namespace, ref.Name, pObj.Namespace, pObj.Name)
+		}
+		hostHelperName = expectedHostHelperName
+	}
+
+	hostHelperPVC := &corev1.PersistentVolumeClaim{}
+	err := ctx.HostClient.Get(ctx.Context, hostHelperName, hostHelperPVC)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if ref != nil && !claimRefReferencesPersistentVolumeClaim(ref, pObj) && ref.UID != "" && ref.UID != hostHelperPVC.UID {
+		return nil, false, fmt.Errorf("host pv %s claimRef UID %s does not match host populate helper pvc %s/%s UID %s", hostPV.Name, ref.UID, hostHelperPVC.Namespace, hostHelperPVC.Name, hostHelperPVC.UID)
+	}
+
+	return hostHelperPVC, true, nil
+}
+
+func (s *persistentVolumeClaimSyncer) recordExternalPopulatorTopologyEvent(vObj *corev1.PersistentVolumeClaim, reason, note string, args ...interface{}) {
+	s.EventRecorder().Eventf(
+		vObj,
+		nil,
+		"Warning",
+		reason,
+		externalPopulatorTopologyEventAction,
+		note,
+		args...,
+	)
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorCurrentHostTarget(
+	ctx *synccontext.SyncContext,
+	pObj, vObj *corev1.PersistentVolumeClaim,
+	hostPVName string,
+) (*corev1.PersistentVolumeClaim, bool, error) {
+	current := &corev1.PersistentVolumeClaim{}
+	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Namespace: pObj.Namespace, Name: pObj.Name}, current)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			s.recordExternalPopulatorTopologyEvent(
+				vObj,
+				externalPopulatorTopologyNotReadyEventReason,
+				"External-populator handoff is waiting because host target PVC %s/%s is not available",
+				pObj.Namespace,
+				pObj.Name,
+			)
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if current.UID != pObj.UID || current.DeletionTimestamp != nil {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyNotReadyEventReason,
+			"External-populator handoff is waiting because host target PVC %s/%s was replaced or is terminating",
+			pObj.Namespace,
+			pObj.Name,
+		)
+		return nil, false, nil
+	}
+
+	gatedSelectedNode := pObj.Annotations[selectedNodeAnnotation]
+	currentSelectedNode := current.Annotations[selectedNodeAnnotation]
+	if currentSelectedNode != gatedSelectedNode {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyMismatchEventReason,
+			"External-populator handoff rejected because host target PVC selected-node changed from %q to %q before target materialization",
+			gatedSelectedNode,
+			currentSelectedNode,
+		)
+		return nil, false, nil
+	}
+	if current.Spec.VolumeName != "" && current.Spec.VolumeName != hostPVName {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyMismatchEventReason,
+			"External-populator handoff rejected because host target PVC %s/%s already references volume %q instead of %q",
+			current.Namespace,
+			current.Name,
+			current.Spec.VolumeName,
+			hostPVName,
+		)
+		return nil, false, nil
+	}
+	if current.Spec.VolumeName == "" && !isHostPVCWaitingForVolume(current) {
+		s.recordExternalPopulatorTopologyEvent(
+			vObj,
+			externalPopulatorTopologyNotReadyEventReason,
+			"External-populator handoff is waiting because host target PVC %s/%s is no longer waiting for a volume",
+			current.Namespace,
+			current.Name,
+		)
+		return nil, false, nil
+	}
+
+	return current, true, nil
+}
+
+// ensureExternalPopulatorHostTargetVolumeName commits the safety-critical
+// target binding against a fresh host PVC snapshot. The explicit selected-node
+// comparison catches a changed cached object before the patch, and the
+// optimistic lock catches a change between the GET and PATCH.
+func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostTargetVolumeName(
+	ctx *synccontext.SyncContext,
+	pObj, vObj *corev1.PersistentVolumeClaim,
+	hostPVName string,
+) (bool, error) {
+	current, ready, err := s.externalPopulatorCurrentHostTarget(ctx, pObj, vObj, hostPVName)
+	if err != nil || !ready {
+		return false, err
+	}
+	if current.Spec.VolumeName == hostPVName {
+		*pObj = *current
+		return true, nil
+	}
+
+	updated := current.DeepCopy()
+	updated.Spec.VolumeName = hostPVName
+	err = ctx.HostClient.Patch(ctx.Context, updated, client.MergeFromWithOptions(current, client.MergeFromWithOptimisticLock{}))
+	if err != nil {
+		return false, err
+	}
+	*pObj = *updated
+	return true, nil
+}
+
+// ensureExternalPopulatorHostPVClaimRef returns true when the host PV claimRef
+// references the host target PVC, either already or after a successful handoff patch.
+// The caller passes the same PV snapshot used by the topology gate so an intervening
+// update is rejected by the optimistic-lock patch instead of bypassing validation.
+func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx *synccontext.SyncContext, hostPV *corev1.PersistentVolume, pObj, vObj *corev1.PersistentVolumeClaim, helperPVC *corev1.PersistentVolumeClaim, helperFound bool) (bool, error) {
+	hostPVName := hostPV.Name
 	targetRef := &corev1.ObjectReference{
 		APIVersion: corev1.SchemeGroupVersion.Version,
 		Kind:       "PersistentVolumeClaim",
@@ -523,7 +891,7 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 
 	updated := hostPV.DeepCopy()
 	updated.Spec.ClaimRef = targetRef
-	err = ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(hostPV))
+	err := ctx.HostClient.Patch(ctx.Context, updated, client.MergeFromWithOptions(hostPV, client.MergeFromWithOptimisticLock{}))
 	if err != nil {
 		return false, err
 	}
@@ -542,8 +910,16 @@ func shouldKeepExternalPopulatorHostPVCSpecImmutable(pObj, vObj *corev1.Persiste
 }
 
 func (s *persistentVolumeClaimSyncer) hostPVClaimRefMatchesExpectedPopulateHelper(ctx *synccontext.SyncContext, ref *corev1.ObjectReference, targetPVC *corev1.PersistentVolumeClaim) bool {
-	if ref == nil || targetPVC == nil || targetPVC.UID == "" {
+	if ref == nil {
 		return false
+	}
+	hostName, ok := s.externalPopulatorExpectedHostHelperName(ctx, targetPVC)
+	return ok && ref.Namespace == hostName.Namespace && ref.Name == hostName.Name
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorExpectedHostHelperName(ctx *synccontext.SyncContext, targetPVC *corev1.PersistentVolumeClaim) (types.NamespacedName, bool) {
+	if targetPVC == nil || targetPVC.UID == "" {
+		return types.NamespacedName{}, false
 	}
 
 	helperPVC := &corev1.PersistentVolumeClaim{
@@ -557,7 +933,7 @@ func (s *persistentVolumeClaimSyncer) hostPVClaimRefMatchesExpectedPopulateHelpe
 		Name:      helperPVC.Name,
 	}, helperPVC)
 
-	return ref.Namespace == hostName.Namespace && ref.Name == hostName.Name
+	return hostName, true
 }
 
 func (s *persistentVolumeClaimSyncer) hostPVClaimRefMatchesVirtualPVC(ctx *synccontext.SyncContext, ref *corev1.ObjectReference, vPVC *corev1.PersistentVolumeClaim) (bool, error) {

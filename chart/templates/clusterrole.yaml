@@ -84,6 +84,12 @@ rules:
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch", "patch"]
   {{- end }}
+  {{- if and .Values.sync.toHost.persistentVolumeClaims.enabled (not (or .Values.pro .Values.sync.fromHost.nodes.enabled)) }}
+  {{- /* external populator topology handoff validates a target selected-node against host PV node affinity */}}
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+  {{- end }}
   {{- if .Values.sync.fromHost.ingressClasses.enabled }}
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingressclasses"]

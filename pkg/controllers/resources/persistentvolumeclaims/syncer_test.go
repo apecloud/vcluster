@@ -1,15 +1,18 @@
 package persistentvolumeclaims
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/loft-sh/vcluster/pkg/config"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	syncertesting "github.com/loft-sh/vcluster/pkg/syncer/testing"
+	syncertypes "github.com/loft-sh/vcluster/pkg/syncer/types"
 	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
 	"gotest.tools/assert"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 
@@ -20,6 +23,92 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+type eventRecordingTranslator struct {
+	syncertypes.GenericTranslator
+	recorder events.EventRecorder
+}
+
+func (t *eventRecordingTranslator) EventRecorder() events.EventRecorder {
+	return t.recorder
+}
+
+func installPVCEventRecorder(syncer *persistentVolumeClaimSyncer) *events.FakeRecorder {
+	recorder := events.NewFakeRecorder(4)
+	syncer.GenericTranslator = &eventRecordingTranslator{
+		GenericTranslator: syncer.GenericTranslator,
+		recorder:          recorder,
+	}
+	return recorder
+}
+
+func assertSinglePVCEvent(t *testing.T, recorder *events.FakeRecorder, fragments ...string) {
+	t.Helper()
+
+	var event string
+	select {
+	case event = <-recorder.Events:
+	default:
+		t.Error("expected one PVC event, got none")
+		return
+	}
+	for _, fragment := range fragments {
+		assert.Check(t, strings.Contains(event, fragment), "event %q does not contain %q", event, fragment)
+	}
+	select {
+	case extra := <-recorder.Events:
+		t.Errorf("expected one PVC event, got extra event %q", extra)
+	default:
+	}
+}
+
+func assertNoPVCEvent(t *testing.T, recorder *events.FakeRecorder) {
+	t.Helper()
+
+	select {
+	case event := <-recorder.Events:
+		t.Errorf("expected no PVC event, got %q", event)
+	default:
+	}
+}
+
+func checkExternalPopulatorHandoffPending(
+	t *testing.T,
+	ctx *synccontext.SyncContext,
+	hostTarget, virtualTarget, expectedClaimRef types.NamespacedName,
+	hostPVName string,
+) {
+	t.Helper()
+
+	actualHostTarget := &corev1.PersistentVolumeClaim{}
+	if err := ctx.HostClient.Get(ctx.Context, hostTarget, actualHostTarget); err != nil {
+		t.Errorf("get host target PVC after handoff: %v", err)
+	} else if actualHostTarget.Spec.VolumeName != "" {
+		t.Errorf("host target PVC volumeName changed before topology convergence: %q", actualHostTarget.Spec.VolumeName)
+	}
+
+	actualHostPV := &corev1.PersistentVolume{}
+	if err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, actualHostPV); err != nil {
+		t.Errorf("get host PV after handoff: %v", err)
+	} else if actualHostPV.Spec.ClaimRef == nil {
+		t.Error("host PV claimRef was cleared before topology convergence")
+	} else if actualHostPV.Spec.ClaimRef.Namespace != expectedClaimRef.Namespace || actualHostPV.Spec.ClaimRef.Name != expectedClaimRef.Name {
+		t.Errorf(
+			"host PV claimRef changed before topology convergence: got %s/%s, want %s/%s",
+			actualHostPV.Spec.ClaimRef.Namespace,
+			actualHostPV.Spec.ClaimRef.Name,
+			expectedClaimRef.Namespace,
+			expectedClaimRef.Name,
+		)
+	}
+
+	actualVirtualTarget := &corev1.PersistentVolumeClaim{}
+	if err := ctx.VirtualClient.Get(ctx.Context, virtualTarget, actualVirtualTarget); err != nil {
+		t.Errorf("get virtual target PVC after handoff: %v", err)
+	} else if actualVirtualTarget.Status.Phase != corev1.ClaimPending {
+		t.Errorf("virtual target PVC phase changed before topology convergence: %q", actualVirtualTarget.Status.Phase)
+	}
+}
 
 func TestSync(t *testing.T) {
 	vObjectMeta := metav1.ObjectMeta{
@@ -424,6 +513,94 @@ func TestSync(t *testing.T) {
 	dataProtectionHostPVBoundToTargetStaleUID.Spec.ClaimRef.UID = types.UID("stale-host-target-pvc-uid")
 	dataProtectionHostPVBoundToTargetFreshUID := dataProtectionHostPVBoundToTarget.DeepCopy()
 	dataProtectionHostPVBoundToTargetFreshUID.Spec.ClaimRef.UID = dataProtectionHostPendingPvcWithObjectUID.UID
+
+	withStorageClassAndSelectedNode := func(pvc *corev1.PersistentVolumeClaim, storageClassName, selectedNode string, hostObject bool) *corev1.PersistentVolumeClaim {
+		updated := pvc.DeepCopy()
+		updated.Spec.StorageClassName = &storageClassName
+		if selectedNode == "" {
+			return updated
+		}
+		if updated.Annotations == nil {
+			updated.Annotations = map[string]string{}
+		}
+		updated.Annotations[selectedNodeAnnotation] = selectedNode
+		if hostObject {
+			updated.Annotations[translate.ManagedAnnotationsAnnotation] = selectedNodeAnnotation
+		}
+		return updated
+	}
+	withRequiredNodeAffinity := func(pv *corev1.PersistentVolume, hostname string) *corev1.PersistentVolume {
+		updated := pv.DeepCopy()
+		updated.Spec.NodeAffinity = &corev1.VolumeNodeAffinity{
+			Required: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{
+								Key:      corev1.LabelHostname,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{hostname},
+							},
+						},
+					},
+				},
+			},
+		}
+		return updated
+	}
+	node2 := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node2",
+			Labels: map[string]string{corev1.LabelHostname: "node2"},
+		},
+	}
+	node4 := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node4",
+			Labels: map[string]string{corev1.LabelHostname: "node4"},
+		},
+	}
+
+	dataProtectionWFFCTargetNode4Pvc := withStorageClassAndSelectedNode(dataProtectionBackupPendingPvcWithVolumeName, waitForFirstConsumerStorageClassName, "node4", false)
+	dataProtectionWFFCTargetNode4BoundPvc := dataProtectionWFFCTargetNode4Pvc.DeepCopy()
+	dataProtectionWFFCTargetNode4BoundPvc.Status = *dataProtectionBackupPendingPvcWithVolumeNameBoundStatus.Status.DeepCopy()
+	dataProtectionHostWFFCTargetNode4Pvc := withStorageClassAndSelectedNode(dataProtectionHostPendingPvcWithUID, waitForFirstConsumerStorageClassName, "node4", true)
+	dataProtectionHostWFFCMaterializedTargetNode4Pvc := dataProtectionHostWFFCTargetNode4Pvc.DeepCopy()
+	dataProtectionHostWFFCMaterializedTargetNode4Pvc.Spec.VolumeName = dataProtectionPopulatedPV.Name
+	dataProtectionHostWFFCTargetNode2Pvc := withStorageClassAndSelectedNode(dataProtectionHostPendingPvcWithUID, waitForFirstConsumerStorageClassName, "node2", true)
+
+	dataProtectionWFFCHelperNode2Pvc := withStorageClassAndSelectedNode(dataProtectionPopulateHelperPvc, waitForFirstConsumerStorageClassName, "node2", false)
+	dataProtectionHostWFFCHelperNode2Pvc := withStorageClassAndSelectedNode(dataProtectionHostPopulateHelperPvc, waitForFirstConsumerStorageClassName, "node2", true)
+	dataProtectionWFFCHelperNode4Pvc := withStorageClassAndSelectedNode(dataProtectionPopulateHelperPvc, waitForFirstConsumerStorageClassName, "node4", false)
+	dataProtectionHostWFFCHelperNode4Pvc := withStorageClassAndSelectedNode(dataProtectionHostPopulateHelperPvc, waitForFirstConsumerStorageClassName, "node4", true)
+
+	dataProtectionWFFCVirtualPVNode2BoundToHelper := withRequiredNodeAffinity(dataProtectionPopulatedPVBoundToHelper, "node2")
+	dataProtectionWFFCHostPVNode2BoundToHelper := withRequiredNodeAffinity(dataProtectionHostPVBoundToHelper, "node2")
+	dataProtectionWFFCVirtualPVNode4BoundToHelper := withRequiredNodeAffinity(dataProtectionPopulatedPVBoundToHelper, "node4")
+	dataProtectionWFFCVirtualPVNode4BoundToTarget := withRequiredNodeAffinity(dataProtectionPopulatedPV, "node4")
+	dataProtectionWFFCHostPVNode4BoundToHelper := withRequiredNodeAffinity(dataProtectionHostPVBoundToHelper, "node4")
+	dataProtectionWFFCHostPVNode4BoundToTarget := dataProtectionWFFCHostPVNode4BoundToHelper.DeepCopy()
+	dataProtectionWFFCHostPVNode4BoundToTarget.Spec.ClaimRef = dataProtectionHostPVBoundToTarget.Spec.ClaimRef.DeepCopy()
+
+	dataProtectionWFFCTargetWithoutSelectedNodePvc := withStorageClassAndSelectedNode(dataProtectionBackupPendingPvcWithVolumeName, waitForFirstConsumerStorageClassName, "", false)
+	dataProtectionHostWFFCTargetWithoutSelectedNodePvc := withStorageClassAndSelectedNode(dataProtectionHostPendingPvcWithUID, waitForFirstConsumerStorageClassName, "", true)
+	dataProtectionWFFCHelperWithoutSelectedNodePvc := withStorageClassAndSelectedNode(dataProtectionPopulateHelperPvc, waitForFirstConsumerStorageClassName, "", false)
+	dataProtectionHostWFFCHelperWithoutSelectedNodePvc := withStorageClassAndSelectedNode(dataProtectionHostPopulateHelperPvc, waitForFirstConsumerStorageClassName, "", true)
+
+	immediateMode := storagev1.VolumeBindingImmediate
+	immediateStorageClassName := "immediate-sc"
+	immediateStorageClass := &storagev1.StorageClass{
+		ObjectMeta:        metav1.ObjectMeta{Name: immediateStorageClassName},
+		VolumeBindingMode: &immediateMode,
+	}
+	dataProtectionImmediateTargetPvc := withStorageClassAndSelectedNode(dataProtectionBackupPendingPvcWithVolumeName, immediateStorageClassName, "", false)
+	dataProtectionImmediateTargetBoundPvc := dataProtectionImmediateTargetPvc.DeepCopy()
+	dataProtectionImmediateTargetBoundPvc.Status = *dataProtectionBackupPendingPvcWithVolumeNameBoundStatus.Status.DeepCopy()
+	dataProtectionHostImmediateTargetPvc := withStorageClassAndSelectedNode(dataProtectionHostPendingPvcWithUID, immediateStorageClassName, "", true)
+	dataProtectionHostImmediateMaterializedTargetPvc := dataProtectionHostImmediateTargetPvc.DeepCopy()
+	dataProtectionHostImmediateMaterializedTargetPvc.Spec.VolumeName = dataProtectionPopulatedPV.Name
+	dataProtectionImmediateHelperPvc := withStorageClassAndSelectedNode(dataProtectionPopulateHelperPvc, immediateStorageClassName, "", false)
+	dataProtectionHostImmediateHelperPvc := withStorageClassAndSelectedNode(dataProtectionHostPopulateHelperPvc, immediateStorageClassName, "", true)
 
 	syncertesting.RunTestsWithContext(t, func(vConfig *config.VirtualClusterConfig, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient) *synccontext.RegisterContext {
 		ctx := syncertesting.NewFakeRegisterContext(vConfig, pClient, vClient)
@@ -1143,7 +1320,417 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
-			Name: "Bridge data protection populated host pv from helper pvc after target volume name is derived",
+			Name: "Keep WFFC external-populator handoff pending when target node4 disagrees with helper and PV node2",
+			InitialVirtualState: []runtime.Object{
+				waitForFirstConsumerStorageClass.DeepCopy(),
+				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode2BoundToHelper.DeepCopy(),
+				dataProtectionWFFCHelperNode2Pvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionHostWFFCHelperNode2Pvc.DeepCopy(),
+				dataProtectionWFFCHostPVNode2BoundToHelper.DeepCopy(),
+				node2.DeepCopy(),
+				node4.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCHelperNode2Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode2BoundToHelper.DeepCopy()},
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCHelperNode2Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCHostPVNode2BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("Node"):             {node2.DeepCopy(), node4.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+				pvcSyncer.useFakePersistentVolumes = true
+				recorder := installPVCEventRecorder(pvcSyncer)
+
+				result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.RequeueAfter == 2*time.Second, "expected a 2s topology requeue, got %s", result.RequeueAfter)
+				assertSinglePVCEvent(t, recorder, "Warning ExternalPopulatorTopologyMismatch", "node4", "node2")
+				checkExternalPopulatorHandoffPending(
+					t,
+					syncCtx,
+					types.NamespacedName{Namespace: dataProtectionHostWFFCTargetNode4Pvc.Namespace, Name: dataProtectionHostWFFCTargetNode4Pvc.Name},
+					types.NamespacedName{Namespace: dataProtectionWFFCTargetNode4Pvc.Namespace, Name: dataProtectionWFFCTargetNode4Pvc.Name},
+					types.NamespacedName{Namespace: dataProtectionHostWFFCHelperNode2Pvc.Namespace, Name: dataProtectionHostWFFCHelperNode2Pvc.Name},
+					dataProtectionWFFCHostPVNode2BoundToHelper.Name,
+				)
+			},
+		},
+		{
+			Name: "Keep WFFC external-populator handoff pending when target and helper node4 disagree with PV node2",
+			InitialVirtualState: []runtime.Object{
+				waitForFirstConsumerStorageClass.DeepCopy(),
+				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode2BoundToHelper.DeepCopy(),
+				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionHostWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCHostPVNode2BoundToHelper.DeepCopy(),
+				node2.DeepCopy(),
+				node4.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode2BoundToHelper.DeepCopy()},
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCHelperNode4Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCHostPVNode2BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("Node"):             {node2.DeepCopy(), node4.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+				pvcSyncer.useFakePersistentVolumes = true
+				recorder := installPVCEventRecorder(pvcSyncer)
+
+				result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.RequeueAfter == 2*time.Second, "expected a 2s topology requeue, got %s", result.RequeueAfter)
+				assertSinglePVCEvent(t, recorder, "Warning ExternalPopulatorTopologyMismatch", dataProtectionPopulatedPV.Name, "node4", "node2")
+				checkExternalPopulatorHandoffPending(
+					t,
+					syncCtx,
+					types.NamespacedName{Namespace: dataProtectionHostWFFCTargetNode4Pvc.Namespace, Name: dataProtectionHostWFFCTargetNode4Pvc.Name},
+					types.NamespacedName{Namespace: dataProtectionWFFCTargetNode4Pvc.Namespace, Name: dataProtectionWFFCTargetNode4Pvc.Name},
+					types.NamespacedName{Namespace: dataProtectionHostWFFCHelperNode4Pvc.Namespace, Name: dataProtectionHostWFFCHelperNode4Pvc.Name},
+					dataProtectionWFFCHostPVNode2BoundToHelper.Name,
+				)
+			},
+		},
+		{
+			Name: "Keep WFFC external-populator handoff pending when selected host Node is missing",
+			InitialVirtualState: []runtime.Object{
+				waitForFirstConsumerStorageClass.DeepCopy(),
+				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy(),
+				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionHostWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCHostPVNode4BoundToHelper.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy()},
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCHelperNode4Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCHostPVNode4BoundToHelper.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+				pvcSyncer.useFakePersistentVolumes = true
+				recorder := installPVCEventRecorder(pvcSyncer)
+
+				result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.RequeueAfter == 2*time.Second, "expected a 2s topology requeue, got %s", result.RequeueAfter)
+				assertSinglePVCEvent(t, recorder, "Warning ExternalPopulatorTopologyNotReady", "node4", "host Node")
+				checkExternalPopulatorHandoffPending(
+					t,
+					syncCtx,
+					types.NamespacedName{Namespace: dataProtectionHostWFFCTargetNode4Pvc.Namespace, Name: dataProtectionHostWFFCTargetNode4Pvc.Name},
+					types.NamespacedName{Namespace: dataProtectionWFFCTargetNode4Pvc.Namespace, Name: dataProtectionWFFCTargetNode4Pvc.Name},
+					types.NamespacedName{Namespace: dataProtectionHostWFFCHelperNode4Pvc.Namespace, Name: dataProtectionHostWFFCHelperNode4Pvc.Name},
+					dataProtectionWFFCHostPVNode4BoundToHelper.Name,
+				)
+			},
+		},
+		{
+			Name: "Complete WFFC target volumeName after claimRef handoff when virtual helper is gone",
+			InitialVirtualState: []runtime.Object{
+				waitForFirstConsumerStorageClass.DeepCopy(),
+				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionHostWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCHostPVNode4BoundToTarget.DeepCopy(),
+				node4.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionWFFCTargetNode4BoundPvc.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy()},
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"):       {waitForFirstConsumerStorageClass.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostWFFCMaterializedTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCHelperNode4Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCHostPVNode4BoundToTarget.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("Node"):             {node4.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+				pvcSyncer.useFakePersistentVolumes = true
+				recorder := installPVCEventRecorder(pvcSyncer)
+
+				result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.IsZero())
+				assertNoPVCEvent(t, recorder)
+			},
+		},
+		{
+			Name: "Keep WFFC target pending when cached selected-node changes before volumeName commit",
+			InitialVirtualState: []runtime.Object{
+				waitForFirstConsumerStorageClass.DeepCopy(),
+				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy(),
+				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostWFFCTargetNode2Pvc.DeepCopy(),
+				dataProtectionHostWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCHostPVNode4BoundToHelper.DeepCopy(),
+				node2.DeepCopy(),
+				node4.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy()},
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostWFFCTargetNode2Pvc.DeepCopy(),
+					dataProtectionHostWFFCHelperNode4Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCHostPVNode4BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("Node"):             {node2.DeepCopy(), node4.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+				pvcSyncer.useFakePersistentVolumes = true
+				recorder := installPVCEventRecorder(pvcSyncer)
+
+				result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.RequeueAfter == 2*time.Second, "expected a 2s topology requeue, got %s", result.RequeueAfter)
+				assertSinglePVCEvent(t, recorder, "Warning ExternalPopulatorTopologyMismatch", "node4", "node2")
+				checkExternalPopulatorHandoffPending(
+					t,
+					syncCtx,
+					types.NamespacedName{Namespace: dataProtectionHostWFFCTargetNode2Pvc.Namespace, Name: dataProtectionHostWFFCTargetNode2Pvc.Name},
+					types.NamespacedName{Namespace: dataProtectionWFFCTargetNode4Pvc.Namespace, Name: dataProtectionWFFCTargetNode4Pvc.Name},
+					types.NamespacedName{Namespace: dataProtectionHostWFFCHelperNode4Pvc.Namespace, Name: dataProtectionHostWFFCHelperNode4Pvc.Name},
+					dataProtectionWFFCHostPVNode4BoundToHelper.Name,
+				)
+			},
+		},
+		{
+			Name: "Bridge WFFC external-populator handoff when target helper and PV all select node4",
+			InitialVirtualState: []runtime.Object{
+				waitForFirstConsumerStorageClass.DeepCopy(),
+				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy(),
+				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+				dataProtectionHostWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCHostPVNode4BoundToHelper.DeepCopy(),
+				node2.DeepCopy(),
+				node4.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionWFFCTargetNode4BoundPvc.DeepCopy(),
+					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy()},
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostWFFCMaterializedTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCHelperNode4Pvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCHostPVNode4BoundToTarget.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("Node"):             {node2.DeepCopy(), node4.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+				pvcSyncer.useFakePersistentVolumes = true
+				recorder := installPVCEventRecorder(pvcSyncer)
+
+				result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.IsZero())
+				assertNoPVCEvent(t, recorder)
+			},
+		},
+		{
+			Name: "Keep WFFC external-populator handoff pending until target selected-node exists",
+			InitialVirtualState: []runtime.Object{
+				waitForFirstConsumerStorageClass.DeepCopy(),
+				dataProtectionWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
+				dataProtectionPopulatedPVBoundToHelper.DeepCopy(),
+				dataProtectionWFFCHelperWithoutSelectedNodePvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
+				dataProtectionHostWFFCHelperWithoutSelectedNodePvc.DeepCopy(),
+				dataProtectionHostPVBoundToHelper.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
+					dataProtectionWFFCHelperWithoutSelectedNodePvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionPopulatedPVBoundToHelper.DeepCopy()},
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
+					dataProtectionHostWFFCHelperWithoutSelectedNodePvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionHostPVBoundToHelper.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+				pvcSyncer.useFakePersistentVolumes = true
+				recorder := installPVCEventRecorder(pvcSyncer)
+
+				result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
+					dataProtectionHostWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
+					dataProtectionWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
+					dataProtectionWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.RequeueAfter == 2*time.Second, "expected a 2s topology requeue, got %s", result.RequeueAfter)
+				assertSinglePVCEvent(t, recorder, "Warning ExternalPopulatorTopologyNotReady", waitForFirstConsumerStorageClassName, selectedNodeAnnotation)
+				checkExternalPopulatorHandoffPending(
+					t,
+					syncCtx,
+					types.NamespacedName{Namespace: dataProtectionHostWFFCTargetWithoutSelectedNodePvc.Namespace, Name: dataProtectionHostWFFCTargetWithoutSelectedNodePvc.Name},
+					types.NamespacedName{Namespace: dataProtectionWFFCTargetWithoutSelectedNodePvc.Namespace, Name: dataProtectionWFFCTargetWithoutSelectedNodePvc.Name},
+					types.NamespacedName{Namespace: dataProtectionHostWFFCHelperWithoutSelectedNodePvc.Namespace, Name: dataProtectionHostWFFCHelperWithoutSelectedNodePvc.Name},
+					dataProtectionHostPVBoundToHelper.Name,
+				)
+			},
+		},
+		{
+			Name: "Bridge Immediate external-populator handoff without selected-node or PV node affinity",
+			InitialVirtualState: []runtime.Object{
+				immediateStorageClass.DeepCopy(),
+				dataProtectionImmediateTargetPvc.DeepCopy(),
+				dataProtectionPopulatedPVBoundToHelper.DeepCopy(),
+				dataProtectionImmediateHelperPvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostImmediateTargetPvc.DeepCopy(),
+				dataProtectionHostImmediateHelperPvc.DeepCopy(),
+				dataProtectionHostPVBoundToHelper.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionImmediateTargetBoundPvc.DeepCopy(),
+					dataProtectionImmediateHelperPvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionPopulatedPVBoundToHelper.DeepCopy()},
+				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {immediateStorageClass.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionHostImmediateMaterializedTargetPvc.DeepCopy(),
+					dataProtectionHostImmediateHelperPvc.DeepCopy(),
+				},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionHostPVBoundToTarget.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+				pvcSyncer.useFakePersistentVolumes = true
+				recorder := installPVCEventRecorder(pvcSyncer)
+
+				result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					dataProtectionHostImmediateTargetPvc.DeepCopy(),
+					dataProtectionHostImmediateTargetPvc.DeepCopy(),
+					dataProtectionImmediateTargetPvc.DeepCopy(),
+					dataProtectionImmediateTargetPvc.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				assert.Check(t, result.IsZero())
+				assertNoPVCEvent(t, recorder)
+			},
+		},
+		{
+			Name: "Bridge shared external-populator handoff without selected-node or PV node affinity",
 			InitialVirtualState: []runtime.Object{
 				dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
 				dataProtectionPopulatedPVBoundToHelper.DeepCopy(),
@@ -1169,16 +1756,20 @@ func TestSync(t *testing.T) {
 				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionHostPVBoundToTarget.DeepCopy()},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
-				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+				syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+				pvcSyncer.useFakePersistentVolumes = true
+				recorder := installPVCEventRecorder(pvcSyncer)
 
-				_, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+				result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
 					dataProtectionHostPendingPvc.DeepCopy(),
 					dataProtectionHostPendingPvc.DeepCopy(),
 					dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
 					dataProtectionBackupPendingPvcWithVolumeName.DeepCopy(),
 				))
 				assert.NilError(t, err)
+				assert.Check(t, result.IsZero())
+				assertNoPVCEvent(t, recorder)
 			},
 		},
 		{
@@ -1300,6 +1891,7 @@ func TestSync(t *testing.T) {
 			Sync: func(ctx *synccontext.RegisterContext) {
 				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
 				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+				recorder := installPVCEventRecorder(syncer.(*persistentVolumeClaimSyncer))
 
 				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
 					dataProtectionHostPendingPvc.DeepCopy(),
@@ -1309,6 +1901,7 @@ func TestSync(t *testing.T) {
 				))
 				assert.NilError(t, err)
 				assert.Equal(t, result.RequeueAfter, 2*time.Second)
+				assertSinglePVCEvent(t, recorder, "Warning ExternalPopulatorTopologyNotReady", dataProtectionPopulatedPV.Name)
 			},
 		},
 		{
