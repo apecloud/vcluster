@@ -1,6 +1,7 @@
 package persistentvolumeclaims
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -27,9 +28,13 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	"github.com/loft-sh/vcluster/pkg/util/loghelper"
 )
@@ -50,6 +55,7 @@ const (
 	dataProtectionBackupKind = "Backup"
 
 	externalPopulatorPopulateHelperPrefix = "kb-populate-"
+	externalPopulatorPVCByUIDIndex        = "externalPopulatorPVCByUID"
 
 	externalPopulatorRestoreConditionType              = corev1.PersistentVolumeClaimConditionType("Restore")
 	externalPopulatorPopulateConditionType             = corev1.PersistentVolumeClaimConditionType("Populating")
@@ -79,6 +85,7 @@ func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
 		storageClassesEnabled:    ctx.Config.Sync.ToHost.StorageClasses.Enabled,
 		schedulerEnabled:         ctx.Config.SchedulingInVirtualClusterEnabled(),
 		useFakePersistentVolumes: !ctx.Config.Sync.ToHost.PersistentVolumes.Enabled,
+		virtualClient:            ctx.VirtualManager.GetClient(),
 	}, nil
 }
 
@@ -91,6 +98,68 @@ type persistentVolumeClaimSyncer struct {
 	storageClassesEnabled    bool
 	schedulerEnabled         bool
 	useFakePersistentVolumes bool
+	virtualClient            client.Client
+}
+
+var _ syncertypes.IndicesRegisterer = &persistentVolumeClaimSyncer{}
+
+func (s *persistentVolumeClaimSyncer) RegisterIndices(ctx *synccontext.RegisterContext) error {
+	return ctx.VirtualManager.GetFieldIndexer().IndexField(ctx, &corev1.PersistentVolumeClaim{}, externalPopulatorPVCByUIDIndex, func(rawObj client.Object) []string {
+		pvc, ok := rawObj.(*corev1.PersistentVolumeClaim)
+		if !ok || pvc.UID == "" {
+			return nil
+		}
+
+		return []string{string(pvc.UID)}
+	})
+}
+
+var _ syncertypes.ControllerModifier = &persistentVolumeClaimSyncer{}
+
+func (s *persistentVolumeClaimSyncer) ModifyController(_ *synccontext.RegisterContext, controllerBuilder *builder.Builder) (*builder.Builder, error) {
+	enqueueDependency := func(
+		ctx context.Context,
+		object client.Object,
+		allowDeletingDependency bool,
+		queue workqueue.TypedRateLimitingInterface[ctrl.Request],
+	) {
+		requests, err := s.externalPopulatorDependencyRequestsWithOptions(ctx, object, allowDeletingDependency)
+		if err != nil {
+			ctrl.LoggerFrom(ctx).Error(
+				err,
+				"failed to map external populator dependency",
+				"kind",
+				fmt.Sprintf("%T", object),
+				"namespace",
+				object.GetNamespace(),
+				"name",
+				object.GetName(),
+			)
+			return
+		}
+
+		for _, request := range requests {
+			queue.Add(request)
+		}
+	}
+	dependencyHandler := &handler.Funcs{
+		CreateFunc: func(ctx context.Context, createEvent event.CreateEvent, queue workqueue.TypedRateLimitingInterface[ctrl.Request]) {
+			enqueueDependency(ctx, createEvent.Object, false, queue)
+		},
+		UpdateFunc: func(ctx context.Context, updateEvent event.UpdateEvent, queue workqueue.TypedRateLimitingInterface[ctrl.Request]) {
+			enqueueDependency(ctx, updateEvent.ObjectNew, false, queue)
+		},
+		DeleteFunc: func(ctx context.Context, deleteEvent event.DeleteEvent, queue workqueue.TypedRateLimitingInterface[ctrl.Request]) {
+			enqueueDependency(ctx, deleteEvent.Object, true, queue)
+		},
+		GenericFunc: func(ctx context.Context, genericEvent event.GenericEvent, queue workqueue.TypedRateLimitingInterface[ctrl.Request]) {
+			enqueueDependency(ctx, genericEvent.Object, false, queue)
+		},
+	}
+
+	return controllerBuilder.
+		Watches(&corev1.PersistentVolume{}, dependencyHandler).
+		Watches(&corev1.PersistentVolumeClaim{}, dependencyHandler), nil
 }
 
 var _ syncertypes.OptionsProvider = &persistentVolumeClaimSyncer{}
@@ -275,7 +344,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 			retErr = utilerrors.NewAggregate([]error{retErr, err})
 		}
 
-		if kerrors.IsConflict(retErr) {
+		if containsConflictError(retErr) {
 			result = ctrl.Result{RequeueAfter: time.Second}
 			retErr = nil
 			return
@@ -303,9 +372,19 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		return ctrl.Result{}, err
 	}
 	if preserveVirtualStatus {
+		hostResourceVersionBeforeMaterialization := event.Host.ResourceVersion
 		hostConverged, err := s.ensureExternalPopulatorHostMaterialization(ctx, event.Host, event.Virtual, vPV)
 		if err != nil {
 			return ctrl.Result{}, err
+		}
+		// A successful optimistic-lock materialization patch returns a new
+		// resourceVersion in event.Host. Rebase only when that direct write or a
+		// fresher target read changed the snapshot captured by NewSyncerPatcher.
+		if event.Host.ResourceVersion != hostResourceVersionBeforeMaterialization {
+			err = patch.RebaseHost(event.Host)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		if hostConverged {
 			ensureExternalPopulatorVirtualPopulateStatus(event.Virtual, vPV)
@@ -333,6 +412,24 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	event.Virtual.Labels, event.Host.Labels = translate.LabelsBidirectionalUpdate(event)
 
 	return result, nil
+}
+
+func containsConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if kerrors.IsConflict(err) {
+		return true
+	}
+	if aggregate, ok := err.(utilerrors.Aggregate); ok {
+		for _, aggregateErr := range aggregate.Errors() {
+			if containsConflictError(aggregateErr) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*corev1.PersistentVolumeClaim]) (_ ctrl.Result, retErr error) {
@@ -1082,6 +1179,188 @@ func claimRefReferencesPersistentVolumeClaim(ref *corev1.ObjectReference, pvc *c
 	}
 
 	return ref.Namespace == pvc.Namespace && ref.Name == pvc.Name
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorDependencyRequests(ctx context.Context, object client.Object) ([]ctrl.Request, error) {
+	return s.externalPopulatorDependencyRequestsWithOptions(ctx, object, false)
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorDependencyRequestsWithOptions(
+	ctx context.Context,
+	object client.Object,
+	allowDeletingDependency bool,
+) ([]ctrl.Request, error) {
+	switch dependency := object.(type) {
+	case *corev1.PersistentVolume:
+		return s.externalPopulatorPersistentVolumeRequests(ctx, dependency, allowDeletingDependency)
+	case *corev1.PersistentVolumeClaim:
+		return s.externalPopulatorHelperPVCRequests(ctx, dependency, allowDeletingDependency)
+	default:
+		return nil, nil
+	}
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorPersistentVolumeRequests(
+	ctx context.Context,
+	vPV *corev1.PersistentVolume,
+	allowDeletingDependency bool,
+) ([]ctrl.Request, error) {
+	if vPV == nil ||
+		vPV.Spec.ClaimRef == nil ||
+		vPV.Spec.ClaimRef.Namespace == "" ||
+		vPV.Spec.ClaimRef.Name == "" ||
+		vPV.Spec.ClaimRef.UID == "" {
+		return nil, nil
+	}
+
+	ref := vPV.Spec.ClaimRef
+	referencedPVC := &corev1.PersistentVolumeClaim{}
+	err := s.virtualClient.Get(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}, referencedPVC)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if isExternalPopulatorWakeTarget(referencedPVC) &&
+		referencedPVC.Spec.VolumeName == vPV.Name &&
+		isExternalPopulatorPersistentVolumeForPVC(vPV, referencedPVC, false) &&
+		vPV.Spec.ClaimRef.UID == referencedPVC.UID {
+		return externalPopulatorTargetRequest(referencedPVC), nil
+	}
+
+	if referencedPVC.Spec.VolumeName != vPV.Name ||
+		referencedPVC.UID == "" ||
+		!isExternalPopulatorPersistentVolumeForPVC(vPV, referencedPVC, false) ||
+		vPV.Spec.ClaimRef.UID != referencedPVC.UID {
+		return nil, nil
+	}
+
+	target, found, err := s.externalPopulatorTargetForHelper(ctx, referencedPVC, allowDeletingDependency)
+	if err != nil || !found {
+		return nil, err
+	}
+
+	return externalPopulatorTargetRequest(target), nil
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorHelperPVCRequests(
+	ctx context.Context,
+	helperPVC *corev1.PersistentVolumeClaim,
+	allowDeletingDependency bool,
+) ([]ctrl.Request, error) {
+	if helperPVC == nil ||
+		(!allowDeletingDependency && helperPVC.DeletionTimestamp != nil) ||
+		helperPVC.Spec.VolumeName == "" ||
+		!strings.HasPrefix(helperPVC.Name, externalPopulatorPopulateHelperPrefix) {
+		return nil, nil
+	}
+
+	vPV := &corev1.PersistentVolume{}
+	err := s.virtualClient.Get(ctx, types.NamespacedName{Name: helperPVC.Spec.VolumeName}, vPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if helperPVC.UID == "" ||
+		!isExternalPopulatorPersistentVolumeForPVC(vPV, helperPVC, false) ||
+		vPV.Spec.ClaimRef.UID != helperPVC.UID {
+		return nil, nil
+	}
+
+	target, found, err := s.externalPopulatorTargetForHelper(ctx, helperPVC, allowDeletingDependency)
+	if err != nil || !found {
+		return nil, err
+	}
+
+	return externalPopulatorTargetRequest(target), nil
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorTargetForHelper(
+	ctx context.Context,
+	helperPVC *corev1.PersistentVolumeClaim,
+	allowDeletingDependency bool,
+) (*corev1.PersistentVolumeClaim, bool, error) {
+	if helperPVC == nil ||
+		(!allowDeletingDependency && helperPVC.DeletionTimestamp != nil) ||
+		helperPVC.Spec.VolumeName == "" ||
+		!strings.HasPrefix(helperPVC.Name, externalPopulatorPopulateHelperPrefix) {
+		return nil, false, nil
+	}
+
+	targetUID := strings.TrimPrefix(helperPVC.Name, externalPopulatorPopulateHelperPrefix)
+	if targetUID == "" {
+		return nil, false, nil
+	}
+
+	targets := &corev1.PersistentVolumeClaimList{}
+	err := s.virtualClient.List(
+		ctx,
+		targets,
+		client.InNamespace(helperPVC.Namespace),
+		client.MatchingFields{externalPopulatorPVCByUIDIndex: targetUID},
+	)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var match *corev1.PersistentVolumeClaim
+	for i := range targets.Items {
+		target := &targets.Items[i]
+		if !isExternalPopulatorWakeTarget(target) ||
+			target.Spec.VolumeName != helperPVC.Spec.VolumeName ||
+			!isExternalPopulatorWakeHelperForTarget(helperPVC, target, allowDeletingDependency) {
+			continue
+		}
+		if match != nil {
+			return nil, false, fmt.Errorf(
+				"multiple external populator target persistent volume claims match helper pvc %s/%s",
+				helperPVC.Namespace,
+				helperPVC.Name,
+			)
+		}
+		match = target.DeepCopy()
+	}
+	if match == nil {
+		return nil, false, nil
+	}
+
+	return match, true, nil
+}
+
+func isExternalPopulatorWakeHelperForTarget(
+	helperPVC, targetPVC *corev1.PersistentVolumeClaim,
+	allowDeletingDependency bool,
+) bool {
+	if !allowDeletingDependency || helperPVC == nil || helperPVC.DeletionTimestamp == nil {
+		return isExternalPopulatorPopulateHelperPVCForTarget(helperPVC, targetPVC)
+	}
+	if targetPVC == nil || targetPVC.UID == "" {
+		return false
+	}
+
+	return helperPVC.Namespace == targetPVC.Namespace &&
+		helperPVC.Name == externalPopulatorPopulateHelperPrefix+string(targetPVC.UID)
+}
+
+func isExternalPopulatorWakeTarget(pvc *corev1.PersistentVolumeClaim) bool {
+	return pvc != nil &&
+		pvc.DeletionTimestamp == nil &&
+		pvc.UID != "" &&
+		pvc.Spec.VolumeName != "" &&
+		isExternalPopulatorPVC(pvc)
+}
+
+func externalPopulatorTargetRequest(pvc *corev1.PersistentVolumeClaim) []ctrl.Request {
+	return []ctrl.Request{{
+		NamespacedName: types.NamespacedName{
+			Namespace: pvc.Namespace,
+			Name:      pvc.Name,
+		},
+	}}
 }
 
 func (s *persistentVolumeClaimSyncer) externalPopulatorPersistentVolume(ctx *synccontext.SyncContext, pObj, vObj *corev1.PersistentVolumeClaim) (*corev1.PersistentVolume, bool, error) {
