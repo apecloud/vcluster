@@ -72,6 +72,42 @@ func assertNoPVCEvent(t *testing.T, recorder *events.FakeRecorder) {
 	}
 }
 
+func TestTranslateSelectorPreservesNilAndExplicitEmptyStorageClass(t *testing.T) {
+	empty := ""
+	tests := []struct {
+		name             string
+		storageClassName *string
+	}{
+		{
+			name:             "nil remains nil",
+			storageClassName: nil,
+		},
+		{
+			name:             "explicit empty remains empty",
+			storageClassName: &empty,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pvc := &corev1.PersistentVolumeClaim{
+				Spec: corev1.PersistentVolumeClaimSpec{
+					StorageClassName: tt.storageClassName,
+				},
+			}
+
+			(&persistentVolumeClaimSyncer{}).translateSelector(nil, pvc)
+
+			if tt.storageClassName == nil {
+				assert.Assert(t, pvc.Spec.StorageClassName == nil)
+				return
+			}
+			assert.Assert(t, pvc.Spec.StorageClassName != nil)
+			assert.Equal(t, *pvc.Spec.StorageClassName, "")
+		})
+	}
+}
+
 func checkExternalPopulatorHandoffPending(
 	t *testing.T,
 	ctx *synccontext.SyncContext,

@@ -1369,7 +1369,7 @@ type SyncFromHost struct {
 	// PriorityClasses defines if priority classes classes should get synced from the host cluster to the virtual cluster, but not back.
 	PriorityClasses EnableSwitchWithPatchesAndSelector `json:"priorityClasses,omitempty"`
 
-	// StorageClasses defines if storage classes should get synced from the host cluster to the virtual cluster, but not back. If auto, is automatically enabled when the virtual scheduler is enabled.
+	// StorageClasses defines if storage classes should get synced from the host cluster to the virtual cluster, but not back. If auto, is automatically enabled when persistent volume claims are synced to the host and storage classes are not synced to the host.
 	StorageClasses EnableAutoSwitchWithPatchesAndSelector `json:"storageClasses,omitempty"`
 
 	// CSINodes defines if csi nodes should get synced from the host cluster to the virtual cluster, but not back. If auto, is automatically enabled when the virtual scheduler is enabled.

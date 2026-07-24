@@ -196,7 +196,7 @@ sync:
     csiStorageCapacities:
       # Enabled defines if this option should be enabled.
       enabled: auto
-    # StorageClasses defines if storage classes should get synced from the host cluster to the virtual cluster, but not back. If auto, is automatically enabled when the virtual scheduler is enabled.
+    # StorageClasses defines if storage classes should get synced from the host cluster to the virtual cluster, but not back. If auto, is automatically enabled when persistent volume claims are synced to the host and storage classes are not synced to the host.
     storageClasses:
       # Enabled defines if this option should be enabled.
       enabled: auto
