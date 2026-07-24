@@ -86,14 +86,18 @@ func (h *SyncerPatcher) Patch(ctx *synccontext.SyncContext, pObj, vObj client.Ob
 	return nil
 }
 
-// RebaseHost records host changes that were committed directly after this
-// SyncerPatcher was created. Later deferred patches then start from the
-// committed resourceVersion instead of replaying against a stale snapshot.
+// RebaseHost records host changes that were committed directly or read from a
+// fresher snapshot after this SyncerPatcher was created. Later deferred patches
+// then start from that resourceVersion instead of replaying against a stale
+// snapshot. A failed rebase disables only the deferred host patch; the virtual
+// patch remains enabled.
 func (h *SyncerPatcher) RebaseHost(obj client.Object) error {
 	if clienthelper.IsNilObject(obj) {
+		h.pPatcher.SkipHostPatch = true
 		return fmt.Errorf("rebase host patcher: expected non-nil object")
 	}
 	if obj.GetResourceVersion() == "" {
+		h.pPatcher.SkipHostPatch = true
 		return fmt.Errorf("rebase host patcher for %s/%s: committed resourceVersion is empty", obj.GetNamespace(), obj.GetName())
 	}
 

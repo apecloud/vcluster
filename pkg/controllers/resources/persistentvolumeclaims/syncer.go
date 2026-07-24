@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/loft-sh/vcluster/pkg/util/loghelper"
 )
@@ -67,6 +68,10 @@ const (
 	externalPopulatorTopologyMismatchEventReason = "ExternalPopulatorTopologyMismatch"
 	externalPopulatorTopologyNotReadyEventReason = "ExternalPopulatorTopologyNotReady"
 	externalPopulatorTopologyEventAction         = "SyncPersistentVolumeClaim"
+
+	externalPopulatorDependencyRetryBaseDelay = 250 * time.Millisecond
+	externalPopulatorDependencyRetryMaxDelay  = 4 * time.Second
+	externalPopulatorDependencyMaxRetries     = 5
 )
 
 func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
@@ -115,7 +120,30 @@ func (s *persistentVolumeClaimSyncer) RegisterIndices(ctx *synccontext.RegisterC
 
 var _ syncertypes.ControllerModifier = &persistentVolumeClaimSyncer{}
 
-func (s *persistentVolumeClaimSyncer) ModifyController(_ *synccontext.RegisterContext, controllerBuilder *builder.Builder) (*builder.Builder, error) {
+type externalPopulatorDependencyRetry struct {
+	object                  client.Object
+	allowDeletingDependency bool
+	targetQueue             workqueue.TypedRateLimitingInterface[ctrl.Request]
+}
+
+func (s *persistentVolumeClaimSyncer) ModifyController(registerCtx *synccontext.RegisterContext, controllerBuilder *builder.Builder) (*builder.Builder, error) {
+	dependencyRetryQueue := workqueue.NewTypedRateLimitingQueueWithConfig(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[*externalPopulatorDependencyRetry](
+			externalPopulatorDependencyRetryBaseDelay,
+			externalPopulatorDependencyRetryMaxDelay,
+		),
+		workqueue.TypedRateLimitingQueueConfig[*externalPopulatorDependencyRetry]{
+			Name: "external-populator-dependency-mapper",
+		},
+	)
+	err := registerCtx.VirtualManager.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		return s.runExternalPopulatorDependencyRetryWorker(ctx, dependencyRetryQueue)
+	}))
+	if err != nil {
+		dependencyRetryQueue.ShutDown()
+		return nil, fmt.Errorf("register external populator dependency retry worker: %w", err)
+	}
+
 	enqueueDependency := func(
 		ctx context.Context,
 		object client.Object,
@@ -134,6 +162,11 @@ func (s *persistentVolumeClaimSyncer) ModifyController(_ *synccontext.RegisterCo
 				"name",
 				object.GetName(),
 			)
+			dependencyRetryQueue.AddRateLimited(&externalPopulatorDependencyRetry{
+				object:                  object.DeepCopyObject().(client.Object),
+				allowDeletingDependency: allowDeletingDependency,
+				targetQueue:             queue,
+			})
 			return
 		}
 
@@ -159,6 +192,59 @@ func (s *persistentVolumeClaimSyncer) ModifyController(_ *synccontext.RegisterCo
 	return controllerBuilder.
 		Watches(&corev1.PersistentVolume{}, dependencyHandler).
 		Watches(&corev1.PersistentVolumeClaim{}, dependencyHandler), nil
+}
+
+func (s *persistentVolumeClaimSyncer) runExternalPopulatorDependencyRetryWorker(
+	ctx context.Context,
+	queue workqueue.TypedRateLimitingInterface[*externalPopulatorDependencyRetry],
+) error {
+	go func() {
+		<-ctx.Done()
+		queue.ShutDown()
+	}()
+
+	for {
+		retry, shutdown := queue.Get()
+		if shutdown {
+			return nil
+		}
+
+		func() {
+			defer queue.Done(retry)
+
+			requests, err := s.externalPopulatorDependencyRequestsWithOptions(
+				ctx,
+				retry.object,
+				retry.allowDeletingDependency,
+			)
+			if err != nil {
+				if queue.NumRequeues(retry) < externalPopulatorDependencyMaxRetries {
+					queue.AddRateLimited(retry)
+					return
+				}
+
+				queue.Forget(retry)
+				ctrl.LoggerFrom(ctx).Error(
+					err,
+					"external populator dependency mapper retries exhausted",
+					"kind",
+					fmt.Sprintf("%T", retry.object),
+					"namespace",
+					retry.object.GetNamespace(),
+					"name",
+					retry.object.GetName(),
+					"retries",
+					externalPopulatorDependencyMaxRetries,
+				)
+				return
+			}
+
+			queue.Forget(retry)
+			for _, request := range requests {
+				retry.targetQueue.Add(request)
+			}
+		}()
+	}
 }
 
 var _ syncertypes.OptionsProvider = &persistentVolumeClaimSyncer{}
@@ -335,7 +421,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 			retErr = utilerrors.NewAggregate([]error{retErr, err})
 		}
 
-		if containsConflictError(retErr) {
+		if containsOnlyConflictErrors(retErr) {
 			result = ctrl.Result{RequeueAfter: time.Second}
 			retErr = nil
 			return
@@ -364,18 +450,22 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	}
 	if preserveVirtualStatus {
 		hostResourceVersionBeforeMaterialization := event.Host.ResourceVersion
-		hostConverged, err := s.ensureExternalPopulatorHostMaterialization(ctx, event.Host, event.Virtual, vPV)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		// A successful optimistic-lock materialization patch returns a new
-		// resourceVersion in event.Host. Rebase only when that direct write or a
-		// fresher target read changed the snapshot captured by NewSyncerPatcher.
+		hostConverged, materializationErr := s.ensureExternalPopulatorHostMaterialization(ctx, event.Host, event.Virtual, vPV)
+		// A direct materialization write or fresher target read can change
+		// event.Host before a later topology lookup fails. Rebase before
+		// processing that error so the deferred host patch never replays the
+		// fresh snapshot as a controller-owned diff against an older baseline.
 		if event.Host.ResourceVersion != hostResourceVersionBeforeMaterialization {
-			err = patch.RebaseHost(event.Host)
-			if err != nil {
-				return ctrl.Result{}, err
+			rebaseErr := patch.RebaseHost(event.Host)
+			if rebaseErr != nil {
+				if materializationErr != nil {
+					return ctrl.Result{}, fmt.Errorf("%w (host patch disabled after rebase failure: %v)", materializationErr, rebaseErr)
+				}
+				return ctrl.Result{}, rebaseErr
 			}
+		}
+		if materializationErr != nil {
+			return ctrl.Result{}, materializationErr
 		}
 		if hostConverged {
 			ensureExternalPopulatorVirtualPopulateStatus(event.Virtual, vPV)
@@ -405,22 +495,42 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	return result, nil
 }
 
-func containsConflictError(err error) bool {
+func containsOnlyConflictErrors(err error) bool {
+	hasError, onlyConflicts := classifyConflictErrors(err)
+	return hasError && onlyConflicts
+}
+
+func classifyConflictErrors(err error) (bool, bool) {
 	if err == nil {
-		return false
-	}
-	if kerrors.IsConflict(err) {
-		return true
+		return false, true
 	}
 	if aggregate, ok := err.(utilerrors.Aggregate); ok {
+		hasError := false
 		for _, aggregateErr := range aggregate.Errors() {
-			if containsConflictError(aggregateErr) {
-				return true
+			nestedHasError, nestedOnlyConflicts := classifyConflictErrors(aggregateErr)
+			hasError = hasError || nestedHasError
+			if !nestedOnlyConflicts {
+				return hasError, false
 			}
 		}
+		return hasError, true
+	}
+	if multiError, ok := err.(interface{ Unwrap() []error }); ok {
+		hasError := false
+		for _, nestedErr := range multiError.Unwrap() {
+			nestedHasError, nestedOnlyConflicts := classifyConflictErrors(nestedErr)
+			hasError = hasError || nestedHasError
+			if !nestedOnlyConflicts {
+				return hasError, false
+			}
+		}
+		return hasError, true
+	}
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		return classifyConflictErrors(unwrapped)
 	}
 
-	return false
+	return true, kerrors.IsConflict(err)
 }
 
 func (s *persistentVolumeClaimSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*corev1.PersistentVolumeClaim]) (_ ctrl.Result, retErr error) {
