@@ -1982,6 +1982,62 @@ func TestValidateCustomResourceSyncProxyConflicts(t *testing.T) {
 	}
 }
 
+func TestStorageClassAutoSyncFollowsPVCTranslation(t *testing.T) {
+	tests := []struct {
+		name                         string
+		persistentVolumeClaims       bool
+		toHostStorageClasses         bool
+		fromHostStorageClasses       string
+		expectedFromHostStorageClass string
+	}{
+		{
+			name:                         "auto enables effective host classes for translated PVCs",
+			persistentVolumeClaims:       true,
+			fromHostStorageClasses:       "auto",
+			expectedFromHostStorageClass: "true",
+		},
+		{
+			name:                         "auto remains disabled without translated PVCs",
+			fromHostStorageClasses:       "auto",
+			expectedFromHostStorageClass: "auto",
+		},
+		{
+			name:                         "to-host storage classes take precedence",
+			persistentVolumeClaims:       true,
+			toHostStorageClasses:         true,
+			fromHostStorageClasses:       "auto",
+			expectedFromHostStorageClass: "auto",
+		},
+		{
+			name:                         "explicit false remains disabled",
+			persistentVolumeClaims:       true,
+			fromHostStorageClasses:       "false",
+			expectedFromHostStorageClass: "false",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defaultConfig, err := config.NewDefaultConfig()
+			if err != nil {
+				t.Fatalf("create default config: %v", err)
+			}
+
+			defaultConfig.Sync.ToHost.PersistentVolumeClaims.Enabled = tt.persistentVolumeClaims
+			defaultConfig.Sync.ToHost.StorageClasses.Enabled = tt.toHostStorageClasses
+			defaultConfig.Sync.FromHost.StorageClasses.Enabled = config.StrBool(tt.fromHostStorageClasses)
+
+			vConfig := &VirtualClusterConfig{Config: *defaultConfig}
+			if err := ValidateConfigAndSetDefaults(vConfig); err != nil {
+				t.Fatalf("validate config: %v", err)
+			}
+			if got := string(vConfig.Sync.FromHost.StorageClasses.Enabled); got != tt.expectedFromHostStorageClass {
+				t.Fatalf("expected sync.fromHost.storageClasses.enabled=%q, got %q", tt.expectedFromHostStorageClass, got)
+			}
+		})
+	}
+}
+
 func TestValidateExperimentalProxyCustomResourcesConfig(t *testing.T) {
 	cases := []struct {
 		name        string

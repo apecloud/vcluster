@@ -60,6 +60,14 @@ func ValidateConfigAndSetDefaults(vConfig *VirtualClusterConfig) error {
 		vConfig.Sync.FromHost.Nodes.Selector.All = true
 	}
 
+	// Keep the guest's effective storage classes aligned with the host whenever
+	// guest PVCs are translated to the host.
+	if vConfig.Sync.ToHost.PersistentVolumeClaims.Enabled &&
+		vConfig.Sync.FromHost.StorageClasses.Enabled == "auto" &&
+		!vConfig.Sync.ToHost.StorageClasses.Enabled {
+		vConfig.Sync.FromHost.StorageClasses.Enabled = "true"
+	}
+
 	// enable additional controllers required for scheduling with storage
 	if vConfig.SchedulingInVirtualClusterEnabled() && vConfig.Sync.ToHost.PersistentVolumeClaims.Enabled {
 		if vConfig.Sync.FromHost.CSINodes.Enabled == "auto" {
@@ -70,9 +78,6 @@ func ValidateConfigAndSetDefaults(vConfig *VirtualClusterConfig) error {
 		}
 		if vConfig.Sync.FromHost.CSIDrivers.Enabled == "auto" {
 			vConfig.Sync.FromHost.CSIDrivers.Enabled = "true"
-		}
-		if vConfig.Sync.FromHost.StorageClasses.Enabled == "auto" && !vConfig.Sync.ToHost.StorageClasses.Enabled {
-			vConfig.Sync.FromHost.StorageClasses.Enabled = "true"
 		}
 	}
 

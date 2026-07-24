@@ -7,6 +7,22 @@
 {{- end -}}
 
 {{/*
+  Whether storage classes are synced from the host after resolving auto.
+*/}}
+{{- define "vcluster.syncFromHostStorageClasses" -}}
+{{- if or
+    (eq (toString .Values.sync.fromHost.storageClasses.enabled) "true")
+    (and
+      (eq (toString .Values.sync.fromHost.storageClasses.enabled) "auto")
+      .Values.sync.toHost.persistentVolumeClaims.enabled
+      (not .Values.sync.toHost.storageClasses.enabled)
+    )
+  -}}
+{{- true -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
   Whether to create a cluster role or not
 */}}
 {{- define "vcluster.createClusterRole" -}}
@@ -33,7 +49,7 @@
     .Values.sync.toHost.pods.hybridScheduling.enabled
     .Values.sync.fromHost.ingressClasses.enabled
     .Values.sync.fromHost.runtimeClasses.enabled
-    (eq (toString .Values.sync.fromHost.storageClasses.enabled) "true")
+    (include "vcluster.syncFromHostStorageClasses" .)
     (eq (toString .Values.sync.fromHost.csiNodes.enabled) "true")
     (eq (toString .Values.sync.fromHost.csiDrivers.enabled) "true")
     (eq (toString .Values.sync.fromHost.csiStorageCapacities.enabled) "true")
@@ -255,4 +271,3 @@
 {{- end }}
 {{- end }}
 {{- end }}
-
