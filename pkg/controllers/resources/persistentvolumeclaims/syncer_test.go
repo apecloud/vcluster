@@ -2,11 +2,15 @@ package persistentvolumeclaims
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/loft-sh/vcluster/pkg/config"
+	"github.com/loft-sh/vcluster/pkg/scheme"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	syncertesting "github.com/loft-sh/vcluster/pkg/syncer/testing"
 	syncertypes "github.com/loft-sh/vcluster/pkg/syncer/types"
@@ -24,8 +28,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 type eventRecordingTranslator struct {
@@ -76,9 +83,221 @@ func assertNoPVCEvent(t *testing.T, recorder *events.FakeRecorder) {
 	}
 }
 
+type externalPopulatorDependencyFixture struct {
+	target *corev1.PersistentVolumeClaim
+	helper *corev1.PersistentVolumeClaim
+	pv     *corev1.PersistentVolume
+}
+
+func newExternalPopulatorDependencyFixture() *externalPopulatorDependencyFixture {
+	const (
+		namespace = "testns"
+		pvName    = "restore-populated-pv"
+	)
+	targetUID := types.UID("target-pvc-uid")
+	helperUID := types.UID("populate-helper-pvc-uid")
+	dataProtectionGroup := dataProtectionAPIGroup
+	target := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target",
+			Namespace: namespace,
+			UID:       targetUID,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: pvName,
+			DataSourceRef: &corev1.TypedObjectReference{
+				APIGroup: &dataProtectionGroup,
+				Kind:     dataProtectionBackupKind,
+				Name:     "backup",
+			},
+		},
+	}
+	helper := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      externalPopulatorPopulateHelperPrefix + string(targetUID),
+			Namespace: namespace,
+			UID:       helperUID,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: pvName,
+		},
+	}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: pvName},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: namespace,
+				Name:      helper.Name,
+				UID:       helperUID,
+			},
+		},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound},
+	}
+
+	return &externalPopulatorDependencyFixture{
+		target: target,
+		helper: helper,
+		pv:     pv,
+	}
+}
+
+func newExternalPopulatorMapperTestSyncer(
+	t *testing.T,
+	virtualObjects ...runtime.Object,
+) (*synccontext.SyncContext, *persistentVolumeClaimSyncer) {
+	t.Helper()
+
+	hostClient := testingutil.NewFakeClient(scheme.Scheme)
+	virtualClient := testingutil.NewFakeClient(scheme.Scheme, virtualObjects...)
+	registerCtx := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), hostClient, virtualClient)
+	syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, registerCtx, New)
+	return syncCtx, objectSyncer.(*persistentVolumeClaimSyncer)
+}
+
+type externalPopulatorMapperErrorClient struct {
+	client.Client
+	getErr  error
+	listErr error
+}
+
+func (c *externalPopulatorMapperErrorClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if c.getErr != nil {
+		return c.getErr
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func (c *externalPopulatorMapperErrorClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if c.listErr != nil {
+		return c.listErr
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
+type externalPopulatorConcurrentWriterClient struct {
+	client.Client
+	target types.NamespacedName
+
+	once          sync.Once
+	directRV      string
+	concurrentRV  string
+	concurrentErr error
+}
+
+func (c *externalPopulatorConcurrentWriterClient) Patch(
+	ctx context.Context,
+	obj client.Object,
+	patch client.Patch,
+	opts ...client.PatchOption,
+) error {
+	if err := c.Client.Patch(ctx, obj, patch, opts...); err != nil {
+		return err
+	}
+
+	pvc, ok := obj.(*corev1.PersistentVolumeClaim)
+	if !ok ||
+		pvc.Namespace != c.target.Namespace ||
+		pvc.Name != c.target.Name ||
+		pvc.Spec.VolumeName == "" {
+		return nil
+	}
+
+	c.once.Do(func() {
+		c.directRV = pvc.ResourceVersion
+		current := &corev1.PersistentVolumeClaim{}
+		c.concurrentErr = c.Client.Get(ctx, c.target, current)
+		if c.concurrentErr != nil {
+			return
+		}
+		if current.Annotations == nil {
+			current.Annotations = map[string]string{}
+		}
+		current.Annotations["example.test/concurrent-writer"] = "preserve"
+		current.Spec.Resources.Requests = corev1.ResourceList{
+			corev1.ResourceStorage: resource.MustParse("2Gi"),
+		}
+		c.concurrentErr = c.Client.Update(ctx, current)
+		if c.concurrentErr == nil {
+			c.concurrentRV = current.ResourceVersion
+		}
+	})
+
+	return nil
+}
+
+type externalPopulatorRecordingManager struct {
+	ctrl.Manager
+	recordingCache cache.Cache
+}
+
+func (m *externalPopulatorRecordingManager) GetCache() cache.Cache {
+	return m.recordingCache
+}
+
+type externalPopulatorRecordingCache struct {
+	cache.Cache
+
+	mu       sync.Mutex
+	handlers map[reflect.Type][]toolscache.ResourceEventHandler
+}
+
+func newExternalPopulatorRecordingCache(delegate cache.Cache) *externalPopulatorRecordingCache {
+	return &externalPopulatorRecordingCache{
+		Cache:    delegate,
+		handlers: map[reflect.Type][]toolscache.ResourceEventHandler{},
+	}
+}
+
+func (c *externalPopulatorRecordingCache) GetInformer(
+	ctx context.Context,
+	object client.Object,
+	opts ...cache.InformerGetOption,
+) (cache.Informer, error) {
+	informer, err := c.Cache.GetInformer(ctx, object, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	objectType := reflect.TypeOf(object)
+	return &externalPopulatorRecordingInformer{
+		Informer: informer,
+		record: func(handler toolscache.ResourceEventHandler) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.handlers[objectType] = append(c.handlers[objectType], handler)
+		},
+	}, nil
+}
+
+func (c *externalPopulatorRecordingCache) handlersFor(object client.Object) []toolscache.ResourceEventHandler {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]toolscache.ResourceEventHandler(nil), c.handlers[reflect.TypeOf(object)]...)
+}
+
+type externalPopulatorRecordingInformer struct {
+	cache.Informer
+	record func(toolscache.ResourceEventHandler)
+}
+
+func (i *externalPopulatorRecordingInformer) AddEventHandler(handler toolscache.ResourceEventHandler) (toolscache.ResourceEventHandlerRegistration, error) {
+	i.record(handler)
+	return i.Informer.AddEventHandler(handler)
+}
+
+func (i *externalPopulatorRecordingInformer) AddEventHandlerWithResyncPeriod(handler toolscache.ResourceEventHandler, resyncPeriod time.Duration) (toolscache.ResourceEventHandlerRegistration, error) {
+	i.record(handler)
+	return i.Informer.AddEventHandlerWithResyncPeriod(handler, resyncPeriod)
+}
+
+func (i *externalPopulatorRecordingInformer) AddEventHandlerWithOptions(handler toolscache.ResourceEventHandler, options toolscache.HandlerOptions) (toolscache.ResourceEventHandlerRegistration, error) {
+	i.record(handler)
+	return i.Informer.AddEventHandlerWithOptions(handler, options)
+}
+
 func TestSyncExternalPopulatorPreGateTransientSchedulesTarget(t *testing.T) {
 	type dependencyRequestMapper interface {
-		externalPopulatorDependencyRequests(context.Context, client.Object) []ctrl.Request
+		externalPopulatorDependencyRequests(context.Context, client.Object) ([]ctrl.Request, error)
 	}
 	type fixture struct {
 		virtualTarget *corev1.PersistentVolumeClaim
@@ -345,7 +564,9 @@ func TestSyncExternalPopulatorPreGateTransientSchedulesTarget(t *testing.T) {
 					_, hasControllerModifier := any(pvcSyncer).(syncertypes.ControllerModifier)
 					var requests []ctrl.Request
 					if hasDependencyMapper {
-						requests = mapper.externalPopulatorDependencyRequests(syncCtx.Context, convergedDependency)
+						var err error
+						requests, err = mapper.externalPopulatorDependencyRequests(syncCtx.Context, convergedDependency)
+						assert.NilError(t, err)
 					}
 					for _, request := range requests {
 						if request.NamespacedName != targetKey {
@@ -399,6 +620,556 @@ func TestSyncExternalPopulatorPreGateTransientSchedulesTarget(t *testing.T) {
 			test.Run(t, syncertesting.NewFakeRegisterContext)
 		})
 	}
+}
+
+func TestExternalPopulatorDependencyMapperRejectsInvalidDependencies(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*externalPopulatorDependencyFixture) client.Object
+	}{
+		{
+			name: "non-applicable target",
+			prepare: func(f *externalPopulatorDependencyFixture) client.Object {
+				f.target.Spec.DataSourceRef.Kind = "PersistentVolumeClaim"
+				f.pv.Spec.ClaimRef = &corev1.ObjectReference{
+					Namespace: f.target.Namespace,
+					Name:      f.target.Name,
+					UID:       f.target.UID,
+				}
+				return f.pv
+			},
+		},
+		{
+			name: "terminating helper",
+			prepare: func(f *externalPopulatorDependencyFixture) client.Object {
+				now := metav1.Now()
+				f.helper.DeletionTimestamp = &now
+				f.helper.Finalizers = []string{"test"}
+				return f.helper
+			},
+		},
+		{
+			name: "invalid helper identity",
+			prepare: func(f *externalPopulatorDependencyFixture) client.Object {
+				f.helper.Name = externalPopulatorPopulateHelperPrefix + "other-target"
+				f.pv.Spec.ClaimRef.Name = f.helper.Name
+				return f.helper
+			},
+		},
+		{
+			name: "helper claimRef UID mismatch",
+			prepare: func(f *externalPopulatorDependencyFixture) client.Object {
+				f.pv.Spec.ClaimRef.UID = types.UID("stale-helper-uid")
+				return f.helper
+			},
+		},
+		{
+			name: "helper claimRef UID absent",
+			prepare: func(f *externalPopulatorDependencyFixture) client.Object {
+				f.pv.Spec.ClaimRef.UID = ""
+				return f.helper
+			},
+		},
+		{
+			name: "target claimRef UID mismatch",
+			prepare: func(f *externalPopulatorDependencyFixture) client.Object {
+				f.pv.Spec.ClaimRef = &corev1.ObjectReference{
+					Namespace: f.target.Namespace,
+					Name:      f.target.Name,
+					UID:       types.UID("stale-target-uid"),
+				}
+				return f.pv
+			},
+		},
+		{
+			name: "target claimRef UID absent",
+			prepare: func(f *externalPopulatorDependencyFixture) client.Object {
+				f.pv.Spec.ClaimRef = &corev1.ObjectReference{
+					Namespace: f.target.Namespace,
+					Name:      f.target.Name,
+				}
+				return f.pv
+			},
+		},
+		{
+			name: "helper absent",
+			prepare: func(f *externalPopulatorDependencyFixture) client.Object {
+				return f.pv
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newExternalPopulatorDependencyFixture()
+			event := tt.prepare(f)
+			virtualObjects := []runtime.Object{f.target.DeepCopy(), f.pv.DeepCopy()}
+			if tt.name != "helper absent" {
+				virtualObjects = append(virtualObjects, f.helper.DeepCopy())
+			}
+			syncCtx, pvcSyncer := newExternalPopulatorMapperTestSyncer(t, virtualObjects...)
+
+			requests, err := pvcSyncer.externalPopulatorDependencyRequests(syncCtx.Context, event)
+			assert.NilError(t, err)
+			assert.Equal(t, len(requests), 0)
+		})
+	}
+}
+
+func TestExternalPopulatorDependencyMapperPropagatesLookupErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		getErr  error
+		listErr error
+	}{
+		{
+			name:   "persistent volume lookup",
+			getErr: errors.New("injected persistent volume lookup failure"),
+		},
+		{
+			name:    "target index lookup",
+			listErr: errors.New("injected target index lookup failure"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newExternalPopulatorDependencyFixture()
+			syncCtx, pvcSyncer := newExternalPopulatorMapperTestSyncer(
+				t,
+				f.target.DeepCopy(),
+				f.helper.DeepCopy(),
+				f.pv.DeepCopy(),
+			)
+			pvcSyncer.virtualClient = &externalPopulatorMapperErrorClient{
+				Client:  syncCtx.VirtualClient,
+				getErr:  tt.getErr,
+				listErr: tt.listErr,
+			}
+
+			requests, err := pvcSyncer.externalPopulatorDependencyRequests(syncCtx.Context, f.helper)
+			assert.Equal(t, len(requests), 0)
+			expectedErr := tt.getErr
+			if expectedErr == nil {
+				expectedErr = tt.listErr
+			}
+			if !errors.Is(err, expectedErr) {
+				t.Fatalf("mapper error = %v, want wrapped %v", err, expectedErr)
+			}
+		})
+	}
+}
+
+func TestExternalPopulatorDependencyMapperIgnoresUnrelatedOrIncompleteEventsBeforeLookup(t *testing.T) {
+	f := newExternalPopulatorDependencyFixture()
+	syncCtx, pvcSyncer := newExternalPopulatorMapperTestSyncer(
+		t,
+		f.target.DeepCopy(),
+		f.helper.DeepCopy(),
+		f.pv.DeepCopy(),
+	)
+	pvcSyncer.virtualClient = &externalPopulatorMapperErrorClient{
+		Client: syncCtx.VirtualClient,
+		getErr: errors.New("ordinary pvc must not trigger a dependency lookup"),
+	}
+	ordinaryPVC := f.target.DeepCopy()
+	ordinaryPVC.Name = "ordinary"
+	ordinaryPVC.Spec.DataSourceRef = nil
+
+	incompletePV := f.pv.DeepCopy()
+	incompletePV.Spec.ClaimRef.UID = ""
+
+	for _, tt := range []struct {
+		name   string
+		object client.Object
+	}{
+		{name: "ordinary pvc", object: ordinaryPVC},
+		{name: "persistent volume missing claim UID", object: incompletePV},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			requests, err := pvcSyncer.externalPopulatorDependencyRequests(syncCtx.Context, tt.object)
+			assert.NilError(t, err)
+			assert.Equal(t, len(requests), 0)
+		})
+	}
+}
+
+func TestExternalPopulatorDependencyModifyControllerWiring(t *testing.T) {
+	f := newExternalPopulatorDependencyFixture()
+	hostClient := testingutil.NewFakeClient(scheme.Scheme)
+	virtualClient := testingutil.NewFakeClient(
+		scheme.Scheme,
+		f.target.DeepCopy(),
+		f.helper.DeepCopy(),
+		f.pv.DeepCopy(),
+	)
+	registerCtx := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), hostClient, virtualClient)
+	baseManager := testingutil.NewFakeManager(virtualClient)
+	recordingCache := newExternalPopulatorRecordingCache(baseManager.GetCache())
+	recordingManager := &externalPopulatorRecordingManager{
+		Manager:        baseManager,
+		recordingCache: recordingCache,
+	}
+	registerCtx.VirtualManager = recordingManager
+
+	objectSyncer, err := New(registerCtx)
+	assert.NilError(t, err)
+	pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+	assert.NilError(t, pvcSyncer.RegisterIndices(registerCtx))
+
+	requests := make(chan ctrl.Request, 32)
+	controllerBuilder := ctrl.NewControllerManagedBy(recordingManager).
+		Named("external-populator-dependency-wiring-test").
+		For(&corev1.PersistentVolumeClaim{})
+	controllerBuilder, err = pvcSyncer.ModifyController(registerCtx, controllerBuilder)
+	assert.NilError(t, err)
+	controller, err := controllerBuilder.Build(reconcile.Func(func(_ context.Context, request ctrl.Request) (ctrl.Result, error) {
+		requests <- request
+		return ctrl.Result{}, nil
+	}))
+	assert.NilError(t, err)
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan error, 1)
+	go func() {
+		started <- controller.Start(runCtx)
+	}()
+
+	waitDeadline := time.NewTimer(2 * time.Second)
+	defer waitDeadline.Stop()
+	waitTicker := time.NewTicker(5 * time.Millisecond)
+	defer waitTicker.Stop()
+	for {
+		if len(recordingCache.handlersFor(&corev1.PersistentVolume{})) == 1 &&
+			len(recordingCache.handlersFor(&corev1.PersistentVolumeClaim{})) == 2 {
+			break
+		}
+		select {
+		case err := <-started:
+			t.Fatalf("controller stopped before watch registration: %v", err)
+		case <-waitDeadline.C:
+			t.Fatalf(
+				"watch registration timed out: pv handlers=%d pvc handlers=%d",
+				len(recordingCache.handlersFor(&corev1.PersistentVolume{})),
+				len(recordingCache.handlersFor(&corev1.PersistentVolumeClaim{})),
+			)
+		case <-waitTicker.C:
+		}
+	}
+
+	targetKey := types.NamespacedName{Namespace: f.target.Namespace, Name: f.target.Name}
+	drainRequests := func() {
+		for {
+			select {
+			case <-requests:
+			default:
+				return
+			}
+		}
+	}
+	expectTarget := func(label string) {
+		t.Helper()
+		deadline := time.NewTimer(2 * time.Second)
+		defer deadline.Stop()
+		for {
+			select {
+			case request := <-requests:
+				if request.NamespacedName == targetKey {
+					return
+				}
+			case <-deadline.C:
+				t.Fatalf("%s did not enqueue exact target %s", label, targetKey)
+			}
+		}
+	}
+	expectNoTarget := func(label string) {
+		t.Helper()
+		deadline := time.NewTimer(150 * time.Millisecond)
+		defer deadline.Stop()
+		for {
+			select {
+			case request := <-requests:
+				if request.NamespacedName == targetKey {
+					t.Fatalf("%s unexpectedly enqueued exact target %s", label, targetKey)
+				}
+			case <-deadline.C:
+				return
+			}
+		}
+	}
+	fireAdd := func(object client.Object) {
+		t.Helper()
+		handlers := recordingCache.handlersFor(object)
+		if len(handlers) == 0 {
+			t.Fatalf("no registered handler for %T", object)
+		}
+		for _, eventHandler := range handlers {
+			eventHandler.OnAdd(object, false)
+		}
+	}
+	fireUpdate := func(oldObject, newObject client.Object) {
+		t.Helper()
+		handlers := recordingCache.handlersFor(newObject)
+		if len(handlers) == 0 {
+			t.Fatalf("no registered handler for %T", newObject)
+		}
+		for _, eventHandler := range handlers {
+			eventHandler.OnUpdate(oldObject, newObject)
+		}
+	}
+	fireDelete := func(object client.Object) {
+		t.Helper()
+		handlers := recordingCache.handlersFor(object)
+		if len(handlers) == 0 {
+			t.Fatalf("no registered handler for %T", object)
+		}
+		for _, eventHandler := range handlers {
+			eventHandler.OnDelete(object)
+		}
+	}
+
+	directPV := f.pv.DeepCopy()
+	directPV.Spec.ClaimRef = &corev1.ObjectReference{
+		Namespace: f.target.Namespace,
+		Name:      f.target.Name,
+		UID:       f.target.UID,
+	}
+	fireAdd(directPV)
+	expectTarget("PV create")
+	drainRequests()
+	pendingDirectPV := directPV.DeepCopy()
+	pendingDirectPV.Status.Phase = corev1.VolumePending
+	fireUpdate(pendingDirectPV, directPV)
+	expectTarget("PV update")
+	drainRequests()
+	fireDelete(directPV)
+	expectTarget("PV delete")
+	drainRequests()
+
+	fireAdd(f.helper.DeepCopy())
+	expectTarget("helper create")
+	drainRequests()
+	updatedHelper := f.helper.DeepCopy()
+	updatedHelper.Labels = map[string]string{"generation": "2"}
+	fireUpdate(f.helper.DeepCopy(), updatedHelper)
+	expectTarget("helper update")
+	drainRequests()
+
+	assert.NilError(t, virtualClient.Delete(runCtx, f.helper.DeepCopy()))
+	deletedHelper := f.helper.DeepCopy()
+	now := metav1.Now()
+	deletedHelper.DeletionTimestamp = &now
+	fireDelete(deletedHelper)
+	expectTarget("helper delete")
+	drainRequests()
+	fireUpdate(f.pv.DeepCopy(), f.pv.DeepCopy())
+	expectNoTarget("PV update while helper absent")
+	drainRequests()
+
+	recreatedHelper := f.helper.DeepCopy()
+	recreatedHelper.ResourceVersion = ""
+	assert.NilError(t, virtualClient.Create(runCtx, recreatedHelper))
+	fireAdd(recreatedHelper.DeepCopy())
+	expectTarget("helper recreate")
+	drainRequests()
+
+	terminatingHelper := recreatedHelper.DeepCopy()
+	terminatingHelper.DeletionTimestamp = &now
+	fireAdd(terminatingHelper)
+	expectNoTarget("terminating helper")
+	drainRequests()
+
+	assert.NilError(t, virtualClient.Delete(runCtx, f.pv.DeepCopy()))
+	fireUpdate(recreatedHelper.DeepCopy(), recreatedHelper.DeepCopy())
+	expectNoTarget("helper update while PV absent")
+	drainRequests()
+	recreatedPV := f.pv.DeepCopy()
+	recreatedPV.ResourceVersion = ""
+	assert.NilError(t, virtualClient.Create(runCtx, recreatedPV))
+	fireAdd(recreatedPV.DeepCopy())
+	expectTarget("PV recreate")
+
+	cancel()
+	select {
+	case err := <-started:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("controller stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("controller did not stop within 2s")
+	}
+}
+
+func TestSyncExternalPopulatorDirectMaterializationConcurrentWriterRetriesFromFreshState(t *testing.T) {
+	const (
+		virtualNamespace = "testns"
+		virtualPVName    = "restore-populated-pv"
+	)
+
+	dataProtectionGroup := dataProtectionAPIGroup
+	virtualTarget := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target",
+			Namespace: virtualNamespace,
+			UID:       types.UID("target-pvc-uid"),
+			Annotations: map[string]string{
+				"example.test/virtual-writer": "preserve",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: virtualPVName,
+			DataSourceRef: &corev1.TypedObjectReference{
+				APIGroup: &dataProtectionGroup,
+				Kind:     dataProtectionBackupKind,
+				Name:     "backup",
+			},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
+	}
+	virtualPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: virtualPVName},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: virtualTarget.Namespace,
+				Name:      virtualTarget.Name,
+				UID:       virtualTarget.UID,
+			},
+		},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound},
+	}
+
+	hostTranslator := translate.NewSingleNamespaceTranslator(testingutil.DefaultTestTargetNamespace)
+	hostTargetName := hostTranslator.HostName(nil, virtualTarget.Name, virtualTarget.Namespace)
+	hostTarget := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      hostTargetName.Name,
+			Namespace: testingutil.DefaultTestTargetNamespace,
+			UID:       types.UID("host-target-pvc-uid"),
+			Annotations: map[string]string{
+				translate.NameAnnotation:          virtualTarget.Name,
+				translate.NamespaceAnnotation:     virtualTarget.Namespace,
+				translate.UIDAnnotation:           string(virtualTarget.UID),
+				translate.KindAnnotation:          corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim").String(),
+				translate.HostNamespaceAnnotation: testingutil.DefaultTestTargetNamespace,
+				translate.HostNameAnnotation:      hostTargetName.Name,
+			},
+			Labels: map[string]string{
+				translate.MarkerLabel:    translate.VClusterName,
+				translate.NamespaceLabel: virtualTarget.Namespace,
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("512Mi"),
+				},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase:    corev1.ClaimPending,
+			Capacity: corev1.ResourceList{},
+		},
+	}
+	hostPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: virtualPVName},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{
+				APIVersion: corev1.SchemeGroupVersion.Version,
+				Kind:       "PersistentVolumeClaim",
+				Namespace:  hostTarget.Namespace,
+				Name:       hostTarget.Name,
+				UID:        hostTarget.UID,
+			},
+		},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound},
+	}
+
+	test := &syncertesting.SyncTest{
+		Name:                 "direct materialization rebases before deferred patch",
+		InitialVirtualState:  []runtime.Object{virtualTarget.DeepCopy(), virtualPV.DeepCopy()},
+		InitialPhysicalState: []runtime.Object{hostTarget.DeepCopy(), hostPV.DeepCopy()},
+		Sync: func(registerCtx *synccontext.RegisterContext) {
+			syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, registerCtx, New)
+			pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+			pvcSyncer.useFakePersistentVolumes = true
+
+			targetKey := types.NamespacedName{
+				Namespace: virtualTarget.Namespace,
+				Name:      virtualTarget.Name,
+			}
+			hostTargetKey := types.NamespacedName{
+				Namespace: hostTarget.Namespace,
+				Name:      hostTarget.Name,
+			}
+			concurrentClient := &externalPopulatorConcurrentWriterClient{
+				Client: syncCtx.HostClient,
+				target: hostTargetKey,
+			}
+			syncCtx.HostClient = concurrentClient
+
+			reconcileTarget := func() ctrl.Result {
+				t.Helper()
+				currentVirtual := &corev1.PersistentVolumeClaim{}
+				assert.NilError(t, syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, currentVirtual))
+				currentHost := &corev1.PersistentVolumeClaim{}
+				assert.NilError(t, syncCtx.HostClient.Get(syncCtx.Context, hostTargetKey, currentHost))
+				result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					currentHost.DeepCopy(),
+					currentHost.DeepCopy(),
+					currentVirtual.DeepCopy(),
+					currentVirtual.DeepCopy(),
+				))
+				assert.NilError(t, err)
+				return result
+			}
+
+			firstResult := reconcileTarget()
+			assert.Equal(t, firstResult.RequeueAfter, time.Second)
+			assert.NilError(t, concurrentClient.concurrentErr)
+			assert.Assert(t, concurrentClient.directRV != "")
+			assert.Assert(t, concurrentClient.concurrentRV != "")
+			assert.Assert(t, concurrentClient.directRV != concurrentClient.concurrentRV)
+
+			hostAfterConflict := &corev1.PersistentVolumeClaim{}
+			assert.NilError(t, syncCtx.HostClient.Get(syncCtx.Context, hostTargetKey, hostAfterConflict))
+			assert.Equal(t, hostAfterConflict.Spec.VolumeName, virtualPVName)
+			assert.Equal(t, hostAfterConflict.Annotations["example.test/concurrent-writer"], "preserve")
+			hostStorageAfterConflict := hostAfterConflict.Spec.Resources.Requests[corev1.ResourceStorage]
+			assert.Equal(t, hostStorageAfterConflict.String(), "2Gi")
+
+			virtualAfterConflict := &corev1.PersistentVolumeClaim{}
+			assert.NilError(t, syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, virtualAfterConflict))
+			assert.Equal(t, virtualAfterConflict.Status.Phase, corev1.ClaimBound)
+			virtualCapacityAfterConflict := virtualAfterConflict.Status.Capacity[corev1.ResourceStorage]
+			assert.Equal(t, virtualCapacityAfterConflict.String(), "1Gi")
+			assert.Equal(t, virtualAfterConflict.Annotations["example.test/virtual-writer"], "preserve")
+
+			secondResult := reconcileTarget()
+			assert.Check(t, secondResult.IsZero())
+
+			hostAfterRetry := &corev1.PersistentVolumeClaim{}
+			assert.NilError(t, syncCtx.HostClient.Get(syncCtx.Context, hostTargetKey, hostAfterRetry))
+			assert.Equal(t, hostAfterRetry.Annotations["example.test/concurrent-writer"], "preserve")
+			hostStorageAfterRetry := hostAfterRetry.Spec.Resources.Requests[corev1.ResourceStorage]
+			assert.Equal(t, hostStorageAfterRetry.String(), "1Gi")
+
+			virtualAfterRetry := &corev1.PersistentVolumeClaim{}
+			assert.NilError(t, syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, virtualAfterRetry))
+			assert.Equal(t, virtualAfterRetry.Status.Phase, corev1.ClaimBound)
+			assert.Equal(t, virtualAfterRetry.Annotations["example.test/virtual-writer"], "preserve")
+		},
+	}
+	test.Run(t, syncertesting.NewFakeRegisterContext)
 }
 
 func TestTranslateSelectorPreservesNilAndExplicitEmptyStorageClass(t *testing.T) {
