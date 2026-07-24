@@ -27,8 +27,9 @@ func TestFromHostSync(t *testing.T) {
 				"example.com/label-b": "test-2",
 			},
 			Annotations: map[string]string{
-				"example.com/annotation-a": "test-1",
-				"example.com/annotation-b": "test-2",
+				DefaultStorageClassAnnotation: "true",
+				"example.com/annotation-a":    "test-1",
+				"example.com/annotation-b":    "test-2",
 			},
 		},
 		Provisioner: "my-provisioner",
@@ -42,8 +43,9 @@ func TestFromHostSync(t *testing.T) {
 				"example.com/label-b": "test-2",
 			},
 			Annotations: map[string]string{
-				"example.com/annotation-a": "test-1",
-				"example.com/annotation-b": "test-2",
+				DefaultStorageClassAnnotation: "true",
+				"example.com/annotation-a":    "test-1",
+				"example.com/annotation-b":    "test-2",
 			},
 		},
 		Provisioner: "my-provisioner",
@@ -60,6 +62,8 @@ func TestFromHostSync(t *testing.T) {
 	vObjectUpdated.Parameters = map[string]string{
 		"test": "value",
 	}
+	vObjectWithoutDefault := vObject.DeepCopy()
+	delete(vObjectWithoutDefault.Annotations, DefaultStorageClassAnnotation)
 
 	syncertesting.RunTests(t, []*syncertesting.SyncTest{
 		{
@@ -80,7 +84,7 @@ func TestFromHostSync(t *testing.T) {
 		{
 			Name:                 "Sync host changes to virtual",
 			InitialPhysicalState: []runtime.Object{pObjectUpdated.DeepCopy()}, // host resource has been updated
-			InitialVirtualState:  []runtime.Object{vObject.DeepCopy()},        // virtual resource has old values
+			InitialVirtualState:  []runtime.Object{vObjectWithoutDefault},     // virtual resource is missing the host default annotation
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"): {pObjectUpdated}, // host resource did not change
 			},
@@ -89,7 +93,7 @@ func TestFromHostSync(t *testing.T) {
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
 				syncerCtx, syncer := newFakeSyncer(t, ctx)
-				_, err := syncer.Sync(syncerCtx, synccontext.NewSyncEvent(pObjectUpdated, vObject.DeepCopy()))
+				_, err := syncer.Sync(syncerCtx, synccontext.NewSyncEvent(pObjectUpdated, vObjectWithoutDefault.DeepCopy()))
 				assert.NilError(t, err)
 			},
 		},

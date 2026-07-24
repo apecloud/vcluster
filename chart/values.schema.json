@@ -5091,7 +5091,7 @@
         },
         "storageClasses": {
           "$ref": "#/$defs/EnableAutoSwitchWithPatchesAndSelector",
-          "description": "StorageClasses defines if storage classes should get synced from the host cluster to the virtual cluster, but not back. If auto, is automatically enabled when the virtual scheduler is enabled."
+          "description": "StorageClasses defines if storage classes should get synced from the host cluster to the virtual cluster, but not back. If auto, is automatically enabled when persistent volume claims are synced to the host and storage classes are not synced to the host."
         },
         "csiNodes": {
           "$ref": "#/$defs/EnableAutoSwitchWithPatches",

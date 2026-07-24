@@ -58,7 +58,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 2
+          count: 3
       - contains:
           path: rules
           content:
@@ -71,6 +71,80 @@ tests:
             apiGroups: [ "" ]
             resources: [ "nodes" ]
             verbs: [ "get" ]
+
+  - it: auto projects host storage classes for translated PVCs
+    set:
+      rbac:
+        enableVolumeSnapshotRules:
+          enabled: false
+      sync:
+        toHost:
+          persistentVolumeClaims:
+            enabled: true
+          persistentVolumes:
+            enabled: false
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: rules
+          content:
+            apiGroups: [ "storage.k8s.io" ]
+            resources: [ "storageclasses" ]
+            verbs: [ "get", "watch", "list" ]
+
+  - it: explicit false does not project host storage classes
+    set:
+      rbac:
+        enableVolumeSnapshotRules:
+          enabled: false
+      sync:
+        toHost:
+          persistentVolumeClaims:
+            enabled: true
+          persistentVolumes:
+            enabled: false
+        fromHost:
+          storageClasses:
+            enabled: false
+    asserts:
+      - hasDocuments:
+          count: 1
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [ "storage.k8s.io" ]
+            resources: [ "storageclasses" ]
+            verbs: [ "get", "watch", "list" ]
+
+  - it: auto does not project host storage classes when guest classes sync to host
+    set:
+      rbac:
+        enableVolumeSnapshotRules:
+          enabled: false
+      sync:
+        toHost:
+          persistentVolumeClaims:
+            enabled: true
+          persistentVolumes:
+            enabled: false
+          storageClasses:
+            enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: rules
+          content:
+            apiGroups: [ "storage.k8s.io" ]
+            resources: [ "storageclasses" ]
+            verbs: [ "create", "delete", "patch", "update", "get", "watch", "list" ]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [ "storage.k8s.io" ]
+            resources: [ "storageclasses" ]
+            verbs: [ "get", "watch", "list" ]
 
   - it: force enable
     set:
@@ -196,7 +270,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -246,7 +320,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 7
+          count: 8
       - contains:
           path: rules
           content:
@@ -277,7 +351,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 7
+          count: 8
       - contains:
           path: rules
           content:
@@ -303,7 +377,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -322,7 +396,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -352,7 +426,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 6
       - contains:
           path: rules
           content:
@@ -393,7 +467,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 7
+          count: 8
       - contains:
           path: rules
           content:
@@ -453,7 +527,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -473,7 +547,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 7
+          count: 8
       - contains:
           path: rules
           content:
@@ -499,7 +573,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 7
+          count: 8
       - contains:
           path: rules
           content:
@@ -521,7 +595,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -548,7 +622,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 8
+          count: 9
       - contains:
           path: rules
           content:
@@ -622,7 +696,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 8
+          count: 9
       - contains:
           path: rules
           content:
@@ -658,7 +732,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 8
+          count: 9
       - contains:
           path: rules
           content:
@@ -694,7 +768,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 8
+          count: 9
       - contains:
           path: rules
           content:
@@ -741,7 +815,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 8
+          count: 9
       - contains:
           path: rules
           content:
@@ -777,7 +851,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 8
+          count: 9
       - contains:
           path: rules
           content:
@@ -813,7 +887,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 8
+          count: 9
       - contains:
           path: rules
           content:
@@ -847,7 +921,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
