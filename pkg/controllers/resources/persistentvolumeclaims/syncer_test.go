@@ -3,9 +3,11 @@ package persistentvolumeclaims
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,14 +26,18 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	toolscache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -68,6 +74,8 @@ func (c *injectHelperAfterHostPVGetClient) Patch(ctx context.Context, obj client
 	}
 	return c.Client.Patch(ctx, obj, patch, opts...)
 }
+
+var externalPopulatorControllerTestID atomic.Uint64
 
 type eventRecordingTranslator struct {
 	syncertypes.GenericTranslator
@@ -175,6 +183,56 @@ func newExternalPopulatorDependencyFixture() *externalPopulatorDependencyFixture
 	}
 }
 
+func newExternalPopulatorHostHandoffObjects(
+	f *externalPopulatorDependencyFixture,
+) (*corev1.PersistentVolumeClaim, *corev1.PersistentVolumeClaim, *corev1.PersistentVolume) {
+	hostTranslator := translate.NewSingleNamespaceTranslator(testingutil.DefaultTestTargetNamespace)
+	hostTargetName := hostTranslator.HostName(nil, f.target.Name, f.target.Namespace)
+	hostTarget := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      hostTargetName.Name,
+			Namespace: testingutil.DefaultTestTargetNamespace,
+			UID:       types.UID("host-target-pvc-uid"),
+			Annotations: map[string]string{
+				translate.NameAnnotation:          f.target.Name,
+				translate.NamespaceAnnotation:     f.target.Namespace,
+				translate.UIDAnnotation:           string(f.target.UID),
+				translate.KindAnnotation:          corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim").String(),
+				translate.HostNamespaceAnnotation: testingutil.DefaultTestTargetNamespace,
+				translate.HostNameAnnotation:      hostTargetName.Name,
+			},
+			Labels: map[string]string{
+				translate.MarkerLabel:    translate.VClusterName,
+				translate.NamespaceLabel: f.target.Namespace,
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
+	}
+	hostHelperName := hostTranslator.HostName(nil, f.helper.Name, f.helper.Namespace)
+	hostHelper := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      hostHelperName.Name,
+			Namespace: testingutil.DefaultTestTargetNamespace,
+			UID:       types.UID("host-helper-pvc-uid"),
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: f.pv.Name},
+	}
+	hostPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: f.pv.Name},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{
+				APIVersion: corev1.SchemeGroupVersion.Version,
+				Kind:       "PersistentVolumeClaim",
+				Namespace:  hostHelper.Namespace,
+				Name:       hostHelper.Name,
+				UID:        hostHelper.UID,
+			},
+		},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound},
+	}
+	return hostTarget, hostHelper, hostPV
+}
+
 func newExternalPopulatorMapperTestSyncer(
 	t *testing.T,
 	virtualObjects ...runtime.Object,
@@ -206,6 +264,109 @@ func (c *externalPopulatorMapperErrorClient) List(ctx context.Context, list clie
 		return c.listErr
 	}
 	return c.Client.List(ctx, list, opts...)
+}
+
+type externalPopulatorFlakyMapperClient struct {
+	client.Client
+
+	mu                 sync.Mutex
+	remainingGetErrors int
+	injectedGetErrors  int
+	getErr             error
+}
+
+func (c *externalPopulatorFlakyMapperClient) Get(
+	ctx context.Context,
+	key client.ObjectKey,
+	obj client.Object,
+	opts ...client.GetOption,
+) error {
+	c.mu.Lock()
+	if c.remainingGetErrors > 0 {
+		c.remainingGetErrors--
+		c.injectedGetErrors++
+		err := c.getErr
+		c.mu.Unlock()
+		return err
+	}
+	c.mu.Unlock()
+
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func (c *externalPopulatorFlakyMapperClient) injectedErrors() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.injectedGetErrors
+}
+
+type externalPopulatorTopologyListErrorAfterWriterClient struct {
+	client.Client
+	hostClient  client.Client
+	hostTarget  types.NamespacedName
+	topologyErr error
+	updateErr   error
+
+	mu                   sync.Mutex
+	pvcListCalls         int
+	injectedUpdateErrors int
+	writerErr            error
+}
+
+func (c *externalPopulatorTopologyListErrorAfterWriterClient) List(
+	ctx context.Context,
+	list client.ObjectList,
+	opts ...client.ListOption,
+) error {
+	if _, ok := list.(*corev1.PersistentVolumeClaimList); !ok {
+		return c.Client.List(ctx, list, opts...)
+	}
+
+	c.mu.Lock()
+	c.pvcListCalls++
+	trigger := c.pvcListCalls == 2
+	c.mu.Unlock()
+	if !trigger {
+		return c.Client.List(ctx, list, opts...)
+	}
+
+	current := &corev1.PersistentVolumeClaim{}
+	err := c.hostClient.Get(ctx, c.hostTarget, current)
+	if err == nil {
+		if current.Annotations == nil {
+			current.Annotations = map[string]string{}
+		}
+		current.Annotations["example.test/external-writer"] = "after-fresh-read"
+		current.Spec.Resources.Requests = corev1.ResourceList{
+			corev1.ResourceStorage: resource.MustParse("3Gi"),
+		}
+		err = c.hostClient.Update(ctx, current)
+	}
+
+	c.mu.Lock()
+	c.writerErr = err
+	c.mu.Unlock()
+	return c.topologyErr
+}
+
+func (c *externalPopulatorTopologyListErrorAfterWriterClient) Update(
+	ctx context.Context,
+	obj client.Object,
+	opts ...client.UpdateOption,
+) error {
+	if c.updateErr != nil {
+		c.mu.Lock()
+		c.injectedUpdateErrors++
+		c.mu.Unlock()
+		return c.updateErr
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func (c *externalPopulatorTopologyListErrorAfterWriterClient) state() (int, int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pvcListCalls, c.injectedUpdateErrors, c.writerErr
 }
 
 type externalPopulatorConcurrentWriterClient struct {
@@ -262,10 +423,26 @@ func (c *externalPopulatorConcurrentWriterClient) Patch(
 type externalPopulatorRecordingManager struct {
 	ctrl.Manager
 	recordingCache cache.Cache
+
+	mu        sync.Mutex
+	runnables []manager.Runnable
 }
 
 func (m *externalPopulatorRecordingManager) GetCache() cache.Cache {
 	return m.recordingCache
+}
+
+func (m *externalPopulatorRecordingManager) Add(runnable manager.Runnable) error {
+	m.mu.Lock()
+	m.runnables = append(m.runnables, runnable)
+	m.mu.Unlock()
+	return m.Manager.Add(runnable)
+}
+
+func (m *externalPopulatorRecordingManager) registeredRunnables() []manager.Runnable {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]manager.Runnable(nil), m.runnables...)
 }
 
 type externalPopulatorRecordingCache struct {
@@ -1032,6 +1209,432 @@ func TestExternalPopulatorDependencyModifyControllerWiring(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("controller did not stop within 2s")
+	}
+}
+
+func TestExternalPopulatorDependencyModifyControllerRetriesTransientMapperError(t *testing.T) {
+	f := newExternalPopulatorDependencyFixture()
+	hostTarget, hostHelper, hostPV := newExternalPopulatorHostHandoffObjects(f)
+
+	hostClient := testingutil.NewFakeClient(
+		scheme.Scheme,
+		hostTarget,
+		hostHelper,
+		hostPV,
+	)
+	virtualClient := testingutil.NewFakeClient(
+		scheme.Scheme,
+		f.target.DeepCopy(),
+		f.pv.DeepCopy(),
+	)
+	registerCtx := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), hostClient, virtualClient)
+	baseManager := testingutil.NewFakeManager(virtualClient)
+	recordingCache := newExternalPopulatorRecordingCache(baseManager.GetCache())
+	recordingManager := &externalPopulatorRecordingManager{
+		Manager:        baseManager,
+		recordingCache: recordingCache,
+	}
+	registerCtx.VirtualManager = recordingManager
+
+	syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, registerCtx, New)
+	pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+	pvcSyncer.useFakePersistentVolumes = true
+
+	targetKey := types.NamespacedName{
+		Namespace: f.target.Namespace,
+		Name:      f.target.Name,
+	}
+	hostTargetKey := types.NamespacedName{
+		Namespace: hostTarget.Namespace,
+		Name:      hostTarget.Name,
+	}
+	reconcileTarget := func() (ctrl.Result, error) {
+		currentVirtual := &corev1.PersistentVolumeClaim{}
+		if err := syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, currentVirtual); err != nil {
+			return ctrl.Result{}, err
+		}
+		currentHost := &corev1.PersistentVolumeClaim{}
+		if err := syncCtx.HostClient.Get(syncCtx.Context, hostTargetKey, currentHost); err != nil {
+			return ctrl.Result{}, err
+		}
+		return pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+			currentHost.DeepCopy(),
+			currentHost.DeepCopy(),
+			currentVirtual.DeepCopy(),
+			currentVirtual.DeepCopy(),
+		))
+	}
+
+	firstResult, err := reconcileTarget()
+	assert.NilError(t, err)
+	assert.Check(t, firstResult.IsZero(), "first transient result was %#v", firstResult)
+	preRecoveryHostTarget := &corev1.PersistentVolumeClaim{}
+	assert.NilError(t, hostClient.Get(syncCtx.Context, hostTargetKey, preRecoveryHostTarget))
+	assert.Equal(t, preRecoveryHostTarget.Spec.VolumeName, "")
+	preRecoveryHostPV := &corev1.PersistentVolume{}
+	assert.NilError(t, hostClient.Get(
+		syncCtx.Context,
+		types.NamespacedName{Name: f.pv.Name},
+		preRecoveryHostPV,
+	))
+	assert.Check(
+		t,
+		claimRefMatchesPersistentVolumeClaim(preRecoveryHostPV.Spec.ClaimRef, hostHelper),
+		"pre-recovery host PV claimRef = %#v, want helper %s/%s",
+		preRecoveryHostPV.Spec.ClaimRef,
+		hostHelper.Namespace,
+		hostHelper.Name,
+	)
+
+	assert.NilError(t, virtualClient.Create(syncCtx.Context, f.helper.DeepCopy()))
+	injectedErr := errors.New("injected first dependency mapper lookup failure")
+	flakyMapperClient := &externalPopulatorFlakyMapperClient{
+		Client:             virtualClient,
+		remainingGetErrors: 1,
+		getErr:             injectedErr,
+	}
+	pvcSyncer.virtualClient = flakyMapperClient
+
+	type reconcileOutcome struct {
+		request ctrl.Request
+		result  ctrl.Result
+		err     error
+	}
+	outcomes := make(chan reconcileOutcome, 4)
+	controllerBuilder := ctrl.NewControllerManagedBy(recordingManager).
+		Named(fmt.Sprintf(
+			"external-populator-dependency-retry-test-%d",
+			externalPopulatorControllerTestID.Add(1),
+		)).
+		For(&corev1.PersistentVolumeClaim{})
+	controllerBuilder, err = pvcSyncer.ModifyController(registerCtx, controllerBuilder)
+	assert.NilError(t, err)
+
+	retryRunnables := recordingManager.registeredRunnables()
+	assert.Equal(t, len(retryRunnables), 1)
+	retryRunnable := retryRunnables[0]
+	controller, err := controllerBuilder.Build(reconcile.Func(func(_ context.Context, request ctrl.Request) (ctrl.Result, error) {
+		if request.NamespacedName != targetKey {
+			return ctrl.Result{}, nil
+		}
+		result, reconcileErr := reconcileTarget()
+		outcomes <- reconcileOutcome{
+			request: request,
+			result:  result,
+			err:     reconcileErr,
+		}
+		return result, reconcileErr
+	}))
+	assert.NilError(t, err)
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	retryStopped := make(chan error, 1)
+	go func() {
+		retryStopped <- retryRunnable.Start(runCtx)
+	}()
+	controllerStopped := make(chan error, 1)
+	go func() {
+		controllerStopped <- controller.Start(runCtx)
+	}()
+
+	waitDeadline := time.NewTimer(2 * time.Second)
+	waitTicker := time.NewTicker(5 * time.Millisecond)
+	for {
+		if len(recordingCache.handlersFor(&corev1.PersistentVolumeClaim{})) == 2 {
+			break
+		}
+		select {
+		case err := <-controllerStopped:
+			t.Fatalf("controller stopped before watch registration: %v", err)
+		case err := <-retryStopped:
+			t.Fatalf("retry worker stopped before dependency event: %v", err)
+		case <-waitDeadline.C:
+			t.Fatalf(
+				"watch registration timed out: pvc handlers=%d",
+				len(recordingCache.handlersFor(&corev1.PersistentVolumeClaim{})),
+			)
+		case <-waitTicker.C:
+		}
+	}
+	waitDeadline.Stop()
+	waitTicker.Stop()
+
+	// Fire the helper creation exactly once. The fast mapper consumes the
+	// injected Get error; no second dependency event is sent after recovery.
+	for _, eventHandler := range recordingCache.handlersFor(&corev1.PersistentVolumeClaim{}) {
+		eventHandler.OnAdd(f.helper.DeepCopy(), false)
+	}
+
+	select {
+	case outcome := <-outcomes:
+		if outcome.request.NamespacedName != targetKey {
+			t.Fatalf("recovered mapper enqueued %s, want %s", outcome.request.NamespacedName, targetKey)
+		}
+		assert.NilError(t, outcome.err)
+		assert.Check(t, outcome.result.IsZero(), "recovered target result was %#v", outcome.result)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("recovered mapper did not enqueue exact target %s within 3s", targetKey)
+	}
+
+	assert.Equal(t, flakyMapperClient.injectedErrors(), 1)
+	actualHostTarget := &corev1.PersistentVolumeClaim{}
+	assert.NilError(t, hostClient.Get(syncCtx.Context, hostTargetKey, actualHostTarget))
+	actualHostPV := &corev1.PersistentVolume{}
+	assert.NilError(t, hostClient.Get(
+		syncCtx.Context,
+		types.NamespacedName{Name: f.pv.Name},
+		actualHostPV,
+	))
+	actualVirtualTarget := &corev1.PersistentVolumeClaim{}
+	assert.NilError(t, virtualClient.Get(syncCtx.Context, targetKey, actualVirtualTarget))
+	if actualHostTarget.Spec.VolumeName != f.pv.Name ||
+		!claimRefMatchesPersistentVolumeClaim(actualHostPV.Spec.ClaimRef, actualHostTarget) ||
+		actualVirtualTarget.Status.Phase != corev1.ClaimBound {
+		t.Fatalf(
+			"recovered handoff: host_volume=%q host_claim_ref=%#v virtual_phase=%q; want %q/target/%q",
+			actualHostTarget.Spec.VolumeName,
+			actualHostPV.Spec.ClaimRef,
+			actualVirtualTarget.Status.Phase,
+			f.pv.Name,
+			corev1.ClaimBound,
+		)
+	}
+
+	cancel()
+	for label, stopped := range map[string]<-chan error{
+		"controller":   controllerStopped,
+		"retry worker": retryStopped,
+	} {
+		select {
+		case err := <-stopped:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("%s stop: %v", label, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s did not stop within 2s", label)
+		}
+	}
+}
+
+func TestExternalPopulatorDependencyRetryExhaustsFiniteBudget(t *testing.T) {
+	f := newExternalPopulatorDependencyFixture()
+	syncCtx, pvcSyncer := newExternalPopulatorMapperTestSyncer(
+		t,
+		f.target.DeepCopy(),
+		f.pv.DeepCopy(),
+	)
+	flakyMapperClient := &externalPopulatorFlakyMapperClient{
+		Client:             syncCtx.VirtualClient,
+		remainingGetErrors: 100,
+		getErr:             errors.New("persistent dependency mapper failure"),
+	}
+	pvcSyncer.virtualClient = flakyMapperClient
+
+	retryQueue := workqueue.NewTypedRateLimitingQueue(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[*externalPopulatorDependencyRetry](
+			time.Millisecond,
+			time.Millisecond,
+		),
+	)
+	targetQueue := workqueue.NewTypedRateLimitingQueue(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[ctrl.Request](
+			time.Millisecond,
+			time.Millisecond,
+		),
+	)
+	defer targetQueue.ShutDown()
+
+	retry := &externalPopulatorDependencyRetry{
+		object:      f.helper.DeepCopy(),
+		targetQueue: targetQueue,
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	go func() {
+		stopped <- pvcSyncer.runExternalPopulatorDependencyRetryWorker(runCtx, retryQueue)
+	}()
+	retryQueue.AddRateLimited(retry)
+
+	deadline := time.NewTimer(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		if flakyMapperClient.injectedErrors() == externalPopulatorDependencyMaxRetries &&
+			retryQueue.NumRequeues(retry) == 0 &&
+			retryQueue.Len() == 0 {
+			break
+		}
+
+		select {
+		case err := <-stopped:
+			t.Fatalf("retry worker stopped before exhausting the retry budget: %v", err)
+		case <-deadline.C:
+			t.Fatalf(
+				"retry budget was not exhausted: injected_errors=%d requeues=%d queue_len=%d",
+				flakyMapperClient.injectedErrors(),
+				retryQueue.NumRequeues(retry),
+				retryQueue.Len(),
+			)
+		case <-ticker.C:
+		}
+	}
+
+	assert.Equal(t, targetQueue.Len(), 0)
+	cancel()
+	select {
+	case err := <-stopped:
+		assert.NilError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("retry worker did not stop within 1s")
+	}
+}
+
+func TestSyncExternalPopulatorTopologyErrorDoesNotReplayFreshHostSnapshot(t *testing.T) {
+	f := newExternalPopulatorDependencyFixture()
+	f.target.Spec.Resources.Requests = corev1.ResourceList{
+		corev1.ResourceStorage: resource.MustParse("1Gi"),
+	}
+	hostTarget, hostHelper, hostPV := newExternalPopulatorHostHandoffObjects(f)
+	hostTarget.Annotations["example.test/external-writer"] = "initial"
+	hostTarget.Annotations[bindCompletedAnnotation] = "yes"
+	hostTarget.Spec.Resources.Requests = corev1.ResourceList{
+		corev1.ResourceStorage: resource.MustParse("1Gi"),
+	}
+
+	hostClient := testingutil.NewFakeClient(
+		scheme.Scheme,
+		hostTarget,
+		hostHelper,
+		hostPV,
+	)
+	virtualClient := testingutil.NewFakeClient(
+		scheme.Scheme,
+		f.target.DeepCopy(),
+		f.helper.DeepCopy(),
+		f.pv.DeepCopy(),
+	)
+	registerCtx := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), hostClient, virtualClient)
+	syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, registerCtx, New)
+	pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+	pvcSyncer.useFakePersistentVolumes = true
+
+	targetKey := types.NamespacedName{Namespace: f.target.Namespace, Name: f.target.Name}
+	hostTargetKey := types.NamespacedName{Namespace: hostTarget.Namespace, Name: hostTarget.Name}
+	eventHost := &corev1.PersistentVolumeClaim{}
+	assert.NilError(t, hostClient.Get(syncCtx.Context, hostTargetKey, eventHost))
+	eventVirtual := &corev1.PersistentVolumeClaim{}
+	assert.NilError(t, virtualClient.Get(syncCtx.Context, targetKey, eventVirtual))
+	initialHostResourceVersion := eventHost.ResourceVersion
+
+	firstWriter := &corev1.PersistentVolumeClaim{}
+	assert.NilError(t, hostClient.Get(syncCtx.Context, hostTargetKey, firstWriter))
+	firstWriter.Annotations["example.test/external-writer"] = "fresh-read"
+	firstWriter.Spec.Resources.Requests = corev1.ResourceList{
+		corev1.ResourceStorage: resource.MustParse("2Gi"),
+	}
+	assert.NilError(t, hostClient.Update(syncCtx.Context, firstWriter))
+
+	topologyErr := errors.New("injected helper topology list failure after fresh host read")
+	deferredConflict := kerrors.NewConflict(
+		schema.GroupResource{Resource: "persistentvolumeclaims"},
+		f.target.Name,
+		errors.New("injected deferred virtual patch conflict"),
+	)
+	errorClient := &externalPopulatorTopologyListErrorAfterWriterClient{
+		Client:      virtualClient,
+		hostClient:  hostClient,
+		hostTarget:  hostTargetKey,
+		topologyErr: topologyErr,
+		updateErr:   deferredConflict,
+	}
+	syncCtx.VirtualClient = errorClient
+
+	result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+		eventHost.DeepCopy(),
+		eventHost,
+		eventVirtual.DeepCopy(),
+		eventVirtual,
+	))
+	if !errors.Is(err, topologyErr) {
+		t.Fatalf("Sync() error = %v, want wrapped topology error %v", err, topologyErr)
+	}
+	assert.Check(t, result.IsZero(), "topology error result was %#v", result)
+	if eventHost.ResourceVersion == initialHostResourceVersion ||
+		eventHost.Annotations["example.test/external-writer"] != "fresh-read" {
+		t.Fatalf(
+			"ensure did not install the fresh host snapshot: initial_rv=%q event_rv=%q writer=%q",
+			initialHostResourceVersion,
+			eventHost.ResourceVersion,
+			eventHost.Annotations["example.test/external-writer"],
+		)
+	}
+
+	listCalls, injectedUpdateErrors, writerErr := errorClient.state()
+	assert.Equal(t, listCalls, 2)
+	assert.Equal(t, injectedUpdateErrors, 1)
+	assert.NilError(t, writerErr)
+
+	actualHostTarget := &corev1.PersistentVolumeClaim{}
+	assert.NilError(t, hostClient.Get(syncCtx.Context, hostTargetKey, actualHostTarget))
+	if actualHostTarget.Annotations["example.test/external-writer"] != "after-fresh-read" ||
+		actualHostTarget.Spec.Resources.Requests.Storage().Cmp(resource.MustParse("3Gi")) != 0 ||
+		actualHostTarget.Spec.VolumeName != "" {
+		t.Fatalf(
+			"deferred host patch replayed a stale snapshot: writer=%q storage=%s volume=%q; want after-fresh-read/3Gi/empty",
+			actualHostTarget.Annotations["example.test/external-writer"],
+			actualHostTarget.Spec.Resources.Requests.Storage().String(),
+			actualHostTarget.Spec.VolumeName,
+		)
+	}
+	actualHostPV := &corev1.PersistentVolume{}
+	assert.NilError(t, hostClient.Get(
+		syncCtx.Context,
+		types.NamespacedName{Name: f.pv.Name},
+		actualHostPV,
+	))
+	assert.Check(
+		t,
+		claimRefMatchesPersistentVolumeClaim(actualHostPV.Spec.ClaimRef, hostHelper),
+		"topology error changed host PV claimRef to %#v",
+		actualHostPV.Spec.ClaimRef,
+	)
+}
+
+func TestContainsOnlyConflictErrors(t *testing.T) {
+	sentinel := errors.New("sentinel non-conflict")
+	conflict := kerrors.NewConflict(
+		schema.GroupResource{Resource: "persistentvolumeclaims"},
+		"target",
+		errors.New("conflict"),
+	)
+	pureAggregate := utilerrors.NewAggregate([]error{
+		conflict,
+		fmt.Errorf("wrapped: %w", conflict),
+	})
+	mixedAggregate := utilerrors.NewAggregate([]error{
+		sentinel,
+		conflict,
+	})
+
+	for _, tt := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "single conflict", err: conflict, want: true},
+		{name: "wrapped conflict", err: fmt.Errorf("wrapped: %w", conflict), want: true},
+		{name: "pure aggregate", err: pureAggregate, want: true},
+		{name: "wrapped pure aggregate", err: fmt.Errorf("wrapped: %w", pureAggregate), want: true},
+		{name: "single non-conflict", err: sentinel, want: false},
+		{name: "mixed aggregate", err: mixedAggregate, want: false},
+		{name: "wrapped mixed aggregate", err: fmt.Errorf("wrapped: %w", mixedAggregate), want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, containsOnlyConflictErrors(tt.err), tt.want)
+		})
 	}
 }
 
