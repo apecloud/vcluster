@@ -19,10 +19,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -105,6 +107,331 @@ func assertNoPVCEvent(t *testing.T, recorder *events.FakeRecorder) {
 	case event := <-recorder.Events:
 		t.Errorf("expected no PVC event, got %q", event)
 	default:
+	}
+}
+
+func TestSyncExternalPopulatorPreGateTransientSchedulesTarget(t *testing.T) {
+	type dependencyRequestMapper interface {
+		externalPopulatorDependencyRequests(context.Context, client.Object) []ctrl.Request
+	}
+	type fixture struct {
+		virtualTarget *corev1.PersistentVolumeClaim
+		virtualPV     *corev1.PersistentVolume
+		virtualHelper *corev1.PersistentVolumeClaim
+		hostTarget    *corev1.PersistentVolumeClaim
+		hostPV        *corev1.PersistentVolume
+	}
+
+	newFixture := func() *fixture {
+		const (
+			virtualNamespace = "testns"
+			virtualTargetUID = types.UID("target-pvc-uid")
+			virtualPVName    = "restore-populated-pv"
+		)
+
+		dataProtectionGroup := "dataprotection.kubeblocks.io"
+		virtualTarget := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "testpvc",
+				Namespace: virtualNamespace,
+				UID:       virtualTargetUID,
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				VolumeName: virtualPVName,
+				DataSourceRef: &corev1.TypedObjectReference{
+					APIGroup: &dataProtectionGroup,
+					Kind:     "Backup",
+					Name:     "backup-1",
+				},
+			},
+			Status: corev1.PersistentVolumeClaimStatus{
+				Phase: corev1.ClaimPending,
+			},
+		}
+		virtualPV := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: virtualPVName},
+			Spec: corev1.PersistentVolumeSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Capacity: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+				ClaimRef: &corev1.ObjectReference{
+					Namespace: virtualNamespace,
+					Name:      virtualTarget.Name,
+					UID:       virtualTargetUID,
+				},
+			},
+			Status: corev1.PersistentVolumeStatus{
+				Phase: corev1.VolumeBound,
+			},
+		}
+		virtualHelper := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      externalPopulatorPopulateHelperPrefix + string(virtualTargetUID),
+				Namespace: virtualNamespace,
+				UID:       types.UID("populate-helper-pvc-uid"),
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				VolumeName: virtualPVName,
+			},
+		}
+
+		hostTranslator := translate.NewSingleNamespaceTranslator(testingutil.DefaultTestTargetNamespace)
+		hostTargetName := hostTranslator.HostName(
+			nil,
+			virtualTarget.Name,
+			virtualTarget.Namespace,
+		)
+		hostTarget := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      hostTargetName.Name,
+				Namespace: testingutil.DefaultTestTargetNamespace,
+				UID:       types.UID("host-target-pvc-uid"),
+				Annotations: map[string]string{
+					translate.NameAnnotation:          virtualTarget.Name,
+					translate.NamespaceAnnotation:     virtualTarget.Namespace,
+					translate.UIDAnnotation:           string(virtualTarget.UID),
+					translate.KindAnnotation:          corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim").String(),
+					translate.HostNamespaceAnnotation: testingutil.DefaultTestTargetNamespace,
+					translate.HostNameAnnotation:      hostTargetName.Name,
+				},
+				Labels: map[string]string{
+					translate.MarkerLabel:    translate.VClusterName,
+					translate.NamespaceLabel: virtualTarget.Namespace,
+				},
+			},
+			Status: corev1.PersistentVolumeClaimStatus{
+				Phase:    corev1.ClaimPending,
+				Capacity: corev1.ResourceList{},
+			},
+		}
+		hostPV := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: virtualPVName},
+			Spec: corev1.PersistentVolumeSpec{
+				ClaimRef: &corev1.ObjectReference{
+					APIVersion: corev1.SchemeGroupVersion.Version,
+					Kind:       "PersistentVolumeClaim",
+					Namespace:  hostTarget.Namespace,
+					Name:       hostTarget.Name,
+					UID:        hostTarget.UID,
+				},
+			},
+			Status: corev1.PersistentVolumeStatus{
+				Phase: corev1.VolumeBound,
+			},
+		}
+
+		return &fixture{
+			virtualTarget: virtualTarget,
+			virtualPV:     virtualPV,
+			virtualHelper: virtualHelper,
+			hostTarget:    hostTarget,
+			hostPV:        hostPV,
+		}
+	}
+
+	tests := []struct {
+		name           string
+		trigger        string
+		initialVirtual func(*fixture) []runtime.Object
+		converge       func(*testing.T, *synccontext.SyncContext, *fixture) client.Object
+	}{
+		{
+			name:    "guest fake pv cache not found",
+			trigger: "guest PV create",
+			initialVirtual: func(f *fixture) []runtime.Object {
+				return []runtime.Object{f.virtualTarget.DeepCopy()}
+			},
+			converge: func(t *testing.T, ctx *synccontext.SyncContext, f *fixture) client.Object {
+				t.Helper()
+				converged := f.virtualPV.DeepCopy()
+				assert.NilError(t, ctx.VirtualClient.Create(ctx.Context, converged))
+				return converged
+			},
+		},
+		{
+			name:    "guest helper identity missing",
+			trigger: "guest helper PVC create",
+			initialVirtual: func(f *fixture) []runtime.Object {
+				pvBoundToHelper := f.virtualPV.DeepCopy()
+				pvBoundToHelper.Spec.ClaimRef = &corev1.ObjectReference{
+					Namespace: f.virtualHelper.Namespace,
+					Name:      f.virtualHelper.Name,
+					UID:       f.virtualHelper.UID,
+				}
+				return []runtime.Object{f.virtualTarget.DeepCopy(), pvBoundToHelper}
+			},
+			converge: func(t *testing.T, ctx *synccontext.SyncContext, f *fixture) client.Object {
+				t.Helper()
+				converged := f.virtualHelper.DeepCopy()
+				assert.NilError(t, ctx.VirtualClient.Create(ctx.Context, converged))
+				return converged
+			},
+		},
+		{
+			name:    "pvc pv bound visibility mismatch",
+			trigger: "guest PV phase update",
+			initialVirtual: func(f *fixture) []runtime.Object {
+				pendingPV := f.virtualPV.DeepCopy()
+				pendingPV.Status.Phase = corev1.VolumePending
+				return []runtime.Object{f.virtualTarget.DeepCopy(), pendingPV}
+			},
+			converge: func(t *testing.T, ctx *synccontext.SyncContext, f *fixture) client.Object {
+				t.Helper()
+				converged := &corev1.PersistentVolume{}
+				assert.NilError(t, ctx.VirtualClient.Get(
+					ctx.Context,
+					types.NamespacedName{Name: f.virtualPV.Name},
+					converged,
+				))
+				converged.Status.Phase = corev1.VolumeBound
+				assert.NilError(t, ctx.VirtualClient.Status().Update(ctx.Context, converged))
+				return converged
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture()
+			test := &syncertesting.SyncTest{
+				Name:                 tt.name,
+				InitialVirtualState:  tt.initialVirtual(f),
+				InitialPhysicalState: []runtime.Object{f.hostTarget.DeepCopy(), f.hostPV.DeepCopy()},
+				Sync: func(registerCtx *synccontext.RegisterContext) {
+					syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, registerCtx, New)
+					pvcSyncer := objectSyncer.(*persistentVolumeClaimSyncer)
+					pvcSyncer.useFakePersistentVolumes = true
+
+					targetKey := types.NamespacedName{
+						Namespace: f.virtualTarget.Namespace,
+						Name:      f.virtualTarget.Name,
+					}
+					hostTargetKey := types.NamespacedName{
+						Namespace: f.hostTarget.Namespace,
+						Name:      f.hostTarget.Name,
+					}
+					targetReconciles := 0
+					timerRequeues := 0
+					mappedTargetRequests := 0
+
+					reconcileTarget := func() ctrl.Result {
+						t.Helper()
+						currentVirtual := &corev1.PersistentVolumeClaim{}
+						assert.NilError(t, syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, currentVirtual))
+						currentHost := &corev1.PersistentVolumeClaim{}
+						assert.NilError(t, syncCtx.HostClient.Get(syncCtx.Context, hostTargetKey, currentHost))
+						result, err := pvcSyncer.Sync(syncCtx, synccontext.NewSyncEventWithOld(
+							currentHost.DeepCopy(),
+							currentHost.DeepCopy(),
+							currentVirtual.DeepCopy(),
+							currentVirtual.DeepCopy(),
+						))
+						assert.NilError(t, err)
+						targetReconciles++
+						if result.Requeue || result.RequeueAfter > 0 {
+							timerRequeues++
+						}
+						return result
+					}
+
+					// Pin the exact pre-gate return before exercising the full Sync
+					// boundary: every fixture must be a transient (nil, false, nil),
+					// rather than the genuine non-applicable entry gate.
+					currentVirtual := &corev1.PersistentVolumeClaim{}
+					assert.NilError(t, syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, currentVirtual))
+					currentHost := &corev1.PersistentVolumeClaim{}
+					assert.NilError(t, syncCtx.HostClient.Get(syncCtx.Context, hostTargetKey, currentHost))
+					preGatePV, preGateReady, err := pvcSyncer.externalPopulatorPersistentVolume(
+						syncCtx,
+						currentHost,
+						currentVirtual,
+					)
+					assert.NilError(t, err)
+					if preGatePV != nil || preGateReady {
+						t.Fatalf(
+							"%s did not enter a transient (nil, false, nil) pre-gate: pv=%#v ready=%t",
+							tt.trigger,
+							preGatePV,
+							preGateReady,
+						)
+					}
+
+					// The first target reconcile observes that transient and
+					// intentionally schedules no polling timer.
+					firstResult := reconcileTarget()
+					assert.Check(t, firstResult.IsZero(), "%s first result was %#v", tt.trigger, firstResult)
+
+					virtualBeforeDependency := &corev1.PersistentVolumeClaim{}
+					assert.NilError(t, syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, virtualBeforeDependency))
+					convergedDependency := tt.converge(t, syncCtx, f)
+					virtualAfterDependency := &corev1.PersistentVolumeClaim{}
+					assert.NilError(t, syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, virtualAfterDependency))
+					assert.Assert(
+						t,
+						apiequality.Semantic.DeepEqual(virtualAfterDependency, virtualBeforeDependency),
+						"dependency convergence changed the target PVC before its mapped reconcile",
+					)
+
+					// Model only requests produced by the dependency event. A PVC's
+					// primary watch would enqueue the helper key, not this target key.
+					mapper, hasDependencyMapper := any(pvcSyncer).(dependencyRequestMapper)
+					_, hasControllerModifier := any(pvcSyncer).(syncertypes.ControllerModifier)
+					var requests []ctrl.Request
+					if hasDependencyMapper {
+						requests = mapper.externalPopulatorDependencyRequests(syncCtx.Context, convergedDependency)
+					}
+					for _, request := range requests {
+						if request.NamespacedName != targetKey {
+							t.Fatalf(
+								"%s mapped unexpected request %s/%s; want target %s/%s",
+								tt.trigger,
+								request.Namespace,
+								request.Name,
+								targetKey.Namespace,
+								targetKey.Name,
+							)
+						}
+						mappedTargetRequests++
+						reconcileTarget()
+					}
+
+					actualHostTarget := &corev1.PersistentVolumeClaim{}
+					assert.NilError(t, syncCtx.HostClient.Get(syncCtx.Context, hostTargetKey, actualHostTarget))
+					actualHostPV := &corev1.PersistentVolume{}
+					assert.NilError(t, syncCtx.HostClient.Get(
+						syncCtx.Context,
+						types.NamespacedName{Name: f.hostPV.Name},
+						actualHostPV,
+					))
+					actualVirtualTarget := &corev1.PersistentVolumeClaim{}
+					assert.NilError(t, syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, actualVirtualTarget))
+
+					if timerRequeues != 0 ||
+						!hasControllerModifier ||
+						mappedTargetRequests != 1 ||
+						targetReconciles != 2 ||
+						actualHostTarget.Spec.VolumeName != f.virtualPV.Name ||
+						!claimRefMatchesPersistentVolumeClaim(actualHostPV.Spec.ClaimRef, actualHostTarget) ||
+						actualVirtualTarget.Status.Phase != corev1.ClaimBound {
+						t.Fatalf(
+							"%s convergence contract: timer_requeues=%d controller_modifier=%t mapped_target_requests=%d target_reconciles=%d host_volume=%q host_claim_ref=%#v virtual_phase=%q; want 0/true/1/2/%q/target/%q",
+							tt.trigger,
+							timerRequeues,
+							hasControllerModifier,
+							mappedTargetRequests,
+							targetReconciles,
+							actualHostTarget.Spec.VolumeName,
+							actualHostPV.Spec.ClaimRef,
+							actualVirtualTarget.Status.Phase,
+							f.virtualPV.Name,
+							corev1.ClaimBound,
+						)
+					}
+				},
+			}
+			test.Run(t, syncertesting.NewFakeRegisterContext)
+		})
 	}
 }
 
