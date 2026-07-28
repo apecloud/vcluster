@@ -34,6 +34,14 @@ type hostStorageClassSyncer struct {
 	syncertypes.GenericTranslator
 }
 
+var _ syncertypes.OptionsProvider = &hostStorageClassSyncer{}
+
+func (s *hostStorageClassSyncer) Options() *syncertypes.Options {
+	return &syncertypes.Options{
+		DisableUIDDeletion: true,
+	}
+}
+
 func (s *hostStorageClassSyncer) UseUncachedPhysicalClient() bool {
 	return false
 }
@@ -46,6 +54,14 @@ func (s *hostStorageClassSyncer) Resource() client.Object {
 	return &storagev1.StorageClass{}
 }
 
+func (s *hostStorageClassSyncer) HostToVirtual(ctx *synccontext.SyncContext, req types.NamespacedName, pObj client.Object) types.NamespacedName {
+	if isVClusterManagedHostStorageClass(pObj) {
+		return types.NamespacedName{}
+	}
+
+	return s.GenericTranslator.HostToVirtual(ctx, req, pObj)
+}
+
 var _ syncertypes.Syncer = &hostStorageClassSyncer{}
 
 func (s *hostStorageClassSyncer) Syncer() syncertypes.Sync[client.Object] {
@@ -53,6 +69,10 @@ func (s *hostStorageClassSyncer) Syncer() syncertypes.Sync[client.Object] {
 }
 
 func (s *hostStorageClassSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*storagev1.StorageClass]) (ctrl.Result, error) {
+	if isVClusterManagedHostStorageClass(event.Host) {
+		return ctrl.Result{}, nil
+	}
+
 	matches, err := ctx.Config.Sync.FromHost.StorageClasses.Selector.Matches(event.Host)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("check storage class selector: %w", err)
@@ -75,6 +95,14 @@ func (s *hostStorageClassSyncer) SyncToVirtual(ctx *synccontext.SyncContext, eve
 }
 
 func (s *hostStorageClassSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*storagev1.StorageClass]) (_ ctrl.Result, retErr error) {
+	if isVClusterManagedHostStorageClass(event.Host) {
+		if event.Virtual.Name == event.Host.Name {
+			return patcher.DeleteVirtualObject(ctx, event.Virtual, event.Host, fmt.Sprintf("storage class %q is managed by a vCluster and must not be mirrored from the host", event.Host.Name))
+		}
+
+		return ctrl.Result{}, nil
+	}
+
 	matches, err := ctx.Config.Sync.FromHost.StorageClasses.Selector.Matches(event.Host)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("check storage class selector: %w", err)
@@ -109,4 +137,13 @@ func (s *hostStorageClassSyncer) Sync(ctx *synccontext.SyncContext, event *syncc
 func (s *hostStorageClassSyncer) SyncToHost(ctx *synccontext.SyncContext, event *synccontext.SyncToHostEvent[*storagev1.StorageClass]) (ctrl.Result, error) {
 	ctx.Log.Infof("delete virtual storage class %s, because physical object is missing", event.Virtual)
 	return ctrl.Result{}, ctx.VirtualClient.Delete(ctx, event.Virtual)
+}
+
+func isVClusterManagedHostStorageClass(obj client.Object) bool {
+	if obj == nil {
+		return false
+	}
+
+	_, managed := obj.GetLabels()[translate.MarkerLabel]
+	return managed
 }
