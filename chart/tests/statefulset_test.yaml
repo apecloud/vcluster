@@ -4,6 +4,8 @@ templates:
 
 tests:
   - it: image name
+    chart:
+      version: 9.8.7-test
     set:
       controlPlane:
         statefulSet:
@@ -12,9 +14,11 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: custom-registry.com/loft-sh/vcluster-pro:0.0.1
+          value: custom-registry.com/loft-sh/vcluster-pro:9.8.7-test
 
   - it: defaultImageRegistry
+    chart:
+      version: 9.8.7-test
     set:
       controlPlane:
         advanced:
@@ -22,7 +26,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: docker.io/loft-sh/vcluster-pro:0.0.1
+          value: docker.io/loft-sh/vcluster-pro:9.8.7-test
 
   - it: custom tag
     set:
@@ -81,6 +85,8 @@ tests:
     release:
       name: my-release
       namespace: my-namespace
+    chart:
+      version: 9.8.7-test
     capabilities:
       majorVersion: 1
       minorVersion: 29
@@ -95,7 +101,7 @@ tests:
           count: 1
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/loft-sh/vcluster-pro:0.0.1
+          value: ghcr.io/loft-sh/vcluster-pro:9.8.7-test
       - contains:
           path: spec.template.spec.containers[0].env
           content:

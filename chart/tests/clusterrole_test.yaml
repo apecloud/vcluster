@@ -3,14 +3,68 @@ templates:
   - clusterrole.yaml
 
 tests:
-  - it: disable when volume snapshot rules are disabled
+  - it: grants the fake PV handoff verbs when PVC sync is enabled and PV sync is disabled
     set:
       rbac:
         enableVolumeSnapshotRules:
           enabled: false
     asserts:
       - hasDocuments:
+          count: 1
+      - lengthEqual:
+          path: rules
+          count: 1
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumes"]
+            verbs: ["get", "list", "watch", "patch"]
+
+  - it: does not create a ClusterRole when PVC PV and snapshot access are disabled
+    set:
+      rbac:
+        enableVolumeSnapshotRules:
+          enabled: false
+      sync:
+        toHost:
+          persistentVolumeClaims:
+            enabled: false
+          persistentVolumes:
+            enabled: false
+    asserts:
+      - hasDocuments:
           count: 0
+
+  - it: retains the full PV lifecycle verbs when PV sync is enabled
+    set:
+      rbac:
+        enableVolumeSnapshotRules:
+          enabled: false
+      sync:
+        toHost:
+          persistentVolumeClaims:
+            enabled: true
+          persistentVolumes:
+            enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - lengthEqual:
+          path: rules
+          count: 2
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumes"]
+            verbs: ["get", "list"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumes"]
+            verbs: ["create", "delete", "patch", "update", "watch"]
 
   - it: enabled by default with default rules
     asserts:
@@ -162,7 +216,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 5
       - contains:
           path: rules
           content:
@@ -212,7 +266,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 6
       - contains:
           path: rules
           content:
@@ -243,7 +297,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 6
       - contains:
           path: rules
           content:
@@ -269,7 +323,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 5
       - contains:
           path: rules
           content:
@@ -288,7 +342,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 6
       - contains:
           path: rules
           content:
@@ -318,7 +372,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 5
       - contains:
           path: rules
           content:
@@ -343,7 +397,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 5
       - contains:
           path: rules
           content:
@@ -359,7 +413,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -419,7 +473,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 5
       - contains:
           path: rules
           content:
@@ -439,7 +493,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 6
       - contains:
           path: rules
           content:
@@ -465,7 +519,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 5
+          count: 6
       - contains:
           path: rules
           content:
@@ -487,7 +541,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 5
       - contains:
           path: rules
           content:
@@ -514,7 +568,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -588,7 +642,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -624,7 +678,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -660,7 +714,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -707,7 +761,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -743,7 +797,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -779,7 +833,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 6
+          count: 7
       - contains:
           path: rules
           content:
@@ -813,7 +867,7 @@ tests:
           count: 1
       - lengthEqual:
           path: rules
-          count: 4
+          count: 5
       - contains:
           path: rules
           content:
