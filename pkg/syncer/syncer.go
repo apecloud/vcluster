@@ -60,8 +60,9 @@ func NewSyncController(ctx *synccontext.RegisterContext, syncer syncertypes.Sync
 		currentNamespace:       ctx.CurrentNamespace,
 		currentNamespaceClient: ctx.CurrentNamespaceClient,
 
-		virtualClient: ctx.VirtualManager.GetClient(),
-		options:       options,
+		virtualClient:    ctx.VirtualManager.GetClient(),
+		virtualAPIReader: ctx.VirtualManager.GetAPIReader(),
+		options:          options,
 	}, nil
 }
 
@@ -106,8 +107,9 @@ type SyncController struct {
 	currentNamespace       string
 	currentNamespaceClient client.Client
 
-	virtualClient client.Client
-	options       *syncertypes.Options
+	virtualClient    client.Client
+	virtualAPIReader client.Reader
+	options          *syncertypes.Options
 }
 
 func (r *SyncController) newSyncContext(ctx context.Context, logName string) *synccontext.SyncContext {
@@ -120,6 +122,7 @@ func (r *SyncController) newSyncContext(ctx context.Context, logName string) *sy
 		CurrentNamespace:       r.currentNamespace,
 		CurrentNamespaceClient: r.currentNamespaceClient,
 		VirtualClient:          r.virtualClient,
+		VirtualAPIReader:       r.virtualAPIReader,
 		Mappings:               r.mappings,
 	}
 	return syncCtx

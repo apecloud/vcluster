@@ -88,6 +88,7 @@ func (r *RegisterContext) ToSyncContext(logName string) *SyncContext {
 	}
 	if r.VirtualManager != nil {
 		syncCtx.VirtualClient = r.VirtualManager.GetClient()
+		syncCtx.VirtualAPIReader = r.VirtualManager.GetAPIReader()
 	}
 	return syncCtx
 }

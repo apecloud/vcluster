@@ -18,6 +18,9 @@ type SyncContext struct {
 
 	HostClient    client.Client
 	VirtualClient client.Client
+	// VirtualAPIReader bypasses the manager cache for commit-boundary reads that
+	// must observe the latest virtual object state before mutating host objects.
+	VirtualAPIReader client.Reader
 
 	ObjectCache *BidirectionalObjectCache
 

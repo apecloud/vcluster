@@ -78,6 +78,12 @@ rules:
     resources: ["persistentvolumes"]
     verbs: ["create", "delete", "patch", "update", "watch"]
   {{- end }}
+  {{- if and .Values.sync.toHost.persistentVolumeClaims.enabled (not .Values.sync.toHost.persistentVolumes.enabled) }}
+  {{- /* external populator handoff patches host PV claimRefs even when PV sync is disabled (fake PV mode) */}}
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "patch"]
+  {{- end }}
   {{- if .Values.sync.fromHost.ingressClasses.enabled }}
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingressclasses"]
