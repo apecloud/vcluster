@@ -224,9 +224,10 @@ func (s *persistentVolumeClaimSyncer) runExternalPopulatorDependencyRetryWorker(
 				}
 
 				queue.Forget(retry)
+				queue.AddRateLimited(retry)
 				ctrl.LoggerFrom(ctx).Error(
 					err,
-					"external populator dependency mapper retries exhausted",
+					"external populator dependency mapper retry burst exhausted; continuing convergence",
 					"kind",
 					fmt.Sprintf("%T", retry.object),
 					"namespace",

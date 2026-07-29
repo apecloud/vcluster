@@ -1383,7 +1383,7 @@ func TestExternalPopulatorDependencyModifyControllerRetriesTransientMapperError(
 	}
 }
 
-func TestExternalPopulatorDependencyRetryExhaustsFiniteBudget(t *testing.T) {
+func TestExternalPopulatorDependencyRetryContinuesAfterFiniteBudget(t *testing.T) {
 	f := newExternalPopulatorDependencyFixture()
 	syncCtx, pvcSyncer := newExternalPopulatorMapperTestSyncer(
 		t,
@@ -1392,8 +1392,8 @@ func TestExternalPopulatorDependencyRetryExhaustsFiniteBudget(t *testing.T) {
 	)
 	flakyMapperClient := &externalPopulatorFlakyMapperClient{
 		Client:             syncCtx.VirtualClient,
-		remainingGetErrors: 100,
-		getErr:             errors.New("persistent dependency mapper failure"),
+		remainingGetErrors: externalPopulatorDependencyMaxRetries,
+		getErr:             errors.New("dependency mapper fails through retry budget"),
 	}
 	pvcSyncer.virtualClient = flakyMapperClient
 
@@ -1427,27 +1427,33 @@ func TestExternalPopulatorDependencyRetryExhaustsFiniteBudget(t *testing.T) {
 	defer deadline.Stop()
 	defer ticker.Stop()
 	for {
-		if flakyMapperClient.injectedErrors() == externalPopulatorDependencyMaxRetries &&
-			retryQueue.NumRequeues(retry) == 0 &&
-			retryQueue.Len() == 0 {
+		if targetQueue.Len() == 1 {
 			break
 		}
 
 		select {
 		case err := <-stopped:
-			t.Fatalf("retry worker stopped before exhausting the retry budget: %v", err)
+			t.Fatalf("retry worker stopped before dependency recovery: %v", err)
 		case <-deadline.C:
 			t.Fatalf(
-				"retry budget was not exhausted: injected_errors=%d requeues=%d queue_len=%d",
+				"recovered mapper did not enqueue target after retry budget: injected_errors=%d requeues=%d retry_queue_len=%d target_queue_len=%d",
 				flakyMapperClient.injectedErrors(),
 				retryQueue.NumRequeues(retry),
 				retryQueue.Len(),
+				targetQueue.Len(),
 			)
 		case <-ticker.C:
 		}
 	}
 
-	assert.Equal(t, targetQueue.Len(), 0)
+	assert.Equal(t, flakyMapperClient.injectedErrors(), externalPopulatorDependencyMaxRetries)
+	request, shutdown := targetQueue.Get()
+	assert.Assert(t, !shutdown)
+	assert.Equal(t, request.NamespacedName, types.NamespacedName{
+		Namespace: f.target.Namespace,
+		Name:      f.target.Name,
+	})
+	targetQueue.Done(request)
 	cancel()
 	select {
 	case err := <-stopped:
