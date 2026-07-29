@@ -1963,6 +1963,12 @@ func (s *persistentVolumeClaimSyncer) externalPopulatorHandoffPendingForTarget(c
 		return false, err
 	}
 
+	if targetHost.DeletionTimestamp != nil {
+		// A terminating target cannot authorize helper deletion. Its current
+		// phase and volumeName may be stale or belong to a replacement path,
+		// while deleting the helper can still release the populated PV.
+		return true, nil
+	}
 	if !isHostPVCWaitingForVolume(targetHost) {
 		return false, nil
 	}
