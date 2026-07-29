@@ -677,9 +677,6 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization
 		return false, err
 	}
 	*pObj = *currentTarget
-	if pObj.Spec.VolumeName == hostPVName && claimRefMatchesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) {
-		return true, nil
-	}
 
 	helperPVC, helperFound, err := s.findExternalPopulatorHelperPVC(ctx, vObj, vPV)
 	if err != nil {
@@ -695,7 +692,41 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization
 	}
 	*pObj = *currentTarget
 
-	claimRefReady, err := s.ensureExternalPopulatorHostPVClaimRef(ctx, hostPV, pObj, vObj, helperPVC, helperFound)
+	// Preserve the maintained handoff contract: claimRef mutation authority comes
+	// from a fresh host PV snapshot, followed by a fresh helper/topology gate.
+	// This closes the window where a helper can reappear after the first lookup.
+	currentHostPV := &corev1.PersistentVolume{}
+	err = ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, currentHostPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			s.recordExternalPopulatorTopologyEvent(
+				vObj,
+				externalPopulatorTopologyNotReadyEventReason,
+				"External-populator handoff is waiting because populated host PV %q disappeared before claimRef handoff",
+				hostPVName,
+			)
+			return false, nil
+		}
+		return false, err
+	}
+	if !s.externalPopulatorHostPVReady(vObj, currentHostPV) {
+		return false, nil
+	}
+	helperPVC, helperFound, err = s.findExternalPopulatorHelperPVC(ctx, vObj, vPV)
+	if err != nil {
+		return false, err
+	}
+	topologyReady, err = s.externalPopulatorHandoffTopologyReady(ctx, currentHostPV, pObj, vObj, helperPVC, helperFound)
+	if err != nil || !topologyReady {
+		return false, err
+	}
+	currentTarget, targetReady, err = s.externalPopulatorCurrentHostTarget(ctx, pObj, vObj, hostPVName)
+	if err != nil || !targetReady {
+		return false, err
+	}
+	*pObj = *currentTarget
+
+	claimRefReady, err := s.ensureExternalPopulatorHostPVClaimRef(ctx, currentHostPV, pObj, vObj, helperPVC, helperFound)
 	if err != nil || !claimRefReady {
 		return false, err
 	}
@@ -704,7 +735,7 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization
 	// Kubernetes transaction. Re-read and re-run the full topology gate after
 	// the claimRef commit so a stale/changed PV, helper, or Node snapshot cannot
 	// be carried into the target volumeName commit.
-	currentHostPV := &corev1.PersistentVolume{}
+	currentHostPV = &corev1.PersistentVolume{}
 	err = ctx.HostClient.Get(ctx.Context, types.NamespacedName{Name: hostPVName}, currentHostPV)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
@@ -729,6 +760,10 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostMaterialization
 			hostPVName,
 		)
 		return false, nil
+	}
+	helperPVC, helperFound, err = s.findExternalPopulatorHelperPVC(ctx, vObj, vPV)
+	if err != nil {
+		return false, err
 	}
 	topologyReady, err = s.externalPopulatorHandoffTopologyReady(ctx, currentHostPV, pObj, vObj, helperPVC, helperFound)
 	if err != nil || !topologyReady {
@@ -1180,7 +1215,7 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 
 	updated := hostPV.DeepCopy()
 	updated.Spec.ClaimRef = targetRef
-	err := ctx.HostClient.Patch(ctx.Context, updated, client.MergeFromWithOptions(hostPV, client.MergeFromWithOptimisticLock{}))
+	err = ctx.HostClient.Patch(ctx.Context, updated, client.MergeFromWithOptions(hostPV, client.MergeFromWithOptimisticLock{}))
 	if err != nil {
 		return false, err
 	}
@@ -1524,7 +1559,15 @@ func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorVirtualStat
 		}
 		return false, err
 	}
-	return isExternalPopulatorPersistentVolumeForPVC(vPV, vObj, false), nil
+	if isExternalPopulatorPersistentVolumeForPVC(vPV, vObj, false) {
+		return true, nil
+	}
+
+	// The populate controller removes the guest helper before handing the guest
+	// PV claimRef to the target. Preserve its terminal condition across that
+	// transition; otherwise the host Pending status erases the authority needed
+	// by the fresh helper-absence gate to complete the handoff.
+	return isExternalPopulatorPersistentVolumeForExpectedHelper(vPV, vObj), nil
 }
 
 func ensureExternalPopulatorVirtualPopulateStatus(vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) {
@@ -1560,6 +1603,15 @@ func isExternalPopulatorPersistentVolumeForPVC(vPV *corev1.PersistentVolume, vOb
 	}
 
 	return true
+}
+
+func isExternalPopulatorPersistentVolumeForExpectedHelper(vPV *corev1.PersistentVolume, targetPVC *corev1.PersistentVolumeClaim) bool {
+	if vPV == nil || vPV.Spec.ClaimRef == nil || targetPVC == nil || targetPVC.UID == "" {
+		return false
+	}
+
+	return vPV.Spec.ClaimRef.Namespace == targetPVC.Namespace &&
+		vPV.Spec.ClaimRef.Name == externalPopulatorPopulateHelperPrefix+string(targetPVC.UID)
 }
 
 func isExternalPopulatorPopulateHelperPVCForTarget(helperPVC, targetPVC *corev1.PersistentVolumeClaim) bool {

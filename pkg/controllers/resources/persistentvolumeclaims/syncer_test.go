@@ -153,6 +153,16 @@ func newExternalPopulatorDependencyFixture() *externalPopulatorDependencyFixture
 				Name:     "backup",
 			},
 		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase: corev1.ClaimPending,
+			Conditions: []corev1.PersistentVolumeClaimCondition{
+				{
+					Type:   externalPopulatorPopulateConditionType,
+					Status: corev1.ConditionTrue,
+					Reason: externalPopulatorRestoreConditionReasonSucceeded,
+				},
+			},
+		},
 	}
 	helper := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -542,6 +552,13 @@ func TestSyncExternalPopulatorPreGateTransientSchedulesTarget(t *testing.T) {
 			},
 			Status: corev1.PersistentVolumeClaimStatus{
 				Phase: corev1.ClaimPending,
+				Conditions: []corev1.PersistentVolumeClaimCondition{
+					{
+						Type:   externalPopulatorPopulateConditionType,
+						Status: corev1.ConditionTrue,
+						Reason: externalPopulatorRestoreConditionReasonSucceeded,
+					},
+				},
 			},
 		}
 		virtualPV := &corev1.PersistentVolume{
@@ -646,8 +663,8 @@ func TestSyncExternalPopulatorPreGateTransientSchedulesTarget(t *testing.T) {
 			},
 		},
 		{
-			name:    "guest helper identity missing",
-			trigger: "guest helper PVC create",
+			name:    "guest PV claimRef handoff closes missing helper identity",
+			trigger: "guest PV claimRef update",
 			initialVirtual: func(f *fixture) []runtime.Object {
 				pvBoundToHelper := f.virtualPV.DeepCopy()
 				pvBoundToHelper.Spec.ClaimRef = &corev1.ObjectReference{
@@ -659,9 +676,19 @@ func TestSyncExternalPopulatorPreGateTransientSchedulesTarget(t *testing.T) {
 			},
 			converge: func(t *testing.T, ctx *synccontext.SyncContext, f *fixture) client.Object {
 				t.Helper()
-				converged := f.virtualHelper.DeepCopy()
-				assert.NilError(t, ctx.VirtualClient.Create(ctx.Context, converged))
-				return converged
+				convergedPV := &corev1.PersistentVolume{}
+				assert.NilError(t, ctx.VirtualClient.Get(
+					ctx.Context,
+					types.NamespacedName{Name: f.virtualPV.Name},
+					convergedPV,
+				))
+				convergedPV.Spec.ClaimRef = &corev1.ObjectReference{
+					Namespace: f.virtualTarget.Namespace,
+					Name:      f.virtualTarget.Name,
+					UID:       f.virtualTarget.UID,
+				}
+				assert.NilError(t, ctx.VirtualClient.Update(ctx.Context, convergedPV))
+				return convergedPV
 			},
 		},
 		{
@@ -760,6 +787,18 @@ func TestSyncExternalPopulatorPreGateTransientSchedulesTarget(t *testing.T) {
 
 					virtualBeforeDependency := &corev1.PersistentVolumeClaim{}
 					assert.NilError(t, syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, virtualBeforeDependency))
+					helperCreationClosed, err := externalPopulatorHelperCreationClosed(
+						syncCtx,
+						syncCtx.VirtualAPIReader,
+						virtualBeforeDependency,
+					)
+					assert.NilError(t, err)
+					if !helperCreationClosed {
+						t.Fatalf(
+							"%s first host-Pending sync erased the target's terminal populator condition",
+							tt.trigger,
+						)
+					}
 					convergedDependency := tt.converge(t, syncCtx, f)
 					virtualAfterDependency := &corev1.PersistentVolumeClaim{}
 					assert.NilError(t, syncCtx.VirtualClient.Get(syncCtx.Context, targetKey, virtualAfterDependency))
@@ -1286,7 +1325,15 @@ func TestExternalPopulatorDependencyModifyControllerRetriesTransientMapperError(
 		hostHelper.Name,
 	)
 
-	assert.NilError(t, virtualClient.Create(syncCtx.Context, f.helper.DeepCopy()))
+	convergedPV := &corev1.PersistentVolume{}
+	assert.NilError(t, virtualClient.Get(syncCtx.Context, types.NamespacedName{Name: f.pv.Name}, convergedPV))
+	convergedPV.Spec.ClaimRef = &corev1.ObjectReference{
+		Namespace: f.target.Namespace,
+		Name:      f.target.Name,
+		UID:       f.target.UID,
+	}
+	assert.NilError(t, virtualClient.Update(syncCtx.Context, convergedPV))
+
 	injectedErr := errors.New("injected first dependency mapper lookup failure")
 	flakyMapperClient := &externalPopulatorFlakyMapperClient{
 		Client:             virtualClient,
@@ -1360,10 +1407,12 @@ func TestExternalPopulatorDependencyModifyControllerRetriesTransientMapperError(
 	waitDeadline.Stop()
 	waitTicker.Stop()
 
-	// Fire the helper creation exactly once. The fast mapper consumes the
-	// injected Get error; no second dependency event is sent after recovery.
-	for _, eventHandler := range recordingCache.handlersFor(&corev1.PersistentVolumeClaim{}) {
-		eventHandler.OnAdd(f.helper.DeepCopy(), false)
+	// Fire the guest PV claimRef handoff exactly once. The helper is already
+	// absent from the API, so the recovered target reconcile may complete.
+	// The fast mapper consumes the injected Get error; no second dependency
+	// event is sent after recovery.
+	for _, eventHandler := range recordingCache.handlersFor(&corev1.PersistentVolume{}) {
+		eventHandler.OnUpdate(f.pv.DeepCopy(), convergedPV.DeepCopy())
 	}
 
 	select {
@@ -1508,6 +1557,12 @@ func TestSyncExternalPopulatorTopologyErrorDoesNotReplayFreshHostSnapshot(t *tes
 	hostTarget.Spec.Resources.Requests = corev1.ResourceList{
 		corev1.ResourceStorage: resource.MustParse("1Gi"),
 	}
+	virtualPV := f.pv.DeepCopy()
+	virtualPV.Spec.ClaimRef = &corev1.ObjectReference{
+		Namespace: f.target.Namespace,
+		Name:      f.target.Name,
+		UID:       f.target.UID,
+	}
 
 	hostClient := testingutil.NewFakeClient(
 		scheme.Scheme,
@@ -1518,8 +1573,7 @@ func TestSyncExternalPopulatorTopologyErrorDoesNotReplayFreshHostSnapshot(t *tes
 	virtualClient := testingutil.NewFakeClient(
 		scheme.Scheme,
 		f.target.DeepCopy(),
-		f.helper.DeepCopy(),
-		f.pv.DeepCopy(),
+		virtualPV,
 	)
 	registerCtx := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), hostClient, virtualClient)
 	syncCtx, objectSyncer := syncertesting.FakeStartSyncer(t, registerCtx, New)
@@ -1673,7 +1727,16 @@ func TestSyncExternalPopulatorDirectMaterializationConcurrentWriterRetriesFromFr
 				},
 			},
 		},
-		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase: corev1.ClaimPending,
+			Conditions: []corev1.PersistentVolumeClaimCondition{
+				{
+					Type:   externalPopulatorPopulateConditionType,
+					Status: corev1.ConditionTrue,
+					Reason: externalPopulatorRestoreConditionReasonSucceeded,
+				},
+			},
+		},
 	}
 	virtualPV := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{Name: virtualPVName},
@@ -2059,6 +2122,14 @@ func TestSync(t *testing.T) {
 	}
 	dataProtectionBackupPendingPvcWithVolumeName := dataProtectionBackupPendingPvc.DeepCopy()
 	dataProtectionBackupPendingPvcWithVolumeName.Spec.VolumeName = "restore-populated-pv"
+	dataProtectionPopulateSucceededPvcWithVolumeName := dataProtectionBackupPendingPvcWithVolumeName.DeepCopy()
+	dataProtectionPopulateSucceededPvcWithVolumeName.Status.Conditions = []corev1.PersistentVolumeClaimCondition{
+		{
+			Type:   externalPopulatorPopulateConditionType,
+			Status: corev1.ConditionTrue,
+			Reason: externalPopulatorRestoreConditionReasonSucceeded,
+		},
+	}
 	dataProtectionBackupPendingPvcWithVolumeNameBoundStatus := dataProtectionBackupPendingPvcWithVolumeName.DeepCopy()
 	dataProtectionBackupPendingPvcWithVolumeNameBoundStatus.Status = corev1.PersistentVolumeClaimStatus{
 		Phase:       corev1.ClaimBound,
@@ -2378,22 +2449,23 @@ func TestSync(t *testing.T) {
 		},
 	}
 
-	dataProtectionWFFCTargetNode4Pvc := withStorageClassAndSelectedNode(dataProtectionBackupPendingPvcWithVolumeName, waitForFirstConsumerStorageClassName, "node4", false)
+	dataProtectionWFFCTargetNode4Pvc := withStorageClassAndSelectedNode(dataProtectionPopulateSucceededPvcWithVolumeName, waitForFirstConsumerStorageClassName, "node4", false)
 	dataProtectionWFFCTargetNode4BoundPvc := dataProtectionWFFCTargetNode4Pvc.DeepCopy()
 	dataProtectionWFFCTargetNode4BoundPvc.Status = *dataProtectionBackupPendingPvcWithVolumeNameBoundStatus.Status.DeepCopy()
+	dataProtectionWFFCTargetNode4BoundPvc.Status.Conditions = append(
+		[]corev1.PersistentVolumeClaimCondition(nil),
+		dataProtectionWFFCTargetNode4Pvc.Status.Conditions...,
+	)
 	dataProtectionHostWFFCTargetNode4Pvc := withStorageClassAndSelectedNode(dataProtectionHostPendingPvcWithUID, waitForFirstConsumerStorageClassName, "node4", true)
 	dataProtectionHostWFFCMaterializedTargetNode4Pvc := dataProtectionHostWFFCTargetNode4Pvc.DeepCopy()
 	dataProtectionHostWFFCMaterializedTargetNode4Pvc.Spec.VolumeName = dataProtectionPopulatedPV.Name
 	dataProtectionHostWFFCTargetNode2Pvc := withStorageClassAndSelectedNode(dataProtectionHostPendingPvcWithUID, waitForFirstConsumerStorageClassName, "node2", true)
 
-	dataProtectionWFFCHelperNode2Pvc := withStorageClassAndSelectedNode(dataProtectionPopulateHelperPvc, waitForFirstConsumerStorageClassName, "node2", false)
 	dataProtectionHostWFFCHelperNode2Pvc := withStorageClassAndSelectedNode(dataProtectionHostPopulateHelperPvc, waitForFirstConsumerStorageClassName, "node2", true)
-	dataProtectionWFFCHelperNode4Pvc := withStorageClassAndSelectedNode(dataProtectionPopulateHelperPvc, waitForFirstConsumerStorageClassName, "node4", false)
 	dataProtectionHostWFFCHelperNode4Pvc := withStorageClassAndSelectedNode(dataProtectionHostPopulateHelperPvc, waitForFirstConsumerStorageClassName, "node4", true)
 
-	dataProtectionWFFCVirtualPVNode2BoundToHelper := withRequiredNodeAffinity(dataProtectionPopulatedPVBoundToHelper, "node2")
+	dataProtectionWFFCVirtualPVNode2BoundToTarget := withRequiredNodeAffinity(dataProtectionPopulatedPV, "node2")
 	dataProtectionWFFCHostPVNode2BoundToHelper := withRequiredNodeAffinity(dataProtectionHostPVBoundToHelper, "node2")
-	dataProtectionWFFCVirtualPVNode4BoundToHelper := withRequiredNodeAffinity(dataProtectionPopulatedPVBoundToHelper, "node4")
 	dataProtectionWFFCVirtualPVNode4BoundToTarget := withRequiredNodeAffinity(dataProtectionPopulatedPV, "node4")
 	dataProtectionWFFCHostPVNode4BoundToHelper := withRequiredNodeAffinity(dataProtectionHostPVBoundToHelper, "node4")
 	dataProtectionWFFCHostPVNode4BoundToTarget := dataProtectionWFFCHostPVNode4BoundToHelper.DeepCopy()
@@ -2409,9 +2481,8 @@ func TestSync(t *testing.T) {
 	terminatingNode4.DeletionTimestamp = &terminatingDependencyTimestamp
 	terminatingNode4.Finalizers = []string{"test.vcluster.loft.sh/review-hold"}
 
-	dataProtectionWFFCTargetWithoutSelectedNodePvc := withStorageClassAndSelectedNode(dataProtectionBackupPendingPvcWithVolumeName, waitForFirstConsumerStorageClassName, "", false)
+	dataProtectionWFFCTargetWithoutSelectedNodePvc := withStorageClassAndSelectedNode(dataProtectionPopulateSucceededPvcWithVolumeName, waitForFirstConsumerStorageClassName, "", false)
 	dataProtectionHostWFFCTargetWithoutSelectedNodePvc := withStorageClassAndSelectedNode(dataProtectionHostPendingPvcWithUID, waitForFirstConsumerStorageClassName, "", true)
-	dataProtectionWFFCHelperWithoutSelectedNodePvc := withStorageClassAndSelectedNode(dataProtectionPopulateHelperPvc, waitForFirstConsumerStorageClassName, "", false)
 	dataProtectionHostWFFCHelperWithoutSelectedNodePvc := withStorageClassAndSelectedNode(dataProtectionHostPopulateHelperPvc, waitForFirstConsumerStorageClassName, "", true)
 
 	immediateMode := storagev1.VolumeBindingImmediate
@@ -2420,13 +2491,16 @@ func TestSync(t *testing.T) {
 		ObjectMeta:        metav1.ObjectMeta{Name: immediateStorageClassName},
 		VolumeBindingMode: &immediateMode,
 	}
-	dataProtectionImmediateTargetPvc := withStorageClassAndSelectedNode(dataProtectionBackupPendingPvcWithVolumeName, immediateStorageClassName, "", false)
+	dataProtectionImmediateTargetPvc := withStorageClassAndSelectedNode(dataProtectionPopulateSucceededPvcWithVolumeName, immediateStorageClassName, "", false)
 	dataProtectionImmediateTargetBoundPvc := dataProtectionImmediateTargetPvc.DeepCopy()
 	dataProtectionImmediateTargetBoundPvc.Status = *dataProtectionBackupPendingPvcWithVolumeNameBoundStatus.Status.DeepCopy()
+	dataProtectionImmediateTargetBoundPvc.Status.Conditions = append(
+		[]corev1.PersistentVolumeClaimCondition(nil),
+		dataProtectionImmediateTargetPvc.Status.Conditions...,
+	)
 	dataProtectionHostImmediateTargetPvc := withStorageClassAndSelectedNode(dataProtectionHostPendingPvcWithUID, immediateStorageClassName, "", true)
 	dataProtectionHostImmediateMaterializedTargetPvc := dataProtectionHostImmediateTargetPvc.DeepCopy()
 	dataProtectionHostImmediateMaterializedTargetPvc.Spec.VolumeName = dataProtectionPopulatedPV.Name
-	dataProtectionImmediateHelperPvc := withStorageClassAndSelectedNode(dataProtectionPopulateHelperPvc, immediateStorageClassName, "", false)
 	dataProtectionHostImmediateHelperPvc := withStorageClassAndSelectedNode(dataProtectionHostPopulateHelperPvc, immediateStorageClassName, "", true)
 
 	syncertesting.RunTestsWithContext(t, func(vConfig *config.VirtualClusterConfig, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient) *synccontext.RegisterContext {
@@ -3199,8 +3273,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState: []runtime.Object{
 				waitForFirstConsumerStorageClass.DeepCopy(),
 				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-				dataProtectionWFFCVirtualPVNode2BoundToHelper.DeepCopy(),
-				dataProtectionWFFCHelperNode2Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode2BoundToTarget.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
 				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
@@ -3212,9 +3285,8 @@ func TestSync(t *testing.T) {
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
 					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-					dataProtectionWFFCHelperNode2Pvc.DeepCopy(),
 				},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode2BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode2BoundToTarget.DeepCopy()},
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
@@ -3255,8 +3327,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState: []runtime.Object{
 				waitForFirstConsumerStorageClass.DeepCopy(),
 				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-				dataProtectionWFFCVirtualPVNode2BoundToHelper.DeepCopy(),
-				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode2BoundToTarget.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
 				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
@@ -3268,9 +3339,8 @@ func TestSync(t *testing.T) {
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
 					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
 				},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode2BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode2BoundToTarget.DeepCopy()},
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
@@ -3311,8 +3381,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState: []runtime.Object{
 				waitForFirstConsumerStorageClass.DeepCopy(),
 				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-				dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy(),
-				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
 				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
@@ -3322,9 +3391,8 @@ func TestSync(t *testing.T) {
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
 					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
 				},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy()},
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
@@ -3407,8 +3475,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState: []runtime.Object{
 				waitForFirstConsumerStorageClass.DeepCopy(),
 				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-				dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy(),
-				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
 				dataProtectionHostWFFCTargetNode2Pvc.DeepCopy(),
@@ -3420,9 +3487,8 @@ func TestSync(t *testing.T) {
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
 					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
 				},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy()},
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
@@ -3463,8 +3529,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState: []runtime.Object{
 				waitForFirstConsumerStorageClass.DeepCopy(),
 				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-				dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy(),
-				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
 				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
@@ -3475,9 +3540,8 @@ func TestSync(t *testing.T) {
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
 					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
 				},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy()},
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
@@ -3518,8 +3582,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState: []runtime.Object{
 				waitForFirstConsumerStorageClass.DeepCopy(),
 				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-				dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy(),
-				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
 				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
@@ -3530,9 +3593,8 @@ func TestSync(t *testing.T) {
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
 					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
 				},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy()},
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
@@ -3573,8 +3635,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState: []runtime.Object{
 				waitForFirstConsumerStorageClass.DeepCopy(),
 				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-				dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy(),
-				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
 				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
@@ -3585,9 +3646,8 @@ func TestSync(t *testing.T) {
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
 					dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
 				},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy()},
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
@@ -3624,12 +3684,11 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
-			Name: "Bridge WFFC external-populator handoff when target helper and PV all select node4",
+			Name: "Bridge WFFC external-populator handoff when target, host helper, and PV all select node4",
 			InitialVirtualState: []runtime.Object{
 				waitForFirstConsumerStorageClass.DeepCopy(),
 				dataProtectionWFFCTargetNode4Pvc.DeepCopy(),
-				dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy(),
-				dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
+				dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
 				dataProtectionHostWFFCTargetNode4Pvc.DeepCopy(),
@@ -3641,9 +3700,8 @@ func TestSync(t *testing.T) {
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
 					dataProtectionWFFCTargetNode4BoundPvc.DeepCopy(),
-					dataProtectionWFFCHelperNode4Pvc.DeepCopy(),
 				},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionWFFCVirtualPVNode4BoundToTarget.DeepCopy()},
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
@@ -3676,8 +3734,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState: []runtime.Object{
 				waitForFirstConsumerStorageClass.DeepCopy(),
 				dataProtectionWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
-				dataProtectionPopulatedPVBoundToHelper.DeepCopy(),
-				dataProtectionWFFCHelperWithoutSelectedNodePvc.DeepCopy(),
+				dataProtectionPopulatedPV.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
 				dataProtectionHostWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
@@ -3687,9 +3744,8 @@ func TestSync(t *testing.T) {
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
 					dataProtectionWFFCTargetWithoutSelectedNodePvc.DeepCopy(),
-					dataProtectionWFFCHelperWithoutSelectedNodePvc.DeepCopy(),
 				},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionPopulatedPVBoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionPopulatedPV.DeepCopy()},
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {waitForFirstConsumerStorageClass.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
@@ -3729,8 +3785,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState: []runtime.Object{
 				immediateStorageClass.DeepCopy(),
 				dataProtectionImmediateTargetPvc.DeepCopy(),
-				dataProtectionPopulatedPVBoundToHelper.DeepCopy(),
-				dataProtectionImmediateHelperPvc.DeepCopy(),
+				dataProtectionPopulatedPV.DeepCopy(),
 			},
 			InitialPhysicalState: []runtime.Object{
 				dataProtectionHostImmediateTargetPvc.DeepCopy(),
@@ -3740,9 +3795,8 @@ func TestSync(t *testing.T) {
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
 					dataProtectionImmediateTargetBoundPvc.DeepCopy(),
-					dataProtectionImmediateHelperPvc.DeepCopy(),
 				},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionPopulatedPVBoundToHelper.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"): {dataProtectionPopulatedPV.DeepCopy()},
 				storagev1.SchemeGroupVersion.WithKind("StorageClass"):  {immediateStorageClass.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
