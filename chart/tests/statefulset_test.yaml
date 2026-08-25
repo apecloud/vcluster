@@ -520,7 +520,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.initContainers[0].image
-          value: ghcr.io/loft-sh/kubernetes:v1.36.0
+          value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.36.0
 
   - it: k8s override image tag
     set:
@@ -533,7 +533,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.initContainers[0].image
-          value: ghcr.io/loft-sh/kubernetes:v99912
+          value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v99912
 
   - it: k8s version sets image tag for apiServer and controllerManager
     set:
@@ -545,7 +545,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.initContainers[0].image
-          value: ghcr.io/loft-sh/kubernetes:v1.35.999
+          value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.35.999
 
   - it: k8s version set and not overridden by image tag
     set:
@@ -560,7 +560,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.initContainers[0].image
-          value: ghcr.io/loft-sh/kubernetes:v1.30.999
+          value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.30.999
 
   - it: k8s not version set but image tags for apiServer and controllerManager set
     set:
@@ -574,7 +574,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.initContainers[0].image
-          value: ghcr.io/loft-sh/kubernetes:v99914
+          value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v99914
 
   - it: k8s version not set, default tag images used for apiServer and controllerManager (virtual scheduler enabled)
     chart:
@@ -589,7 +589,7 @@ tests:
     asserts:
     - equal:
         path: spec.template.spec.initContainers[0].image
-        value: ghcr.io/loft-sh/kubernetes:v1.36.0
+        value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.36.0
 
   - it: k8s version not set, default tag images used for apiServer and controllerManager (virtual scheduler enabled, deprecated)
     chart:
@@ -605,7 +605,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.initContainers[0].image
-          value: ghcr.io/loft-sh/kubernetes:v1.36.0
+          value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.36.0
 
   - it: k8s version sets image tag for apiServer and controllerManager (virtual scheduler enabled)
     set:
@@ -619,7 +619,7 @@ tests:
     asserts:
     - equal:
         path: spec.template.spec.initContainers[0].image
-        value: ghcr.io/loft-sh/kubernetes:v1.35.999
+        value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.35.999
 
   - it: k8s version sets image tag for apiServer and controllerManager (virtual scheduler enabled, deprecated)
     set:
@@ -634,7 +634,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.initContainers[0].image
-          value: ghcr.io/loft-sh/kubernetes:v1.35.999
+          value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.35.999
 
   - it: k8s version set but not overridden by image tag for apiServer and controllerManager (virtual scheduler enabled)
     set:
@@ -650,7 +650,7 @@ tests:
     asserts:
     - equal:
         path: spec.template.spec.initContainers[0].image
-        value: ghcr.io/loft-sh/kubernetes:v1.30.999
+        value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.30.999
 
   - it: k8s version set but not overridden by image tag for apiServer and controllerManager (virtual scheduler enabled, deprecated)
     set:
@@ -668,7 +668,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.initContainers[0].image
-          value: ghcr.io/loft-sh/kubernetes:v1.30.999
+          value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.30.999
 
   - it: custom dnsPolicy
     set:
@@ -849,7 +849,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.initContainers[0].image
-          value: ghcr.io/loft-sh/kubernetes:v1.35.999-full
+          value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.35.999-full
 
   - it: private nodes k8s full image version
     set:
@@ -862,7 +862,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.initContainers[0].image
-          value: ghcr.io/loft-sh/kubernetes:v1.35.999-full
+          value: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.35.999-full
 
   - it: sets custom probe configuration
     set:

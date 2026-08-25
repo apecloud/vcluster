@@ -318,9 +318,9 @@ controlPlane:
       image:
         # Registry is the registry of the container image, e.g. my-registry.com or ghcr.io. This setting can be globally
         # overridden via the controlPlane.advanced.defaultImageRegistry option. Empty means docker hub.
-        registry: ghcr.io
+        registry: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com
         # Repository is the repository of the container image, e.g. my-repo/my-image
-        repository: "loft-sh/kubernetes"
+        repository: "apecloud/kubernetes"
         # Tag is the tag of the container image, and is the default version.
         tag: "v1.36.0"
       # APIServer holds configuration specific to starting the api server.

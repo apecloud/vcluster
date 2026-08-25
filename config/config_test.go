@@ -10,6 +10,11 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+func TestK8SVersionMapUsesACRForV136(t *testing.T) {
+	assert.Equal(t, K8SVersionMap["1.36"], "apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.36.0")
+	assert.Equal(t, K8SVersionMap["1.35"], "ghcr.io/loft-sh/kubernetes:v1.35.0")
+}
+
 func TestConfig_Diff(t *testing.T) {
 	tests := []struct {
 		name string

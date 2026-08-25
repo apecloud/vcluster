@@ -140,8 +140,8 @@ controlPlane:
       version: ""
       imagePullPolicy: ""
       image:
-        registry: ghcr.io
-        repository: "loft-sh/kubernetes"
+        registry: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com
+        repository: "apecloud/kubernetes"
         tag: "v1.36.0"
       apiServer:
         enabled: true

@@ -17,7 +17,7 @@ const (
 
 // K8SVersionMap holds the supported k8s api servers
 var K8SVersionMap = map[string]string{
-	"1.36": "ghcr.io/loft-sh/kubernetes:v1.36.0",
+	"1.36": "apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com/apecloud/kubernetes:v1.36.0",
 	"1.35": "ghcr.io/loft-sh/kubernetes:v1.35.0",
 	"1.34": "ghcr.io/loft-sh/kubernetes:v1.34.0",
 	"1.33": "ghcr.io/loft-sh/kubernetes:v1.33.4",
