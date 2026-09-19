@@ -70,7 +70,7 @@ tests:
           content:
             apiGroups: [ "" ]
             resources: [ "nodes" ]
-            verbs: [ "get" ]
+            verbs: [ "get", "list", "watch" ]
 
   - it: auto projects host storage classes for translated PVCs
     set:
