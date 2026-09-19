@@ -92,10 +92,10 @@ rules:
     verbs: ["get", "list", "watch", "patch"]
   {{- end }}
   {{- if and .Values.sync.toHost.persistentVolumeClaims.enabled (not (or .Values.pro .Values.sync.fromHost.nodes.enabled)) }}
-  {{- /* external populator topology handoff validates a target selected-node against host PV node affinity */}}
+  {{- /* external populator topology handoff uses the host client cache to validate selected-node affinity */}}
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
   {{- end }}
   {{- if .Values.sync.fromHost.ingressClasses.enabled }}
   - apiGroups: ["networking.k8s.io"]
