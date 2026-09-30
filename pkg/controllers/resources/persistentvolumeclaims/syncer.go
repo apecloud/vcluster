@@ -317,6 +317,14 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		}
 		if !preserveExternalPopulatorStatus {
 			event.Virtual.Status = *event.Host.Status.DeepCopy()
+		} else if event.Host.Status.Phase == corev1.ClaimBound && hasExternalPopulatorStatusConditions(event.Virtual) {
+			// The host owns binding fields, while DataProtection owns the
+			// external-populator conditions on the guest PVC. A bound host PVC
+			// commonly has no conditions, so copying its whole status would erase
+			// the guest Restore/Populating progress that Cluster observes.
+			conditions := append([]corev1.PersistentVolumeClaimCondition(nil), event.Virtual.Status.Conditions...)
+			event.Virtual.Status = *event.Host.Status.DeepCopy()
+			event.Virtual.Status.Conditions = conditions
 		}
 	}
 
@@ -701,6 +709,9 @@ func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorVirtualStat
 	if !hasExternalPopulatorDataSource(vObj) {
 		return false, nil
 	}
+	if pObj.Status.Phase == corev1.ClaimBound && hasExternalPopulatorStatusConditions(vObj) {
+		return true, nil
+	}
 	if !isHostPVCWaitingForVolume(pObj) {
 		return false, nil
 	}
@@ -717,6 +728,26 @@ func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorVirtualStat
 		return false, err
 	}
 	return isExternalPopulatorPersistentVolumeForPVC(vPV, vObj, false), nil
+}
+
+func hasExternalPopulatorStatusConditions(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc == nil {
+		return false
+	}
+	for _, condition := range pvc.Status.Conditions {
+		if condition.Type != externalPopulatorPopulateConditionType && condition.Type != externalPopulatorRestoreConditionType {
+			continue
+		}
+		// Provisioned and Processing with the no-data message are the
+		// controller's no-data restore markers. They must continue to be
+		// replaced by the host status once the host PVC is bound.
+		if (condition.Status == corev1.ConditionTrue && condition.Reason == externalPopulatorRestoreConditionReasonProvisioned) ||
+			(condition.Status != corev1.ConditionFalse && condition.Reason == externalPopulatorRestoreConditionReasonProcessing && strings.Contains(condition.Message, externalPopulatorNoDataRestoreMessage)) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func ensureExternalPopulatorVirtualPopulateStatus(vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) {

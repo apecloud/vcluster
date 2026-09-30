@@ -2052,6 +2052,112 @@ func TestSync_ExternalPopulatorStatusNotOverwritten(t *testing.T) {
 				assert.NilError(t, err)
 			},
 		},
+		{
+			Name: "External populator conditions survive bound host without conditions",
+			InitialVirtualState: []runtime.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: vObjectMeta,
+					Spec: corev1.PersistentVolumeClaimSpec{
+						DataSourceRef: &corev1.TypedObjectReference{
+							APIGroup: &apiGroup,
+							Kind:     "Backup",
+							Name:     "my-backup",
+						},
+						VolumeName: "pvc-restored-vol",
+					},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Phase:       corev1.ClaimBound,
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+						Conditions: []corev1.PersistentVolumeClaimCondition{
+							{Type: externalPopulatorPopulateConditionType, Status: corev1.ConditionTrue, Reason: externalPopulatorRestoreConditionReasonSucceeded},
+							{Type: externalPopulatorRestoreConditionType, Status: corev1.ConditionTrue, Reason: externalPopulatorRestoreConditionReasonSucceeded},
+						},
+					},
+				},
+			},
+			InitialPhysicalState: []runtime.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: pObjectMeta,
+					Spec: corev1.PersistentVolumeClaimSpec{
+						DataSourceRef: &corev1.TypedObjectReference{
+							APIGroup: &apiGroup,
+							Kind:     "Backup",
+							Name:     "my-backup",
+						},
+					},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Phase:       corev1.ClaimBound,
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+					},
+				},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					&corev1.PersistentVolumeClaim{
+						ObjectMeta: vObjectMeta,
+						Spec: corev1.PersistentVolumeClaimSpec{
+							DataSourceRef: &corev1.TypedObjectReference{
+								APIGroup: &apiGroup,
+								Kind:     "Backup",
+								Name:     "my-backup",
+							},
+							VolumeName: "pvc-restored-vol",
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase:       corev1.ClaimBound,
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+							Capacity: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("10Gi"),
+							},
+							Conditions: []corev1.PersistentVolumeClaimCondition{
+								{Type: externalPopulatorPopulateConditionType, Status: corev1.ConditionTrue, Reason: externalPopulatorRestoreConditionReasonSucceeded},
+								{Type: externalPopulatorRestoreConditionType, Status: corev1.ConditionTrue, Reason: externalPopulatorRestoreConditionReasonSucceeded},
+							},
+						},
+					},
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					&corev1.PersistentVolumeClaim{
+						ObjectMeta: pObjectMeta,
+						Spec: corev1.PersistentVolumeClaimSpec{
+							DataSourceRef: &corev1.TypedObjectReference{
+								APIGroup: &apiGroup,
+								Kind:     "Backup",
+								Name:     "my-backup",
+							},
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase:       corev1.ClaimBound,
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+							Capacity: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("10Gi"),
+							},
+						},
+					},
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				vPVC := &corev1.PersistentVolumeClaim{}
+				err := syncCtx.VirtualClient.Get(syncCtx, types.NamespacedName{Namespace: vObjectMeta.Namespace, Name: vObjectMeta.Name}, vPVC)
+				assert.NilError(t, err)
+				pPVC := &corev1.PersistentVolumeClaim{}
+				err = syncCtx.HostClient.Get(syncCtx, types.NamespacedName{Namespace: pObjectMeta.Namespace, Name: pObjectMeta.Name}, pPVC)
+				assert.NilError(t, err)
+				_, err = syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					pPVC.DeepCopy(), pPVC.DeepCopy(), vPVC.DeepCopy(), vPVC.DeepCopy(),
+				))
+				assert.NilError(t, err)
+			},
+		},
 	})
 }
 
