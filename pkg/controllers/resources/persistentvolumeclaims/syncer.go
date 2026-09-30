@@ -322,9 +322,7 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 			// external-populator conditions on the guest PVC. A bound host PVC
 			// commonly has no conditions, so copying its whole status would erase
 			// the guest Restore/Populating progress that Cluster observes.
-			conditions := append([]corev1.PersistentVolumeClaimCondition(nil), event.Virtual.Status.Conditions...)
-			event.Virtual.Status = *event.Host.Status.DeepCopy()
-			event.Virtual.Status.Conditions = conditions
+			copyHostStatusPreservingExternalPopulatorConditions(event.Host, event.Virtual)
 		}
 	}
 
@@ -744,6 +742,35 @@ func hasExternalPopulatorStatusConditions(pvc *corev1.PersistentVolumeClaim) boo
 		return true
 	}
 	return false
+}
+
+func copyHostStatusPreservingExternalPopulatorConditions(pObj, vObj *corev1.PersistentVolumeClaim) {
+	preserved := make([]corev1.PersistentVolumeClaimCondition, 0, len(vObj.Status.Conditions))
+	if hasExternalPopulatorDataSource(vObj) {
+		for _, condition := range vObj.Status.Conditions {
+			if isExternalPopulatorStatusCondition(condition.Type) {
+				preserved = append(preserved, condition)
+			}
+		}
+	}
+
+	vObj.Status = *pObj.Status.DeepCopy()
+	if len(preserved) == 0 {
+		return
+	}
+
+	conditions := make([]corev1.PersistentVolumeClaimCondition, 0, len(vObj.Status.Conditions)+len(preserved))
+	for _, condition := range vObj.Status.Conditions {
+		if !isExternalPopulatorStatusCondition(condition.Type) {
+			conditions = append(conditions, condition)
+		}
+	}
+	vObj.Status.Conditions = append(conditions, preserved...)
+}
+
+func isExternalPopulatorStatusCondition(conditionType corev1.PersistentVolumeClaimConditionType) bool {
+	return conditionType == externalPopulatorRestoreConditionType ||
+		conditionType == externalPopulatorPopulateConditionType
 }
 
 func ensureExternalPopulatorVirtualPopulateStatus(vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) {

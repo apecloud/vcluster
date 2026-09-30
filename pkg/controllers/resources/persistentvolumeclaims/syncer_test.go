@@ -2252,3 +2252,53 @@ func TestHasExternalPopulatorDataSource(t *testing.T) {
 		})
 	}
 }
+
+func TestCopyHostStatusPreservingExternalPopulatorConditions(t *testing.T) {
+	apiGroup := dataProtectionAPIGroup
+	externalConditions := []corev1.PersistentVolumeClaimCondition{
+		{
+			Type:    externalPopulatorPopulateConditionType,
+			Status:  corev1.ConditionTrue,
+			Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+			Message: externalPopulatorNoDataRestoreMessage,
+		},
+		{
+			Type:    externalPopulatorRestoreConditionType,
+			Status:  corev1.ConditionTrue,
+			Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+			Message: externalPopulatorNoDataRestoreMessage,
+		},
+	}
+	hostCondition := corev1.PersistentVolumeClaimCondition{
+		Type:   corev1.PersistentVolumeClaimFileSystemResizePending,
+		Status: corev1.ConditionTrue,
+	}
+	host := &corev1.PersistentVolumeClaim{
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase: corev1.ClaimBound,
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+			Conditions: []corev1.PersistentVolumeClaimCondition{hostCondition},
+		},
+	}
+	virtual := &corev1.PersistentVolumeClaim{
+		Spec: corev1.PersistentVolumeClaimSpec{
+			DataSourceRef: &corev1.TypedObjectReference{
+				APIGroup: &apiGroup,
+				Kind:     dataProtectionBackupKind,
+				Name:     "backup-1",
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase:      corev1.ClaimPending,
+			Conditions: append([]corev1.PersistentVolumeClaimCondition(nil), externalConditions...),
+		},
+	}
+
+	copyHostStatusPreservingExternalPopulatorConditions(host, virtual)
+
+	expected := *host.Status.DeepCopy()
+	expected.Conditions = append(expected.Conditions, externalConditions...)
+	assert.DeepEqual(t, virtual.Status, expected)
+}
