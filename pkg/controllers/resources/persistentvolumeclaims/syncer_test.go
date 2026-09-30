@@ -396,8 +396,6 @@ func TestSync(t *testing.T) {
 			corev1.ResourceStorage: resource.MustParse("1Gi"),
 		},
 	}
-	dataProtectionNoDataRestorePvcWithHostBoundStatus := dataProtectionNoDataRestorePvc.DeepCopy()
-	dataProtectionNoDataRestorePvcWithHostBoundStatus.Status = *dataProtectionNoDataHostBoundWithBackupSource.Status.DeepCopy()
 	dataProtectionNoDataHostPendingWithoutBackupSource := dataProtectionHostPendingPvcWithUID.DeepCopy()
 	dataProtectionNoDataHostPendingWithoutBackupSource.Spec = corev1.PersistentVolumeClaimSpec{}
 	dataProtectionNoDataHostDeletingWithoutBackupSource := dataProtectionNoDataHostPendingWithoutBackupSource.DeepCopy()
@@ -1039,7 +1037,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState:  []runtime.Object{dataProtectionNoDataRestorePvc.DeepCopy()},
 			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostBoundWithBackupSource.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestorePvcWithHostBoundStatus.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestorePvc.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataHostBoundWithBackupSource.DeepCopy()},
@@ -2072,8 +2070,18 @@ func TestSync_ExternalPopulatorStatusNotOverwritten(t *testing.T) {
 							corev1.ResourceStorage: resource.MustParse("10Gi"),
 						},
 						Conditions: []corev1.PersistentVolumeClaimCondition{
-							{Type: externalPopulatorPopulateConditionType, Status: corev1.ConditionTrue, Reason: externalPopulatorRestoreConditionReasonSucceeded},
-							{Type: externalPopulatorRestoreConditionType, Status: corev1.ConditionTrue, Reason: externalPopulatorRestoreConditionReasonSucceeded},
+							{
+								Type:    externalPopulatorPopulateConditionType,
+								Status:  corev1.ConditionTrue,
+								Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+								Message: "PVC provisioned without data restore",
+							},
+							{
+								Type:    externalPopulatorRestoreConditionType,
+								Status:  corev1.ConditionTrue,
+								Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+								Message: "PVC provisioned without data restore",
+							},
 						},
 					},
 				},
@@ -2116,8 +2124,18 @@ func TestSync_ExternalPopulatorStatusNotOverwritten(t *testing.T) {
 								corev1.ResourceStorage: resource.MustParse("10Gi"),
 							},
 							Conditions: []corev1.PersistentVolumeClaimCondition{
-								{Type: externalPopulatorPopulateConditionType, Status: corev1.ConditionTrue, Reason: externalPopulatorRestoreConditionReasonSucceeded},
-								{Type: externalPopulatorRestoreConditionType, Status: corev1.ConditionTrue, Reason: externalPopulatorRestoreConditionReasonSucceeded},
+								{
+									Type:    externalPopulatorPopulateConditionType,
+									Status:  corev1.ConditionTrue,
+									Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+									Message: "PVC provisioned without data restore",
+								},
+								{
+									Type:    externalPopulatorRestoreConditionType,
+									Status:  corev1.ConditionTrue,
+									Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+									Message: "PVC provisioned without data restore",
+								},
 							},
 						},
 					},

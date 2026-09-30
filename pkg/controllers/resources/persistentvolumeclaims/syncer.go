@@ -738,13 +738,9 @@ func hasExternalPopulatorStatusConditions(pvc *corev1.PersistentVolumeClaim) boo
 		if condition.Type != externalPopulatorPopulateConditionType && condition.Type != externalPopulatorRestoreConditionType {
 			continue
 		}
-		// Provisioned and Processing with the no-data message are the
-		// controller's no-data restore markers. They must continue to be
-		// replaced by the host status once the host PVC is bound.
-		if (condition.Status == corev1.ConditionTrue && condition.Reason == externalPopulatorRestoreConditionReasonProvisioned) ||
-			(condition.Status != corev1.ConditionFalse && condition.Reason == externalPopulatorRestoreConditionReasonProcessing && strings.Contains(condition.Message, externalPopulatorNoDataRestoreMessage)) {
-			continue
-		}
+		// These conditions are owned by the external populator, including the
+		// terminal Provisioned state used by postReady-only restores. The host
+		// PVC owns binding fields, but it must not erase this guest status.
 		return true
 	}
 	return false
