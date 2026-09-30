@@ -234,32 +234,6 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 			Preconditions:      metav1.NewUIDPreconditions(string(event.Host.UID)),
 		})
 	}
-	backoffHostPVC, err := s.shouldBackoffExternalPopulatorHostNoDataRestorePVC(ctx, event.Host, event.Virtual)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if backoffHostPVC {
-		logExternalPopulatorNoDataRestoreBackoff(ctx.Log, event.Host, event.Virtual)
-		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
-	}
-	waitForPopulateHelper, err := s.shouldWaitForExternalPopulatorHelperAbsence(ctx, event.Virtual)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if waitForPopulateHelper {
-		ctx.Log.Infof("wait for virtual populate helper to be absent before reconciling host target pvc: guestPVC=%s/%s guestUID=%s hostPVC=%s/%s", event.Virtual.Namespace, event.Virtual.Name, event.Virtual.UID, event.Host.Namespace, event.Host.Name)
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
-
-	// make sure the persistent volume is synced / faked
-	if event.Host.Spec.VolumeName != "" {
-		requeue, err := s.ensurePersistentVolume(ctx, event.Host, event.Virtual, ctx.Log)
-		if err != nil {
-			return ctrl.Result{}, err
-		} else if requeue {
-			return ctrl.Result{Requeue: true}, nil
-		}
-	}
 	// patch objects
 	patch, err := patcher.NewSyncerPatcher(ctx, event.Host, event.Virtual, patcher.TranslatePatches(ctx.Config.Sync.ToHost.PersistentVolumeClaims.Patches, false))
 	if err != nil {
@@ -288,6 +262,37 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 			)
 		}
 	}()
+
+	backoffHostPVC, err := s.shouldBackoffExternalPopulatorHostNoDataRestorePVC(ctx, event.Host, event.Virtual)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if backoffHostPVC {
+		// Backoff protects the no-data restore PVC from being recreated with a
+		// restore data source before the guest has materialized its volume. It
+		// must not also block scheduler metadata flowing back to the guest.
+		s.translateUpdateBackwards(event.Host, event.Virtual)
+		logExternalPopulatorNoDataRestoreBackoff(ctx.Log, event.Host, event.Virtual)
+		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
+	}
+	waitForPopulateHelper, err := s.shouldWaitForExternalPopulatorHelperAbsence(ctx, event.Virtual)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if waitForPopulateHelper {
+		ctx.Log.Infof("wait for virtual populate helper to be absent before reconciling host target pvc: guestPVC=%s/%s guestUID=%s hostPVC=%s/%s", event.Virtual.Namespace, event.Virtual.Name, event.Virtual.UID, event.Host.Namespace, event.Host.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// make sure the persistent volume is synced / faked
+	if event.Host.Spec.VolumeName != "" {
+		requeue, err := s.ensurePersistentVolume(ctx, event.Host, event.Virtual, ctx.Log)
+		if err != nil {
+			return ctrl.Result{}, err
+		} else if requeue {
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
 
 	// check backwards update
 	s.translateUpdateBackwards(event.Host, event.Virtual)

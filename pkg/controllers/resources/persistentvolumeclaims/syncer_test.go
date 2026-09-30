@@ -921,6 +921,52 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
+			Name:                "Propagate selected node while backing off no-data restore pvc",
+			InitialVirtualState: []runtime.Object{dataProtectionNoDataRestoreProcessingPvc.DeepCopy()},
+			InitialPhysicalState: func() []runtime.Object {
+				host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+				host.Annotations[selectedNodeAnnotation] = "node1"
+				host.Annotations[translate.ManagedAnnotationsAnnotation] = selectedNodeAnnotation
+				return []runtime.Object{host}
+			}(),
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+						guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+						return guest
+					}(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+						host.Annotations[selectedNodeAnnotation] = "node1"
+						host.Annotations[translate.ManagedAnnotationsAnnotation] = selectedNodeAnnotation
+						return host
+					}(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+				host.Annotations[selectedNodeAnnotation] = "node1"
+				host.Annotations[translate.ManagedAnnotationsAnnotation] = selectedNodeAnnotation
+				guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					host.DeepCopy(),
+					host,
+					guest.DeepCopy(),
+					guest,
+				))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, externalPopulatorNoDataRestoreBackoff)
+			},
+		},
+		{
 			Name: "Keep immutable host backup data source and retry while populated host pv is missing",
 			InitialVirtualState: []runtime.Object{
 				dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
