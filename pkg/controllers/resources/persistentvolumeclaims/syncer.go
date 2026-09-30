@@ -317,12 +317,12 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 		}
 		if !preserveExternalPopulatorStatus {
 			event.Virtual.Status = *event.Host.Status.DeepCopy()
-		} else if event.Host.Status.Phase == corev1.ClaimBound && hasExternalPopulatorStatusConditions(event.Virtual) {
-			// The host owns binding fields, while DataProtection owns the
-			// external-populator conditions on the guest PVC. A bound host PVC
-			// commonly has no conditions, so copying its whole status would erase
-			// the guest Restore/Populating progress that Cluster observes.
-			copyHostStatusPreservingExternalPopulatorConditions(event.Host, event.Virtual)
+		} else if event.Host.Status.Phase == corev1.ClaimBound && hasGuestOwnedPVCStatusConditions(event.Virtual) {
+			// The host owns binding fields, while the external populator owns
+			// guest-only conditions. A bound host PVC commonly has no conditions,
+			// so copying its whole status would erase the guest restore progress
+			// that Cluster observes.
+			copyHostStatusPreservingGuestOnlyConditions(event.Host, event.Virtual)
 		}
 	}
 
@@ -707,7 +707,7 @@ func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorVirtualStat
 	if !hasExternalPopulatorDataSource(vObj) {
 		return false, nil
 	}
-	if pObj.Status.Phase == corev1.ClaimBound && hasExternalPopulatorStatusConditions(vObj) {
+	if pObj.Status.Phase == corev1.ClaimBound && hasGuestOwnedPVCStatusConditions(vObj) {
 		return true, nil
 	}
 	if !isHostPVCWaitingForVolume(pObj) {
@@ -728,49 +728,53 @@ func (s *persistentVolumeClaimSyncer) shouldPreserveExternalPopulatorVirtualStat
 	return isExternalPopulatorPersistentVolumeForPVC(vPV, vObj, false), nil
 }
 
-func hasExternalPopulatorStatusConditions(pvc *corev1.PersistentVolumeClaim) bool {
+func hasGuestOwnedPVCStatusConditions(pvc *corev1.PersistentVolumeClaim) bool {
 	if pvc == nil {
 		return false
 	}
 	for _, condition := range pvc.Status.Conditions {
-		if condition.Type != externalPopulatorPopulateConditionType && condition.Type != externalPopulatorRestoreConditionType {
+		if isKubernetesPVCStatusConditionType(condition.Type) {
 			continue
 		}
-		// These conditions are owned by the external populator, including the
-		// terminal Provisioned state used by postReady-only restores. The host
-		// PVC owns binding fields, but it must not erase this guest status.
+		// A condition that exists only on an external-populator guest PVC is
+		// guest-owned. Do not depend on the producer's condition Type here:
+		// KubeBlocks may add or rename a protocol condition in the future.
 		return true
 	}
 	return false
 }
 
-func copyHostStatusPreservingExternalPopulatorConditions(pObj, vObj *corev1.PersistentVolumeClaim) {
-	preserved := make([]corev1.PersistentVolumeClaimCondition, 0, len(vObj.Status.Conditions))
-	if hasExternalPopulatorDataSource(vObj) {
-		for _, condition := range vObj.Status.Conditions {
-			if isExternalPopulatorStatusCondition(condition.Type) {
-				preserved = append(preserved, condition)
-			}
-		}
-	}
-
+func copyHostStatusPreservingGuestOnlyConditions(pObj, vObj *corev1.PersistentVolumeClaim) {
+	guestConditions := append([]corev1.PersistentVolumeClaimCondition(nil), vObj.Status.Conditions...)
 	vObj.Status = *pObj.Status.DeepCopy()
-	if len(preserved) == 0 {
+	if len(guestConditions) == 0 {
 		return
 	}
 
-	conditions := make([]corev1.PersistentVolumeClaimCondition, 0, len(vObj.Status.Conditions)+len(preserved))
+	hostConditionTypes := make(map[corev1.PersistentVolumeClaimConditionType]struct{}, len(vObj.Status.Conditions))
 	for _, condition := range vObj.Status.Conditions {
-		if !isExternalPopulatorStatusCondition(condition.Type) {
-			conditions = append(conditions, condition)
-		}
+		hostConditionTypes[condition.Type] = struct{}{}
 	}
-	vObj.Status.Conditions = append(conditions, preserved...)
+
+	conditions := append([]corev1.PersistentVolumeClaimCondition(nil), vObj.Status.Conditions...)
+	for _, condition := range guestConditions {
+		if isKubernetesPVCStatusConditionType(condition.Type) {
+			// Resize conditions describe host-side work. If the host does not
+			// report one now, do not bring a stale guest copy back.
+			continue
+		}
+		if _, exists := hostConditionTypes[condition.Type]; exists {
+			// The host is authoritative when both objects report the same Type.
+			continue
+		}
+		conditions = append(conditions, condition)
+	}
+	vObj.Status.Conditions = conditions
 }
 
-func isExternalPopulatorStatusCondition(conditionType corev1.PersistentVolumeClaimConditionType) bool {
-	return conditionType == externalPopulatorRestoreConditionType ||
-		conditionType == externalPopulatorPopulateConditionType
+func isKubernetesPVCStatusConditionType(conditionType corev1.PersistentVolumeClaimConditionType) bool {
+	return conditionType == corev1.PersistentVolumeClaimResizing ||
+		conditionType == corev1.PersistentVolumeClaimFileSystemResizePending
 }
 
 func ensureExternalPopulatorVirtualPopulateStatus(vObj *corev1.PersistentVolumeClaim, vPV *corev1.PersistentVolume) {

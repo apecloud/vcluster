@@ -2253,8 +2253,20 @@ func TestHasExternalPopulatorDataSource(t *testing.T) {
 	}
 }
 
-func TestCopyHostStatusPreservingExternalPopulatorConditions(t *testing.T) {
+func TestCopyHostStatusPreservingGuestOnlyConditions(t *testing.T) {
 	apiGroup := dataProtectionAPIGroup
+	guestOnlyCondition := corev1.PersistentVolumeClaimCondition{
+		Type:    corev1.PersistentVolumeClaimConditionType("RestoreProgress"),
+		Status:  corev1.ConditionTrue,
+		Reason:  "FutureProtocolValue",
+		Message: "future external-populator condition",
+	}
+	hostWinsCondition := corev1.PersistentVolumeClaimCondition{
+		Type:    corev1.PersistentVolumeClaimConditionType("HostOwnedFutureCondition"),
+		Status:  corev1.ConditionTrue,
+		Reason:  "HostValue",
+		Message: "host is authoritative",
+	}
 	externalConditions := []corev1.PersistentVolumeClaimCondition{
 		{
 			Type:    externalPopulatorPopulateConditionType,
@@ -2268,18 +2280,29 @@ func TestCopyHostStatusPreservingExternalPopulatorConditions(t *testing.T) {
 			Reason:  externalPopulatorRestoreConditionReasonProvisioned,
 			Message: externalPopulatorNoDataRestoreMessage,
 		},
+		guestOnlyCondition,
+		{
+			Type:   corev1.PersistentVolumeClaimFileSystemResizePending,
+			Status: corev1.ConditionTrue,
+		},
+		{
+			Type:   corev1.PersistentVolumeClaimResizing,
+			Status: corev1.ConditionTrue,
+		},
+		hostWinsCondition,
 	}
 	hostCondition := corev1.PersistentVolumeClaimCondition{
 		Type:   corev1.PersistentVolumeClaimFileSystemResizePending,
 		Status: corev1.ConditionTrue,
 	}
+	hostWinsCondition.Status = corev1.ConditionFalse
 	host := &corev1.PersistentVolumeClaim{
 		Status: corev1.PersistentVolumeClaimStatus{
 			Phase: corev1.ClaimBound,
 			Capacity: corev1.ResourceList{
 				corev1.ResourceStorage: resource.MustParse("1Gi"),
 			},
-			Conditions: []corev1.PersistentVolumeClaimCondition{hostCondition},
+			Conditions: []corev1.PersistentVolumeClaimCondition{hostCondition, hostWinsCondition},
 		},
 	}
 	virtual := &corev1.PersistentVolumeClaim{
@@ -2296,9 +2319,9 @@ func TestCopyHostStatusPreservingExternalPopulatorConditions(t *testing.T) {
 		},
 	}
 
-	copyHostStatusPreservingExternalPopulatorConditions(host, virtual)
+	copyHostStatusPreservingGuestOnlyConditions(host, virtual)
 
 	expected := *host.Status.DeepCopy()
-	expected.Conditions = append(expected.Conditions, externalConditions...)
+	expected.Conditions = append(expected.Conditions, externalConditions[:3]...)
 	assert.DeepEqual(t, virtual.Status, expected)
 }
