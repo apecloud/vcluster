@@ -676,6 +676,265 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
+			Name: "Propagate target selected node to external populator helper",
+			InitialVirtualState: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					target := dataProtectionBackupPendingPvc.DeepCopy()
+					target.Annotations = map[string]string{selectedNodeAnnotation: "node2"}
+					return target
+				}(),
+				dataProtectionPopulateHelperPvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				dataProtectionHostPendingPopulateHelperPvc.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						target := dataProtectionBackupPendingPvc.DeepCopy()
+						target.Annotations = map[string]string{selectedNodeAnnotation: "node2"}
+						return target
+					}(),
+					dataProtectionPopulateHelperPvc.DeepCopy(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						host := dataProtectionHostPendingPopulateHelperPvc.DeepCopy()
+						host.Annotations[selectedNodeAnnotation] = "node2"
+						host.Annotations[translate.ManagedAnnotationsAnnotation] = selectedNodeAnnotation
+						return host
+					}(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(dataProtectionPopulateHelperPvc.DeepCopy()))
+				assert.NilError(t, err)
+				assert.Check(t, result.IsZero())
+			},
+		},
+		{
+			Name: "Create external populator helper with target selected node",
+			InitialVirtualState: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					target := dataProtectionBackupPendingPvc.DeepCopy()
+					target.Annotations = map[string]string{selectedNodeAnnotation: "node2"}
+					return target
+				}(),
+				dataProtectionPopulateHelperPvc.DeepCopy(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						target := dataProtectionBackupPendingPvc.DeepCopy()
+						target.Annotations = map[string]string{selectedNodeAnnotation: "node2"}
+						return target
+					}(),
+					dataProtectionPopulateHelperPvc.DeepCopy(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						host := dataProtectionHostPopulateHelperPvc.DeepCopy()
+						host.Status = corev1.PersistentVolumeClaimStatus{}
+						host.Annotations[selectedNodeAnnotation] = "node2"
+						host.Annotations[translate.ManagedAnnotationsAnnotation] = selectedNodeAnnotation
+						return host
+					}(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(dataProtectionPopulateHelperPvc.DeepCopy()))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name: "Do not overwrite conflicting external populator helper selected node",
+			InitialVirtualState: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					target := dataProtectionBackupPendingPvc.DeepCopy()
+					target.Annotations = map[string]string{selectedNodeAnnotation: "node2"}
+					return target
+				}(),
+				dataProtectionPopulateHelperPvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					host := dataProtectionHostPendingPopulateHelperPvc.DeepCopy()
+					host.Annotations[selectedNodeAnnotation] = "node1"
+					return host
+				}(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						target := dataProtectionBackupPendingPvc.DeepCopy()
+						target.Annotations = map[string]string{selectedNodeAnnotation: "node2"}
+						return target
+					}(),
+					dataProtectionPopulateHelperPvc.DeepCopy(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						host := dataProtectionHostPendingPopulateHelperPvc.DeepCopy()
+						host.Annotations[selectedNodeAnnotation] = "node1"
+						return host
+					}(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(dataProtectionPopulateHelperPvc.DeepCopy()))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, externalPopulatorNoDataRestoreBackoff)
+			},
+		},
+		{
+			Name: "Keep helper selected node when target differs",
+			InitialVirtualState: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					target := dataProtectionBackupPendingPvc.DeepCopy()
+					target.Annotations = map[string]string{selectedNodeAnnotation: "node2"}
+					return target
+				}(),
+				func() *corev1.PersistentVolumeClaim {
+					helper := dataProtectionPopulateHelperPvc.DeepCopy()
+					helper.Annotations = map[string]string{selectedNodeAnnotation: "node3"}
+					return helper
+				}(),
+			},
+			InitialPhysicalState: []runtime.Object{dataProtectionHostPendingPopulateHelperPvc.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						target := dataProtectionBackupPendingPvc.DeepCopy()
+						target.Annotations = map[string]string{selectedNodeAnnotation: "node2"}
+						return target
+					}(),
+					func() *corev1.PersistentVolumeClaim {
+						helper := dataProtectionPopulateHelperPvc.DeepCopy()
+						helper.Annotations = map[string]string{selectedNodeAnnotation: "node3"}
+						return helper
+					}(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionHostPendingPopulateHelperPvc.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(func() *corev1.PersistentVolumeClaim {
+					helper := dataProtectionPopulateHelperPvc.DeepCopy()
+					helper.Annotations = map[string]string{selectedNodeAnnotation: "node3"}
+					return helper
+				}()))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, externalPopulatorNoDataRestoreBackoff)
+			},
+		},
+		{
+			Name: "Do not write target selected node when target has none",
+			InitialVirtualState: []runtime.Object{
+				dataProtectionBackupPendingPvc.DeepCopy(),
+				dataProtectionPopulateHelperPvc.DeepCopy(),
+			},
+			InitialPhysicalState: []runtime.Object{dataProtectionHostPendingPopulateHelperPvc.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					dataProtectionBackupPendingPvc.DeepCopy(),
+					dataProtectionPopulateHelperPvc.DeepCopy(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionHostPendingPopulateHelperPvc.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				_, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(dataProtectionPopulateHelperPvc.DeepCopy()))
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name: "Do not infer target selected node for unrelated helper UID",
+			InitialVirtualState: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					target := dataProtectionBackupPendingPvc.DeepCopy()
+					target.Annotations = map[string]string{selectedNodeAnnotation: "node2"}
+					return target
+				}(),
+				func() *corev1.PersistentVolumeClaim {
+					helper := dataProtectionPopulateHelperPvc.DeepCopy()
+					helper.Name = "kb-populate-unrelated-target-pvc-uid"
+					return helper
+				}(),
+			},
+			InitialPhysicalState: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					helper := dataProtectionPopulateHelperPvc.DeepCopy()
+					helper.Name = "kb-populate-unrelated-target-pvc-uid"
+					host := dataProtectionHostPendingPopulateHelperPvc.DeepCopy()
+					hostName := translate.Default.HostName(nil, helper.Name, helper.Namespace)
+					host.Name = hostName.Name
+					host.Annotations[translate.NameAnnotation] = helper.Name
+					host.Annotations[translate.HostNameAnnotation] = hostName.Name
+					return host
+				}(),
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						target := dataProtectionBackupPendingPvc.DeepCopy()
+						target.Annotations = map[string]string{selectedNodeAnnotation: "node2"}
+						return target
+					}(),
+					func() *corev1.PersistentVolumeClaim {
+						helper := dataProtectionPopulateHelperPvc.DeepCopy()
+						helper.Name = "kb-populate-unrelated-target-pvc-uid"
+						return helper
+					}(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						helper := dataProtectionPopulateHelperPvc.DeepCopy()
+						helper.Name = "kb-populate-unrelated-target-pvc-uid"
+						host := dataProtectionHostPendingPopulateHelperPvc.DeepCopy()
+						hostName := translate.Default.HostName(nil, helper.Name, helper.Namespace)
+						host.Name = hostName.Name
+						host.Annotations[translate.NameAnnotation] = helper.Name
+						host.Annotations[translate.HostNameAnnotation] = hostName.Name
+						return host
+					}(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				helper := dataProtectionPopulateHelperPvc.DeepCopy()
+				helper.Name = "kb-populate-unrelated-target-pvc-uid"
+				_, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(helper))
+				assert.NilError(t, err)
+			},
+		},
+		{
 			Name: "Persist guest scheduler annotations on existing host pvc during no-data restore backoff",
 			InitialVirtualState: func() []runtime.Object {
 				guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()

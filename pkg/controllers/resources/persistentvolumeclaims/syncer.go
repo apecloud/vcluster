@@ -2,6 +2,7 @@ package persistentvolumeclaims
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -146,6 +147,11 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		)
 		return ctrl.Result{}, err
 	}
+	if conflict, err := s.persistExternalPopulatorSchedulerAnnotations(ctx, event.Virtual, pObj); err != nil {
+		return ctrl.Result{}, err
+	} else if conflict {
+		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
+	}
 	if handled {
 		err = pro.ApplyPatchesHostObject(ctx, nil, pObj, event.Virtual, ctx.Config.Sync.ToHost.PersistentVolumeClaims.Patches, false)
 		if err != nil {
@@ -156,13 +162,6 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 			return ctrl.Result{}, err
 		}
 		if blocked {
-			// The guest scheduler can add selected-node while the external-populator
-			// restore is still blocked. Persist only these scheduler annotations on an
-			// existing host PVC before requeueing; do not release the data source or
-			// invent a volume name while the guest volume is not materialized.
-			if err := s.persistExternalPopulatorSchedulerAnnotations(ctx, pObj); err != nil {
-				return ctrl.Result{}, err
-			}
 			return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
 		}
 
@@ -182,6 +181,12 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, err
 	}
 
+	if conflict, err := s.persistExternalPopulatorSchedulerAnnotations(ctx, event.Virtual, pObj); err != nil {
+		return ctrl.Result{}, err
+	} else if conflict {
+		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
+	}
+
 	err = pro.ApplyPatchesHostObject(ctx, nil, pObj, event.Virtual, ctx.Config.Sync.ToHost.PersistentVolumeClaims.Patches, false)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -191,13 +196,6 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, err
 	}
 	if blocked {
-		// The guest scheduler can add selected-node while the external-populator
-		// restore is still blocked. Persist only these scheduler annotations on an
-		// existing host PVC before requeueing; do not release the data source or
-		// invent a volume name while the guest volume is not materialized.
-		if err := s.persistExternalPopulatorSchedulerAnnotations(ctx, pObj); err != nil {
-			return ctrl.Result{}, err
-		}
 		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
 	}
 
@@ -211,23 +209,41 @@ var externalPopulatorSchedulerAnnotations = []string{
 	storageProvisionerAnnotation,
 }
 
-func (s *persistentVolumeClaimSyncer) persistExternalPopulatorSchedulerAnnotations(ctx *synccontext.SyncContext, translatedHostPVC *corev1.PersistentVolumeClaim) error {
+// persistExternalPopulatorSchedulerAnnotations copies scheduler metadata to an
+// existing host PVC. A populate helper inherits its target's selected node only
+// when it has no selection of its own; conflicting selections are retried.
+func (s *persistentVolumeClaimSyncer) persistExternalPopulatorSchedulerAnnotations(ctx *synccontext.SyncContext, virtualPVC, translatedHostPVC *corev1.PersistentVolumeClaim) (bool, error) {
 	if translatedHostPVC == nil {
-		return nil
+		return false, nil
+	}
+
+	selectedNode, isHelper, conflict, err := s.externalPopulatorHelperSelectedNode(ctx, virtualPVC)
+	if err != nil || conflict {
+		return conflict, err
+	}
+	if isHelper && selectedNode != "" && translatedHostPVC.Annotations[selectedNodeAnnotation] == "" {
+		if translatedHostPVC.Annotations == nil {
+			translatedHostPVC.Annotations = map[string]string{}
+		}
+		translatedHostPVC.Annotations[selectedNodeAnnotation] = selectedNode
+		addManagedAnnotation(translatedHostPVC.Annotations, selectedNodeAnnotation)
 	}
 
 	hostPVC := &corev1.PersistentVolumeClaim{}
-	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{
+	err = ctx.HostClient.Get(ctx.Context, types.NamespacedName{
 		Namespace: translatedHostPVC.Namespace,
 		Name:      translatedHostPVC.Name,
 	}, hostPVC)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 
+	if isHelper && selectedNode != "" && hostPVC.Annotations[selectedNodeAnnotation] != "" && hostPVC.Annotations[selectedNodeAnnotation] != selectedNode {
+		return true, nil
+	}
 	before := hostPVC.DeepCopy()
 	if hostPVC.Annotations == nil {
 		hostPVC.Annotations = map[string]string{}
@@ -242,16 +258,59 @@ func (s *persistentVolumeClaimSyncer) persistExternalPopulatorSchedulerAnnotatio
 		changed = true
 	}
 	if !changed {
-		return nil
+		return false, nil
+	}
+	if isHelper && selectedNode != "" {
+		addManagedAnnotation(hostPVC.Annotations, selectedNodeAnnotation)
 	}
 
 	if err := ctx.HostClient.Patch(ctx.Context, hostPVC, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("persist external populator scheduler annotations: %w", err)
+		return false, fmt.Errorf("persist external populator scheduler annotations: %w", err)
 	}
 	if ctx.ObjectCache != nil {
 		ctx.ObjectCache.Host().Put(hostPVC)
 	}
-	return nil
+	return false, nil
+}
+
+func (s *persistentVolumeClaimSyncer) externalPopulatorHelperSelectedNode(ctx *synccontext.SyncContext, virtualPVC *corev1.PersistentVolumeClaim) (selectedNode string, isHelper, conflict bool, err error) {
+	if virtualPVC == nil || !strings.HasPrefix(virtualPVC.Name, externalPopulatorPopulateHelperPrefix) {
+		return "", false, false, nil
+	}
+
+	targetUID := strings.TrimPrefix(virtualPVC.Name, externalPopulatorPopulateHelperPrefix)
+	if targetUID == "" {
+		return "", false, false, nil
+	}
+	targetPVC, found, err := s.findExternalPopulatorTargetPVCByUID(ctx, virtualPVC.Namespace, types.UID(targetUID))
+	if err != nil || !found {
+		return "", false, false, err
+	}
+
+	targetSelectedNode := targetPVC.Annotations[selectedNodeAnnotation]
+	helperSelectedNode := virtualPVC.Annotations[selectedNodeAnnotation]
+	if helperSelectedNode != "" && targetSelectedNode != "" && helperSelectedNode != targetSelectedNode {
+		return "", true, true, nil
+	}
+	if helperSelectedNode != "" {
+		return helperSelectedNode, true, false, nil
+	}
+	return targetSelectedNode, true, false, nil
+}
+
+func addManagedAnnotation(annotations map[string]string, key string) {
+	managed := map[string]struct{}{key: {}}
+	for _, existing := range strings.Split(annotations[translate.ManagedAnnotationsAnnotation], "\n") {
+		if existing != "" {
+			managed[existing] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(managed))
+	for existing := range managed {
+		keys = append(keys, existing)
+	}
+	sort.Strings(keys)
+	annotations[translate.ManagedAnnotationsAnnotation] = strings.Join(keys, "\n")
 }
 
 func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*corev1.PersistentVolumeClaim]) (result ctrl.Result, retErr error) {
