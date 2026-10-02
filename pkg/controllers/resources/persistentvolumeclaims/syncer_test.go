@@ -676,6 +676,72 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
+			Name: "Persist guest scheduler annotations on existing host pvc during no-data restore backoff",
+			InitialVirtualState: func() []runtime.Object {
+				guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+				guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+				return []runtime.Object{guest}
+			}(),
+			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+						guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+						return guest
+					}(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+						host.Annotations[selectedNodeAnnotation] = "node1"
+						return host
+					}(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+				guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+				result, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(guest))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, externalPopulatorNoDataRestoreBackoff)
+			},
+		},
+		{
+			Name:                "Keep existing host scheduler annotations when guest has none during no-data restore backoff",
+			InitialVirtualState: []runtime.Object{dataProtectionNoDataRestoreProcessingPvc.DeepCopy()},
+			InitialPhysicalState: func() []runtime.Object {
+				host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+				host.Annotations[selectedNodeAnnotation] = "node0"
+				return []runtime.Object{host}
+			}(),
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestoreProcessingPvc.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+						host.Annotations[selectedNodeAnnotation] = "node0"
+						return host
+					}(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(dataProtectionNoDataRestoreProcessingPvc.DeepCopy()))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, externalPopulatorNoDataRestoreBackoff)
+			},
+		},
+		{
 			Name:                "Recreate data protection no-data host pvc without deleting virtual after stale host pvc was deleted",
 			InitialVirtualState: []runtime.Object{dataProtectionNoDataRestorePvc.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{

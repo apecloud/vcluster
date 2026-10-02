@@ -152,8 +152,18 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 			return ctrl.Result{}, err
 		}
 		blocked, err := s.shouldBlockExternalPopulatorHostPVCUntilGuestBackupMaterialized(ctx, event.Virtual, pObj)
-		if err != nil || blocked {
-			return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, err
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if blocked {
+			// The guest scheduler can add selected-node while the external-populator
+			// restore is still blocked. Persist only these scheduler annotations on an
+			// existing host PVC before requeueing; do not release the data source or
+			// invent a volume name while the guest volume is not materialized.
+			if err := s.persistExternalPopulatorSchedulerAnnotations(ctx, pObj); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
 		}
 
 		return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), true)
@@ -177,11 +187,71 @@ func (s *persistentVolumeClaimSyncer) SyncToHost(ctx *synccontext.SyncContext, e
 		return ctrl.Result{}, err
 	}
 	blocked, err := s.shouldBlockExternalPopulatorHostPVCUntilGuestBackupMaterialized(ctx, event.Virtual, pObj)
-	if err != nil || blocked {
-		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, err
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if blocked {
+		// The guest scheduler can add selected-node while the external-populator
+		// restore is still blocked. Persist only these scheduler annotations on an
+		// existing host PVC before requeueing; do not release the data source or
+		// invent a volume name while the guest volume is not materialized.
+		if err := s.persistExternalPopulatorSchedulerAnnotations(ctx, pObj); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
 	}
 
 	return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), true)
+}
+
+var externalPopulatorSchedulerAnnotations = []string{
+	selectedNodeAnnotation,
+	bindCompletedAnnotation,
+	boundByControllerAnnotation,
+	storageProvisionerAnnotation,
+}
+
+func (s *persistentVolumeClaimSyncer) persistExternalPopulatorSchedulerAnnotations(ctx *synccontext.SyncContext, translatedHostPVC *corev1.PersistentVolumeClaim) error {
+	if translatedHostPVC == nil {
+		return nil
+	}
+
+	hostPVC := &corev1.PersistentVolumeClaim{}
+	err := ctx.HostClient.Get(ctx.Context, types.NamespacedName{
+		Namespace: translatedHostPVC.Namespace,
+		Name:      translatedHostPVC.Name,
+	}, hostPVC)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	before := hostPVC.DeepCopy()
+	if hostPVC.Annotations == nil {
+		hostPVC.Annotations = map[string]string{}
+	}
+	changed := false
+	for _, annotation := range externalPopulatorSchedulerAnnotations {
+		value := translatedHostPVC.Annotations[annotation]
+		if value == "" || hostPVC.Annotations[annotation] == value {
+			continue
+		}
+		hostPVC.Annotations[annotation] = value
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+
+	if err := ctx.HostClient.Patch(ctx.Context, hostPVC, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("persist external populator scheduler annotations: %w", err)
+	}
+	if ctx.ObjectCache != nil {
+		ctx.ObjectCache.Host().Put(hostPVC)
+	}
+	return nil
 }
 
 func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*corev1.PersistentVolumeClaim]) (result ctrl.Result, retErr error) {
