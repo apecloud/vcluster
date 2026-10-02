@@ -211,6 +211,19 @@ var externalPopulatorSchedulerAnnotations = []string{
 	storageProvisionerAnnotation,
 }
 
+func copyHostSchedulerAnnotationsToVirtual(pObj, vObj *corev1.PersistentVolumeClaim) {
+	for _, annotation := range externalPopulatorSchedulerAnnotations {
+		value := pObj.Annotations[annotation]
+		if value == "" || vObj.Annotations[annotation] == value {
+			continue
+		}
+		if vObj.Annotations == nil {
+			vObj.Annotations = map[string]string{}
+		}
+		vObj.Annotations[annotation] = value
+	}
+}
+
 func (s *persistentVolumeClaimSyncer) persistExternalPopulatorSchedulerAnnotations(ctx *synccontext.SyncContext, translatedHostPVC *corev1.PersistentVolumeClaim) error {
 	if translatedHostPVC == nil {
 		return nil
@@ -340,8 +353,9 @@ func (s *persistentVolumeClaimSyncer) Sync(ctx *synccontext.SyncContext, event *
 	if backoffHostPVC {
 		// Backoff protects the no-data restore PVC from being recreated with a
 		// restore data source before the guest has materialized its volume. It
-		// must not also block scheduler metadata flowing back to the guest.
-		s.translateUpdateBackwards(event.Host, event.Virtual)
+		// must not also block scheduler metadata flowing back to the guest, nor
+		// erase guest values that SyncToHost has not persisted on the host yet.
+		copyHostSchedulerAnnotationsToVirtual(event.Host, event.Virtual)
 		logExternalPopulatorNoDataRestoreBackoff(ctx.Log, event.Host, event.Virtual)
 		return ctrl.Result{RequeueAfter: externalPopulatorNoDataRestoreBackoff}, nil
 	}
