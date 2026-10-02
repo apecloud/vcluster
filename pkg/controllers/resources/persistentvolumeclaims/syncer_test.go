@@ -396,8 +396,6 @@ func TestSync(t *testing.T) {
 			corev1.ResourceStorage: resource.MustParse("1Gi"),
 		},
 	}
-	dataProtectionNoDataRestorePvcWithHostBoundStatus := dataProtectionNoDataRestorePvc.DeepCopy()
-	dataProtectionNoDataRestorePvcWithHostBoundStatus.Status = *dataProtectionNoDataHostBoundWithBackupSource.Status.DeepCopy()
 	dataProtectionNoDataHostPendingWithoutBackupSource := dataProtectionHostPendingPvcWithUID.DeepCopy()
 	dataProtectionNoDataHostPendingWithoutBackupSource.Spec = corev1.PersistentVolumeClaimSpec{}
 	dataProtectionNoDataHostDeletingWithoutBackupSource := dataProtectionNoDataHostPendingWithoutBackupSource.DeepCopy()
@@ -678,6 +676,72 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
+			Name: "Persist guest scheduler annotations on existing host pvc during no-data restore backoff",
+			InitialVirtualState: func() []runtime.Object {
+				guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+				guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+				return []runtime.Object{guest}
+			}(),
+			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+						guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+						return guest
+					}(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+						host.Annotations[selectedNodeAnnotation] = "node1"
+						return host
+					}(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+				guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+				result, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(guest))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, externalPopulatorNoDataRestoreBackoff)
+			},
+		},
+		{
+			Name:                "Keep existing host scheduler annotations when guest has none during no-data restore backoff",
+			InitialVirtualState: []runtime.Object{dataProtectionNoDataRestoreProcessingPvc.DeepCopy()},
+			InitialPhysicalState: func() []runtime.Object {
+				host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+				host.Annotations[selectedNodeAnnotation] = "node0"
+				return []runtime.Object{host}
+			}(),
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestoreProcessingPvc.DeepCopy()},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+						host.Annotations[selectedNodeAnnotation] = "node0"
+						return host
+					}(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				result, err := syncer.(*persistentVolumeClaimSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(dataProtectionNoDataRestoreProcessingPvc.DeepCopy()))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, externalPopulatorNoDataRestoreBackoff)
+			},
+		},
+		{
 			Name:                "Recreate data protection no-data host pvc without deleting virtual after stale host pvc was deleted",
 			InitialVirtualState: []runtime.Object{dataProtectionNoDataRestorePvc.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
@@ -923,6 +987,89 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
+			Name:                "Propagate selected node while backing off no-data restore pvc",
+			InitialVirtualState: []runtime.Object{dataProtectionNoDataRestoreProcessingPvc.DeepCopy()},
+			InitialPhysicalState: func() []runtime.Object {
+				host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+				host.Annotations[selectedNodeAnnotation] = "node1"
+				host.Annotations[translate.ManagedAnnotationsAnnotation] = selectedNodeAnnotation
+				return []runtime.Object{host}
+			}(),
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+						guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+						return guest
+					}(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+						host.Annotations[selectedNodeAnnotation] = "node1"
+						host.Annotations[translate.ManagedAnnotationsAnnotation] = selectedNodeAnnotation
+						return host
+					}(),
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+				host.Annotations[selectedNodeAnnotation] = "node1"
+				host.Annotations[translate.ManagedAnnotationsAnnotation] = selectedNodeAnnotation
+				guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					host.DeepCopy(),
+					host,
+					guest.DeepCopy(),
+					guest,
+				))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, externalPopulatorNoDataRestoreBackoff)
+			},
+		},
+		{
+			Name: "Keep guest selected node while host has none during no-data restore backoff",
+			InitialVirtualState: func() []runtime.Object {
+				guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+				guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+				return []runtime.Object{guest}
+			}(),
+			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					func() *corev1.PersistentVolumeClaim {
+						guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+						guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+						return guest
+					}(),
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				syncer.(*persistentVolumeClaimSyncer).useFakePersistentVolumes = true
+
+				host := dataProtectionNoDataHostProcessingWithBackupSource.DeepCopy()
+				guest := dataProtectionNoDataRestoreProcessingPvc.DeepCopy()
+				guest.Annotations = map[string]string{selectedNodeAnnotation: "node1"}
+				result, err := syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					host.DeepCopy(),
+					host,
+					guest.DeepCopy(),
+					guest,
+				))
+				assert.NilError(t, err)
+				assert.Equal(t, result.RequeueAfter, externalPopulatorNoDataRestoreBackoff)
+			},
+		},
+		{
 			Name: "Keep immutable host backup data source and retry while populated host pv is missing",
 			InitialVirtualState: []runtime.Object{
 				dataProtectionNoDataRestorePvcWithVolumeName.DeepCopy(),
@@ -1039,7 +1186,7 @@ func TestSync(t *testing.T) {
 			InitialVirtualState:  []runtime.Object{dataProtectionNoDataRestorePvc.DeepCopy()},
 			InitialPhysicalState: []runtime.Object{dataProtectionNoDataHostBoundWithBackupSource.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestorePvcWithHostBoundStatus.DeepCopy()},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataRestorePvc.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {dataProtectionNoDataHostBoundWithBackupSource.DeepCopy()},
@@ -2052,6 +2199,132 @@ func TestSync_ExternalPopulatorStatusNotOverwritten(t *testing.T) {
 				assert.NilError(t, err)
 			},
 		},
+		{
+			Name: "External populator conditions survive bound host without conditions",
+			InitialVirtualState: []runtime.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: vObjectMeta,
+					Spec: corev1.PersistentVolumeClaimSpec{
+						DataSourceRef: &corev1.TypedObjectReference{
+							APIGroup: &apiGroup,
+							Kind:     "Backup",
+							Name:     "my-backup",
+						},
+						VolumeName: "pvc-restored-vol",
+					},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Phase:       corev1.ClaimBound,
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+						Conditions: []corev1.PersistentVolumeClaimCondition{
+							{
+								Type:    externalPopulatorPopulateConditionType,
+								Status:  corev1.ConditionTrue,
+								Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+								Message: "PVC provisioned without data restore",
+							},
+							{
+								Type:    externalPopulatorRestoreConditionType,
+								Status:  corev1.ConditionTrue,
+								Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+								Message: "PVC provisioned without data restore",
+							},
+						},
+					},
+				},
+			},
+			InitialPhysicalState: []runtime.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: pObjectMeta,
+					Spec: corev1.PersistentVolumeClaimSpec{
+						DataSourceRef: &corev1.TypedObjectReference{
+							APIGroup: &apiGroup,
+							Kind:     "Backup",
+							Name:     "my-backup",
+						},
+					},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Phase:       corev1.ClaimBound,
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+					},
+				},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					&corev1.PersistentVolumeClaim{
+						ObjectMeta: vObjectMeta,
+						Spec: corev1.PersistentVolumeClaimSpec{
+							DataSourceRef: &corev1.TypedObjectReference{
+								APIGroup: &apiGroup,
+								Kind:     "Backup",
+								Name:     "my-backup",
+							},
+							VolumeName: "pvc-restored-vol",
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase:       corev1.ClaimBound,
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+							Capacity: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("10Gi"),
+							},
+							Conditions: []corev1.PersistentVolumeClaimCondition{
+								{
+									Type:    externalPopulatorPopulateConditionType,
+									Status:  corev1.ConditionTrue,
+									Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+									Message: "PVC provisioned without data restore",
+								},
+								{
+									Type:    externalPopulatorRestoreConditionType,
+									Status:  corev1.ConditionTrue,
+									Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+									Message: "PVC provisioned without data restore",
+								},
+							},
+						},
+					},
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {
+					&corev1.PersistentVolumeClaim{
+						ObjectMeta: pObjectMeta,
+						Spec: corev1.PersistentVolumeClaimSpec{
+							DataSourceRef: &corev1.TypedObjectReference{
+								APIGroup: &apiGroup,
+								Kind:     "Backup",
+								Name:     "my-backup",
+							},
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase:       corev1.ClaimBound,
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+							Capacity: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("10Gi"),
+							},
+						},
+					},
+				},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				vPVC := &corev1.PersistentVolumeClaim{}
+				err := syncCtx.VirtualClient.Get(syncCtx, types.NamespacedName{Namespace: vObjectMeta.Namespace, Name: vObjectMeta.Name}, vPVC)
+				assert.NilError(t, err)
+				pPVC := &corev1.PersistentVolumeClaim{}
+				err = syncCtx.HostClient.Get(syncCtx, types.NamespacedName{Namespace: pObjectMeta.Namespace, Name: pObjectMeta.Name}, pPVC)
+				assert.NilError(t, err)
+				_, err = syncer.(*persistentVolumeClaimSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					pPVC.DeepCopy(), pPVC.DeepCopy(), vPVC.DeepCopy(), vPVC.DeepCopy(),
+				))
+				assert.NilError(t, err)
+			},
+		},
 	})
 }
 
@@ -2127,4 +2400,77 @@ func TestHasExternalPopulatorDataSource(t *testing.T) {
 			assert.Equal(t, hasExternalPopulatorDataSource(tt.pvc), tt.expected)
 		})
 	}
+}
+
+func TestCopyHostStatusPreservingGuestOnlyConditions(t *testing.T) {
+	apiGroup := dataProtectionAPIGroup
+	guestOnlyCondition := corev1.PersistentVolumeClaimCondition{
+		Type:    corev1.PersistentVolumeClaimConditionType("RestoreProgress"),
+		Status:  corev1.ConditionTrue,
+		Reason:  "FutureProtocolValue",
+		Message: "future external-populator condition",
+	}
+	hostWinsCondition := corev1.PersistentVolumeClaimCondition{
+		Type:    corev1.PersistentVolumeClaimConditionType("HostOwnedFutureCondition"),
+		Status:  corev1.ConditionTrue,
+		Reason:  "HostValue",
+		Message: "host is authoritative",
+	}
+	externalConditions := []corev1.PersistentVolumeClaimCondition{
+		{
+			Type:    externalPopulatorPopulateConditionType,
+			Status:  corev1.ConditionTrue,
+			Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+			Message: externalPopulatorNoDataRestoreMessage,
+		},
+		{
+			Type:    externalPopulatorRestoreConditionType,
+			Status:  corev1.ConditionTrue,
+			Reason:  externalPopulatorRestoreConditionReasonProvisioned,
+			Message: externalPopulatorNoDataRestoreMessage,
+		},
+		guestOnlyCondition,
+		{
+			Type:   corev1.PersistentVolumeClaimFileSystemResizePending,
+			Status: corev1.ConditionTrue,
+		},
+		{
+			Type:   corev1.PersistentVolumeClaimResizing,
+			Status: corev1.ConditionTrue,
+		},
+		hostWinsCondition,
+	}
+	hostCondition := corev1.PersistentVolumeClaimCondition{
+		Type:   corev1.PersistentVolumeClaimFileSystemResizePending,
+		Status: corev1.ConditionTrue,
+	}
+	hostWinsCondition.Status = corev1.ConditionFalse
+	host := &corev1.PersistentVolumeClaim{
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase: corev1.ClaimBound,
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+			Conditions: []corev1.PersistentVolumeClaimCondition{hostCondition, hostWinsCondition},
+		},
+	}
+	virtual := &corev1.PersistentVolumeClaim{
+		Spec: corev1.PersistentVolumeClaimSpec{
+			DataSourceRef: &corev1.TypedObjectReference{
+				APIGroup: &apiGroup,
+				Kind:     dataProtectionBackupKind,
+				Name:     "backup-1",
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Phase:      corev1.ClaimPending,
+			Conditions: append([]corev1.PersistentVolumeClaimCondition(nil), externalConditions...),
+		},
+	}
+
+	copyHostStatusPreservingGuestOnlyConditions(host, virtual)
+
+	expected := *host.Status.DeepCopy()
+	expected.Conditions = append(expected.Conditions, externalConditions[:3]...)
+	assert.DeepEqual(t, virtual.Status, expected)
 }
