@@ -609,7 +609,20 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 		if hostPV.Spec.ClaimRef == nil {
 			return false, fmt.Errorf("host pv %s has no claimRef while virtual populate helper pvc %s/%s exists", hostPVName, helperPVC.Namespace, helperPVC.Name)
 		}
+		rebound := false
+		if helperPVC.Name == externalPopulatorPopulateHelperPrefix+string(vObj.UID) {
+			if ctx.VirtualAPIReader == nil {
+				return false, fmt.Errorf("virtual API reader is required to revalidate virtual pv claimRef before patching host pv %s", hostPVName)
+			}
+			rebound, err = externalPopulatorVirtualPVRebound(ctx, ctx.VirtualAPIReader, vObj)
+			if err != nil {
+				return false, err
+			}
+		}
 		if claimRefReferencesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) && hostPV.Spec.ClaimRef.UID == pObj.UID {
+			if rebound {
+				return true, nil
+			}
 			ctx.Log.Infof("wait for virtual populate helper to disappear before accepting host pv target handoff: hostPV=%s targetPVC=%s/%s helperPVC=%s/%s", hostPVName, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
 			return false, nil
 		}
@@ -621,8 +634,17 @@ func (s *persistentVolumeClaimSyncer) ensureExternalPopulatorHostPVClaimRef(ctx 
 		if !ok {
 			return false, fmt.Errorf("host pv %s claimRef %s/%s does not match target pvc %s/%s or expected populate helper pvc %s/%s", hostPVName, hostPV.Spec.ClaimRef.Namespace, hostPV.Spec.ClaimRef.Name, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
 		}
+		if !rebound {
+			return false, nil
+		}
 
-		return false, nil
+		ctx.Log.Infof("hand off host pv to target pvc while virtual populate helper waits for target binding: hostPV=%s targetPVC=%s/%s helperPVC=%s/%s", hostPVName, pObj.Namespace, pObj.Name, helperPVC.Namespace, helperPVC.Name)
+		updated := hostPV.DeepCopy()
+		updated.Spec.ClaimRef = targetRef
+		if err := ctx.HostClient.Patch(ctx.Context, updated, client.MergeFrom(hostPV)); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 
 	exactTargetClaimRef := claimRefReferencesPersistentVolumeClaim(hostPV.Spec.ClaimRef, pObj) && hostPV.Spec.ClaimRef.UID == pObj.UID
@@ -1090,7 +1112,37 @@ func (s *persistentVolumeClaimSyncer) shouldWaitForExternalPopulatorHelperAbsenc
 		return false, nil
 	}
 
-	return s.externalPopulatorPopulateHelperExists(ctx, targetPVC)
+	helperExists, err := s.externalPopulatorPopulateHelperExists(ctx, targetPVC)
+	if err != nil || !helperExists {
+		return false, err
+	}
+	rebound, err := externalPopulatorVirtualPVRebound(ctx, ctx.VirtualClient, targetPVC)
+	if err != nil {
+		return false, err
+	}
+
+	return !rebound, nil
+}
+
+// externalPopulatorVirtualPVRebound reports whether the populator has already
+// pointed the virtual PV at the target PVC. KubeBlocks keeps the populate helper
+// until the target is bind-completed, which inside a vcluster only happens after
+// the host PV is handed off, so helper presence alone must not block the handoff.
+func externalPopulatorVirtualPVRebound(ctx *synccontext.SyncContext, reader client.Reader, targetPVC *corev1.PersistentVolumeClaim) (bool, error) {
+	if reader == nil || targetPVC == nil || targetPVC.UID == "" || targetPVC.Spec.VolumeName == "" {
+		return false, nil
+	}
+
+	vPV := &corev1.PersistentVolume{}
+	err := reader.Get(ctx.Context, types.NamespacedName{Name: targetPVC.Spec.VolumeName}, vPV)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return claimRefReferencesPersistentVolumeClaim(vPV.Spec.ClaimRef, targetPVC) && vPV.Spec.ClaimRef.UID == targetPVC.UID, nil
 }
 
 func isDataProtectionBackupDataSourceRef(ref *corev1.TypedObjectReference) bool {
