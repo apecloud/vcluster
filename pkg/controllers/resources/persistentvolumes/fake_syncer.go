@@ -19,6 +19,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const fakePVLabel = "vcluster.loft.sh/fake-pv"
+
 func NewFakeSyncer(_ *synccontext.RegisterContext) (syncer.Object, error) {
 	return &fakePersistentVolumeSyncer{}, nil
 }
@@ -94,7 +96,7 @@ func (r *fakePersistentVolumeSyncer) FakeSync(ctx *synccontext.SyncContext, vObj
 	if err != nil {
 		return ctrl.Result{}, err
 	} else if needed {
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.growCapacityToBoundPVC(ctx, persistentVolume)
 	}
 
 	ctx.Log.Infof("Delete fake persistent volume %s", vObj.GetName())
@@ -119,6 +121,45 @@ func (r *fakePersistentVolumeSyncer) FakeSync(ctx *synccontext.SyncContext, vObj
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// growCapacityToBoundPVC raises the fake PV capacity to the storage reported by
+// its bound PVC. The host CSI driver performs the expansion and only the PVC
+// status reflects it, so the fake PV would otherwise keep its creation-time size.
+// The capacity never shrinks because Kubernetes volumes cannot shrink.
+func (r *fakePersistentVolumeSyncer) growCapacityToBoundPVC(ctx *synccontext.SyncContext, pv *corev1.PersistentVolume) error {
+	if pv.Labels[fakePVLabel] != "true" || pv.Spec.ClaimRef == nil {
+		return nil
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: pv.Spec.ClaimRef.Name, Namespace: pv.Spec.ClaimRef.Namespace}, pvc)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if pvc.Spec.VolumeName != pv.Name || (pv.Spec.ClaimRef.UID != "" && pv.Spec.ClaimRef.UID != pvc.UID) {
+		return nil
+	}
+
+	pvcStorage, ok := pvc.Status.Capacity[corev1.ResourceStorage]
+	if !ok {
+		return nil
+	}
+	pvStorage := pv.Spec.Capacity[corev1.ResourceStorage]
+	if pvcStorage.Cmp(pvStorage) <= 0 {
+		return nil
+	}
+
+	orig := pv.DeepCopy()
+	if pv.Spec.Capacity == nil {
+		pv.Spec.Capacity = corev1.ResourceList{}
+	}
+	pv.Spec.Capacity[corev1.ResourceStorage] = pvcStorage.DeepCopy()
+	ctx.Log.Infof("Grow fake persistent volume %s capacity from %s to %s to match PVC %s/%s", pv.Name, pvStorage.String(), pvcStorage.String(), pvc.Namespace, pvc.Name)
+	return ctx.VirtualClient.Patch(ctx, pv, client.MergeFrom(orig))
 }
 
 func (r *fakePersistentVolumeSyncer) pvNeeded(ctx *synccontext.SyncContext, pvName string) (bool, error) {
@@ -172,7 +213,7 @@ func CreateFakePersistentVolume(ctx context.Context, virtualClient client.Client
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name.Name,
 			Labels: map[string]string{
-				"vcluster.loft.sh/fake-pv": "true",
+				fakePVLabel: "true",
 			},
 			Annotations: map[string]string{
 				"kubernetes.io/createdby":              "fake-pv-provisioner",
