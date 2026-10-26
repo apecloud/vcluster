@@ -11,6 +11,7 @@ import (
 
 	"github.com/loft-sh/vcluster/pkg/constants"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -87,7 +88,76 @@ func TestFakeSync(t *testing.T) {
 	rePointedTargetPvc := basePvc.DeepCopy()
 	rePointedTargetPvc.Spec.VolumeName = ""
 
+	smallStorage := corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("20Gi")}
+	largeStorage := corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("21Gi")}
+	pv20Gi := basePv.DeepCopy()
+	pv20Gi.Spec.Capacity = smallStorage.DeepCopy()
+	pv21Gi := basePv.DeepCopy()
+	pv21Gi.Spec.Capacity = largeStorage.DeepCopy()
+	expandedPvc := basePvc.DeepCopy()
+	expandedPvc.Spec.Resources.Requests = largeStorage.DeepCopy()
+	expandedPvc.Status.Phase = corev1.ClaimBound
+	expandedPvc.Status.Capacity = largeStorage.DeepCopy()
+	expandingPvc := expandedPvc.DeepCopy()
+	expandingPvc.Status.Capacity = smallStorage.DeepCopy()
+	shrunkStatusPvc := expandedPvc.DeepCopy()
+	shrunkStatusPvc.Status.Capacity = smallStorage.DeepCopy()
+	realPv20Gi := pv20Gi.DeepCopy()
+	delete(realPv20Gi.Labels, fakePVLabel)
+
 	syncertesting.RunTests(t, []*syncertesting.SyncTest{
+		{
+			Name:                "Grow fake pv capacity after bound pvc expansion completes",
+			InitialVirtualState: []runtime.Object{pv20Gi, expandedPvc},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {pv21Gi},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {expandedPvc},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
+				_, err := syncer.FakeSync(syncContext, pv20Gi.DeepCopy())
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                "Keep fake pv capacity while pvc expansion is only requested",
+			InitialVirtualState: []runtime.Object{pv20Gi, expandingPvc},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {pv20Gi},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {expandingPvc},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
+				_, err := syncer.FakeSync(syncContext, pv20Gi.DeepCopy())
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                "Never shrink fake pv capacity",
+			InitialVirtualState: []runtime.Object{pv21Gi, shrunkStatusPvc},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {pv21Gi},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {shrunkStatusPvc},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
+				_, err := syncer.FakeSync(syncContext, pv21Gi.DeepCopy())
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name:                "Leave capacity of pv without fake label untouched",
+			InitialVirtualState: []runtime.Object{realPv20Gi, expandedPvc},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {realPv20Gi},
+				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {expandedPvc},
+			},
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
+				_, err := syncer.FakeSync(syncContext, realPv20Gi.DeepCopy())
+				assert.NilError(t, err)
+			},
+		},
 		{
 			Name:                "Keep pv while claim ref references live pvc without volume name",
 			InitialVirtualState: []runtime.Object{basePv, rePointedTargetPvc},
